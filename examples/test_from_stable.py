@@ -11,7 +11,7 @@ from frogger.custom_sampling import FnHeuristicAlgrICSampler
 from frogger.solvers import FroggerConfig, Frogger
 # Import our custom classes
 from frogger.custom_robot_model import FunctionalRobotModel  # Updated import
-from frogger.custom_solver_parallel import FunctionalFrogger         # Updated import
+from frogger.custom_solver import FunctionalFrogger         # Updated import
 from frogger.utils import timeout
 
 from frogger.custom_sampling import ContactHeuristicAlgrICSampler
