@@ -10,6 +10,7 @@ from frogger import ROOT
 from frogger.grasping import wedge
 from frogger.robots.robot_core import RobotModel
 from frogger.robots.robots import AlgrModel, BH280Model, FR3AlgrModel
+from frogger.utils import add_marker
 
 # ########### #
 # IC SAMPLERS #
@@ -234,7 +235,7 @@ class HeuristicICSampler(ICSampler):
         """
 
     def sample_configuration(
-        self, tol_ang: float = 1e-2, tol_pos: float = 1e-4, seed: int | None = None
+        self, tol_ang: float = 1e-2, tol_pos: float = 1e-4, seed: int | None = None, set_palm: bool = True,
     ) -> tuple[np.ndarray, int]:
         """Sample a grasp.
 
@@ -281,20 +282,25 @@ class HeuristicICSampler(ICSampler):
             ik = InverseKinematics(plant, self.model.plant_context)
 
             # palm pose constraints
-            ik.AddOrientationConstraint(
-                plant.world_frame(),
-                R_WPalm_des,
-                f_palm,
-                RotationMatrix(),
-                tol_ang,
-            )  # constraint: align palm frame with desired palm frame
-            ik.AddPositionConstraint(
-                plant.world_frame(),
-                p_WPalm_des,
-                f_palm,
-                -tol_pos * np.ones(3),
-                tol_pos * np.ones(3),
-            )  # constraint: place palm frame at desired position
+            if set_palm:
+                ik.AddOrientationConstraint(
+                    plant.world_frame(),
+                    R_WPalm_des,
+                    f_palm,
+                    RotationMatrix(),
+                    tol_ang,
+                )  # constraint: align palm frame with desired palm frame
+                ik.AddPositionConstraint(
+                    plant.world_frame(),
+                    p_WPalm_des,
+                    f_palm,
+                    -tol_pos * np.ones(3),
+                    tol_pos * np.ones(3),
+                )  # constraint: place palm frame at desired position
+
+                # Add the marker
+                # add_marker(self.model, p_WPalm_des, color=[0, 1, 0, 1], radius=0.01, name="palm")
+                self.X_WPalm_des = X_WPalm_des
 
             # restrict object state for IK, since it's a free body
             q_guess = plant.GetPositions(self.model.plant_context)
@@ -303,6 +309,7 @@ class HeuristicICSampler(ICSampler):
 
             # any additional constraints - if the action in this function has a chance
             # at failing, then we catch a ValueError to allow continuation
+            # self.add_additional_constraints(ik, X_WPalm_des)
             try:
                 self.add_additional_constraints(ik, X_WPalm_des)
             except ValueError:

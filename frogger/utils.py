@@ -74,3 +74,30 @@ def timeout(seconds: float) -> callable:
         return wrapper
 
     return decorator
+
+from pydrake.geometry import Sphere, Rgba
+from pydrake.math import RigidTransform, RotationMatrix
+
+def add_marker(model, pos, color=[1,0,0,1], radius=0.01, name="marker"):
+    """Add a marker to the model.
+
+    Parameters
+    ----------
+    model : pymanoid.robot_model.RobotModel
+        The robot model to add the marker to.
+    color : tuple
+        The color of the marker in RGB format.
+    pos : np.ndarray
+        The position of the marker.
+    radius : float, optional
+        The radius of the marker, by default 0.01.
+    """
+    model.meshcat.SetObject(
+        path=name,
+        shape=Sphere(radius),
+        rgba=Rgba(*color),
+    )
+    model.meshcat.SetTransform(
+        path=name,
+        X_ParentPath=RigidTransform(pos)
+    )

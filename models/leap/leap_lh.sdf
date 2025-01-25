@@ -1,0 +1,237 @@
+<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="leap_hand">
+    <link name="palm_lower_left">
+      <inertial>
+        <mass>0.235</mass>
+        <inertia>
+          <ixx>0.000351007</ixx>
+          <ixy>-0.000001393</ixy>
+          <ixz>-0.000000694</ixz>
+          <iyy>0.000523205</iyy>
+          <iyz>-0.000003085</iyz>
+          <izz>0.000256996</izz>
+        </inertia>
+      </inertial>
+      <visual name="palm_visual">
+        <pose>-0.095574 -0.11704 0.02078 1.5708 0 3.14159</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/palm_lower_left.stl</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="palm_collision">
+        <pose>-0.095574 -0.11704 0.02078 1.5708 0 3.14159</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/palm_lower_left.stl</uri>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+
+    <!-- Index Finger -->
+    <link name="mcp_joint">
+      <inertial>
+        <mass>0.044</mass>
+        <inertia>
+          <ixx>0.000011499</ixx>
+          <ixy>0.000003049</ixy>
+          <ixz>0.000000121</ixz>
+          <iyy>0.000007796</iyy>
+          <iyz>0.000000112</iyz>
+          <izz>0.000014759</izz>
+        </inertia>
+      </inertial>
+      <visual name="mcp_visual">
+        <pose>0.008407 0.007766 0.014657 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/mcp_joint.stl</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="mcp_collision">
+        <pose>0.008407 0.007766 0.014657 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/mcp_joint.stl</uri>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="palm_to_mcp" type="revolute">
+      <parent>palm_lower_left</parent>
+      <child>mcp_joint</child>
+      <pose>-0.082574 -0.08574 0.007801 1.5708 1.5708 0</pose>
+      <axis>
+        <xyz>0 0 -1</xyz>
+        <limit>
+          <lower>-0.314</lower>
+          <upper>2.23</upper>
+          <effort>0.95</effort>
+          <velocity>8.48</velocity>
+        </limit>
+        <dynamics>
+          <damping>0.01</damping>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <link name="pip">
+      <inertial>
+        <mass>0.032</mass>
+        <inertia>
+          <ixx>0.000004798</ixx>
+          <ixy>0.000000012</ixy>
+          <ixz>0.000000004</ixz>
+          <iyy>0.000002862</iyy>
+          <iyz>0.000000011</iyz>
+          <izz>0.000004234</izz>
+        </inertia>
+      </inertial>
+      <visual name="pip_visual">
+        <pose>0.009643 0.0003 0.000784 -1.5708 -1.5708 0</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/pip.stl</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="pip_collision">
+        <pose>0.009643 0.0003 0.000784 -1.5708 -1.5708 0</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/pip.stl</uri>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="mcp_to_pip" type="revolute">
+      <parent>mcp_joint</parent>
+      <child>pip</child>
+      <pose>-0.0122 0.0381 0.0145 -1.5708 0 1.5708</pose>
+      <axis>
+        <xyz>0 0 -1</xyz>
+        <limit>
+          <lower>-1.047</lower>
+          <upper>1.047</upper>
+          <effort>0.95</effort>
+          <velocity>8.48</velocity>
+        </limit>
+        <dynamics>
+          <damping>0.01</damping>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <link name="dip">
+      <inertial>
+        <mass>0.037</mass>
+        <inertia>
+          <ixx>0.000005542</ixx>
+          <ixy>-0.000000607</ixy>
+          <ixz>-0.000000017</ixz>
+          <iyy>0.000005727</iyy>
+          <iyz>-0.000000023</iyz>
+          <izz>0.000006682</izz>
+        </inertia>
+      </inertial>
+      <visual name="dip_visual">
+        <pose>0.021133 -0.008432 0.009785 -3.14159 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/dip.stl</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="dip_collision">
+        <pose>0.021133 -0.008432 0.009785 -3.14159 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/dip.stl</uri>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="pip_to_dip" type="revolute">
+      <parent>pip</parent>
+      <child>dip</child>
+      <pose>0.015 0.0143 -0.013 1.5708 -1.5708 0</pose>
+      <axis>
+        <xyz>0 0 -1</xyz>
+        <limit>
+          <lower>-0.506</lower>
+          <upper>1.885</upper>
+          <effort>0.95</effort>
+          <velocity>8.48</velocity>
+        </limit>
+        <dynamics>
+          <damping>0.01</damping>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <link name="fingertip">
+      <inertial>
+        <mass>0.016</mass>
+        <inertia>
+          <ixx>0.000003368</ixx>
+          <ixy>0.000000115</ixy>
+          <ixz>0</ixz>
+          <iyy>0.000001556</iyy>
+          <iyz>0</iyz>
+          <izz>0.000002863</izz>
+        </inertia>
+      </inertial>
+      <visual name="fingertip_visual">
+        <pose>0.013286 -0.006114 0.0145 3.14159 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/fingertip.stl</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="fingertip_collision">
+        <pose>0.013286 -0.006114 0.0145 3.14159 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/fingertip.stl</uri>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="dip_to_fingertip" type="revolute">
+      <parent>dip</parent>
+      <child>fingertip</child>
+      <pose>0 -0.0361 0.0002 0 0 0</pose>
+      <axis>
+        <xyz>0 0 -1</xyz>
+        <limit>
+          <lower>-0.366</lower>
+          <upper>2.042</upper>
+          <effort>0.95</effort>
+          <velocity>8.48</velocity>
+        </limit>
+        <dynamics>
+          <damping>0.01</damping>
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- Middle Finger -->
+    <!-- Similar pattern for middle finger links and joints -->
+    
+    <!-- Ring Finger -->
+    <!-- Similar pattern for ring finger links and joints -->
+    
+    <!-- Thumb -->
+    <!-- Similar pattern for thumb links and joints -->
+
+  </model>
+</sdf>

@@ -148,7 +148,7 @@ class Frogger:
 
         return f, g, h
 
-    def generate_grasp(self) -> np.ndarray:
+    def generate_grasp(self, optimize=True, **kwargs) -> np.ndarray:
         """Generates a grasp.
 
         Returns
@@ -159,7 +159,9 @@ class Frogger:
         success = False
         while not success:
             # sample initial guess
-            q0, _ = self.sampler.sample_configuration()
+            q0, _ = self.sampler.sample_configuration(**kwargs)
+            if not optimize:
+                return None, q0
 
             # refine the grasp
             try:
@@ -230,4 +232,4 @@ class Frogger:
                     <= self.tol_fclosure  # TODO(ahl): once exposed, allow diff tolerances here
                 )
 
-        return q_star
+        return q_star, q0

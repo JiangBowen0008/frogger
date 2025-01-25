@@ -531,6 +531,7 @@ class RobotModel:
         self.gOCs = compute_gOCs(self.P_OF, self.n_O)  # (nc, 4, 4)
         self.G = compute_grasp_matrix(self.gOCs)  # (6, 3 * nc), object frame
         self.W = self.G @ np.kron(np.eye(self.nc), self.F)  # cols = primitive wrenches
+        pass
 
     def _compute_DG_and_DW(self) -> None:
         """Computes the Jacobians of the grasp and wrench matrices."""
