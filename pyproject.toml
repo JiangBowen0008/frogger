@@ -20,9 +20,9 @@ dependencies = [
     "jaxlib>=0.4.1",
     "matplotlib>=3.5.2",
     "nlopt>=2.7.1",
-    "numba>=0.57.0",
-    "numpy>=1.23.1",
-    "open3d>=0.16.0",
+    "numba",
+    "numpy<2.0",
+    "open3d==0.18.0",
     "pyvhacd>=0.0.2",
     "qpth>=0.0.16",
     "quantecon>=0.6.0",
@@ -30,7 +30,7 @@ dependencies = [
     "scipy>=1.10.0",
     "tbb>=2021.11.0",
     "torch>=1.13.1",
-    "trimesh>=4.0.0",
+    "trimesh<4.0.0",
     "vhacdx>=0.0.4",
 ]
 
