@@ -890,14 +890,12 @@ class BatchedGraspOptimizer:
 
     # -- initialisation ---------------------------------------------------
     def _init(self, center, n_act, act_positions=None, act_directions=None):
-        """Initialise joint angles and wrist poses using OBB-based sampling.
+        """Initialise by sampling palm contact points ON the object surface.
 
-        Replicates FroGGer's HeuristicICSampler strategy:
-        1. Compute object's oriented bounding box (OBB) via PCA
-        2. Sample palm y-axis aligned with OBB axes (probability ∝ length)
-        3. Sample palm x-axis (outward) from remaining OBB axes
-        4. Position palm by offsetting from object center along -x_hat
-        5. Add von-Mises-like noise for diversity
+        Strategy: pick random surface points on the object body, compute the
+        base pose that places the palm inner surface at each point with the
+        correct orientation (palm tangent to surface). This guarantees the
+        palm starts in contact with the object.
         """
         B, dev = self.num_envs, self.device
 
@@ -909,7 +907,6 @@ class BatchedGraspOptimizer:
                  1.0, 0.5, 0.5, 0.3],
                 device=dev,
             )
-            frog_offset = 0.10
         else:
             dq = torch.tensor(
                 [0.0, 0.5, 0.5, 0.5,
@@ -918,87 +915,71 @@ class BatchedGraspOptimizer:
                  1.2, 0.5, 0.5, 0.4],
                 device=dev,
             )
-            frog_offset = 0.095
         du = self._q2u(dq)
         self.u = (du + 0.3 * torch.randn(B, 16, device=dev)).detach().requires_grad_(True)
 
         c = torch.tensor(center, dtype=torch.float32, device=dev)
 
-        # --- OBB-based palm pose sampling (following FroGGer) ---
-        # Compute OBB axes from mesh vertices
-        obb_axes = self._obb_axes  # [3, 3] columns = OBB axes, sorted by length
-        obb_lengths = self._obb_lengths  # [3] axis lengths
+        # --- Surface-based palm placement ---
+        # 1. Sample random surface points on the object
+        # 2. Get surface normals at those points
+        # 3. Compute base pose that places palm inner surface AT each point
+        with torch.no_grad():
+            # Sample random points near the object surface using the SDF
+            # Start from random directions around center, march to surface
+            verts_W = torch.tensor(self.sdf._verts_W, dtype=torch.float32, device=dev)
+            n_verts = verts_W.shape[0]
+            # Randomly sample vertex indices (surface points)
+            idx = torch.randint(0, n_verts, (B,), device=dev)
+            surf_pts = verts_W[idx]  # [B, 3] points on surface
 
-        # For each environment, randomly pick OBB axes for palm y and x
-        # Probability ∝ axis length (longer axes more likely for y-axis)
-        probs = obb_lengths / obb_lengths.sum()
-        y_axis_idx = torch.multinomial(probs.expand(B, -1), 1).squeeze(-1)  # [B]
+            # Get outward normals at surface points via SDF gradient
+            surf_pts_q = surf_pts.unsqueeze(1)  # [B, 1, 3]
+            _, surf_normals = self.sdf.query_with_normals(surf_pts_q)
+            # query_with_normals returns INWARD normals, negate for outward
+            outward_normals = -surf_normals[:, 0, :]  # [B, 3]
+            outward_normals = F.normalize(outward_normals, dim=-1)
 
-        # y-axis from OBB, with random sign and noise
-        y_hat = obb_axes[:, y_axis_idx].T  # [B, 3]
-        y_sign = 2.0 * (torch.rand(B, device=dev) > 0.5).float() - 1.0
-        y_hat = y_hat * y_sign.unsqueeze(-1)
-        y_hat = y_hat + 0.15 * torch.randn(B, 3, device=dev)  # von Mises-like noise
-        y_hat = F.normalize(y_hat, dim=-1)
+            # Palm geometry (verified by FK at q=0):
+            #   Inner surface center in BASE frame: [0, 0.005, 0.05]
+            #   Palm inward direction in BASE frame: [0, 0, -1] (base -z)
+            #   So: base -z must point toward object (= inward normal = -outward)
+            #   Equivalently: base +z = outward normal (away from object)
+            # Contact point near finger bases (NOT deep in palm).
+            # The object rests where fingers can reach around it.
+            # In base frame at q=0: finger bases are at z≈0.09, palm inner at z≈0.05.
+            # Contact should be between them, closer to finger bases.
+            palm_contact_base = torch.tensor([0.0, 0.005, 0.085], device=dev)
 
-        # x-axis from remaining OBB axes (palm outward direction)
-        remaining_mask = torch.ones(B, 3, device=dev)
-        remaining_mask.scatter_(1, y_axis_idx.unsqueeze(-1), 0)
-        remaining_probs = obb_lengths.unsqueeze(0) * remaining_mask
-        remaining_probs = remaining_probs / remaining_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        x_axis_idx = torch.multinomial(remaining_probs, 1).squeeze(-1)
+            # Orientation: base z = outward normal (so palm inner face = -z faces object)
+            z_hat = outward_normals  # [B, 3]
 
-        x_hat = obb_axes[:, x_axis_idx].T  # [B, 3]
-        x_sign = 2.0 * (torch.rand(B, device=dev) > 0.5).float() - 1.0
-        x_hat = x_hat * x_sign.unsqueeze(-1)
-        # Orthogonalize x wrt y
-        x_hat = x_hat - (x_hat * y_hat).sum(-1, keepdim=True) * y_hat
-        x_hat = F.normalize(x_hat, dim=-1)
+            # y_hat: prefer OBB longest axis for finger spread along object
+            obb_long = self._obb_axes[:, 0]
+            y_hat = obb_long.unsqueeze(0).expand(B, -1).clone()
+            y_sign = 2.0 * (torch.rand(B, device=dev) > 0.5).float() - 1.0
+            y_hat = y_hat * y_sign.unsqueeze(-1)
+            y_hat = y_hat + 0.15 * torch.randn(B, 3, device=dev)
+            y_hat = y_hat - (y_hat * z_hat).sum(-1, keepdim=True) * z_hat
+            y_hat = F.normalize(y_hat, dim=-1)
+            x_hat = torch.cross(y_hat, z_hat, dim=-1)
+            x_hat = F.normalize(x_hat, dim=-1)
 
-        z_hat = torch.cross(x_hat, y_hat, dim=-1)
-        z_hat = F.normalize(z_hat, dim=-1)
+            R_base = torch.stack([x_hat, y_hat, z_hat], dim=-1)  # [B, 3, 3]
 
-        # For actuation targets: override some environments to approach
-        # from the opposite side of the push direction
-        if n_act and act_positions is not None and act_directions is not None:
-            n_biased = B // 2
-            if act_directions[0] is not None:
-                push_d = torch.tensor(act_directions[0], dtype=torch.float32, device=dev)
-                push_d = F.normalize(push_d, dim=0)
-                # Palm x-axis should point AWAY from push dir (palm faces object)
-                x_hat[:n_biased] = (-push_d).unsqueeze(0) + 0.3 * torch.randn(n_biased, 3, device=dev)
-                x_hat[:n_biased] = F.normalize(x_hat[:n_biased], dim=-1)
-                # Recompute y, z for these
-                rand_ax = torch.randn(n_biased, 3, device=dev)
-                y_hat[:n_biased] = rand_ax - (rand_ax * x_hat[:n_biased]).sum(-1, keepdim=True) * x_hat[:n_biased]
-                y_hat[:n_biased] = F.normalize(y_hat[:n_biased], dim=-1)
-                z_hat[:n_biased] = torch.cross(x_hat[:n_biased], y_hat[:n_biased], dim=-1)
+            # Place base so that palm INNER SURFACE contact point is at the surface:
+            # contact_world = R_base @ palm_contact_base + base_pos = surf_pt + margin * outward
+            margin = 0.002 + 0.008 * torch.rand(B, device=dev)  # 2-10mm outside surface
+            palm_target = surf_pts + margin.unsqueeze(-1) * outward_normals
+            contact_in_world = (R_base @ palm_contact_base.unsqueeze(-1)).squeeze(-1)
+            base_pos = palm_target - contact_in_world
 
-        # Position palm: offset from center along -x_hat (palm faces object)
-        # Bisect: place palm at object boundary + small margin
-        margin = 0.03 + 0.08 * torch.rand(B, device=dev)  # 3-11cm from center
-        palm_pos = c.unsqueeze(0) + margin.unsqueeze(-1) * x_hat - frog_offset * z_hat
-
-        # For actuation: anchor to midpoint of actuation targets
-        if n_act and act_positions is not None:
-            act_mid = torch.stack([
-                torch.tensor(p, dtype=torch.float32, device=dev)
-                for p in act_positions
-            ]).mean(dim=0)
-            anchor = 0.5 * (act_mid + c)
-            n_act_biased = B // 2
-            palm_pos[:n_act_biased] = (
-                anchor.unsqueeze(0)
-                + margin[:n_act_biased].unsqueeze(-1) * x_hat[:n_act_biased]
-                - frog_offset * z_hat[:n_act_biased]
-            )
-
-        palm_pos = palm_pos + 0.01 * torch.randn(B, 3, device=dev)
+        palm_pos = base_pos + 0.005 * torch.randn(B, 3, device=dev)
         self.pos = palm_pos.detach().requires_grad_(True)
 
-        # 5) 6D rotation = [x_column, y_column]
+        # 5) 6D rotation = [x_column, y_column] from the computed R_base
         r6d = torch.cat([x_hat, y_hat], dim=-1)
-        r6d = r6d + 0.15 * torch.randn_like(r6d)
+        r6d = r6d + 0.05 * torch.randn_like(r6d)  # small noise to preserve palm orientation
         self.rot6d = r6d.detach().requires_grad_(True)
 
         # Actuation-finger assignment
@@ -1136,7 +1117,9 @@ class BatchedGraspOptimizer:
 
         # -- Phase 1: Get fingertips onto surface -------------------------
         p1_steps = steps * 2 // 5
-        opt1 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr)
+        # FREEZE rotation: palm orientation (facing object) must be preserved.
+        # Only optimize joints (finger curling) and base position (palm approach).
+        opt1 = torch.optim.Adam([self.u, self.pos], lr=lr)
         sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, p1_steps, lr * 0.1)
         aB = torch.arange(B, device=dev)
 
@@ -1258,7 +1241,8 @@ class BatchedGraspOptimizer:
         # The projection enforces constraints that soft penalties cannot.
 
         p2_steps = steps - p1_steps
-        opt2 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr * 0.5)
+        # FREEZE rotation in Phase 2 as well — preserve palm-on-object orientation
+        opt2 = torch.optim.Adam([self.u, self.pos], lr=lr * 0.5)
         sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, p2_steps, lr * 0.05)
         best_sigma = torch.full((B2,), -1.0, device=dev)
         best_u = self.u.clone().detach()
