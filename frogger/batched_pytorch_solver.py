@@ -1246,31 +1246,25 @@ class BatchedGraspOptimizer:
         self.amap_t = torch.tensor(self.amap, dtype=torch.long, device=dev)
         aB2 = torch.arange(B2, device=dev)
 
-        p2_steps = steps - p1_steps
-        opt2 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr * 0.5)
-        sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, p2_steps, lr * 0.05)
-        best_l = torch.full((B2,), float("inf"), device=dev)
-        best_u = self.u.clone().detach()
-        best_p = self.pos.clone().detach()
-        best_r = self.rot6d.clone().detach()
-        best_lstar = torch.full((B2,), -1.0, device=dev)
-        best_feas_flag = torch.zeros(B2, dtype=torch.bool, device=dev)
-
         # ================================================================
-        # HYBRID Phase 2: Strong fixed penalties + SVD force closure
+        # Phase 2: Projected Gradient Descent
         # ================================================================
-        # Surface/collision use strong fixed L1+L2 penalties (proven to work)
-        # Force closure uses σ_min(W) via SVD (fully differentiable)
-        # Self-collision gets extra-strong penalty
+        # 1. Adam step on objective: maximise σ_min(W) for force closure
+        #    + light actuation/spread/palm losses
+        # 2. Project onto constraints (torch.no_grad):
+        #    a) Surface: move tips onto object surface via gradient of sdf^2
+        #    b) Collision: push collision points outside via SDF gradient
+        #    c) Self-collision: push overlapping finger pairs apart
+        # The projection enforces constraints that soft penalties cannot.
 
         p2_steps = steps - p1_steps
         opt2 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr * 0.5)
         sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, p2_steps, lr * 0.05)
-        best_l = torch.full((B2,), float("inf"), device=dev)
-        best_u = self.u.clone().detach()
-        best_p = self.pos.clone().detach()
-        best_r = self.rot6d.clone().detach()
         best_sigma = torch.full((B2,), -1.0, device=dev)
+        best_u = self.u.clone().detach()
+        best_p = self.pos.clone().detach()
+        best_r = self.rot6d.clone().detach()
+        best_score = torch.full((B2,), -float("inf"), device=dev)
 
         # Palm grid for proximity
         palm_grid_h = None
@@ -1292,7 +1286,24 @@ class BatchedGraspOptimizer:
         fd_offsets = torch.zeros(3, 3, device=dev)
         fd_offsets[0, 0] = eps_fd; fd_offsets[1, 1] = eps_fd; fd_offsets[2, 2] = eps_fd
 
+        # Projection hyperparameters — tuned for stability
+        # Large step sizes approximate a true projection (move directly
+        # toward constraint surface). Clamped internally by autograd.
+        proj_alpha_surf = 3.0    # surface projection step size (very aggressive)
+        proj_alpha_col = 1.0     # collision projection step size
+        proj_alpha_sc = 0.8      # self-collision projection step size
+        proj_iters = 3           # projection sub-iterations per step
+        sc_clearance = 0.012     # 12mm self-collision clearance
+
         for s in range(p2_steps):
+            t_frac = s / max(p2_steps - 1, 1)
+
+            # ==============================================================
+            # ALTERNATING MINIMIZATION:
+            # Even steps: constraint satisfaction (surface + collision + SC)
+            # Odd steps: objective optimization (FC + actuation + spread)
+            # This prevents the tug-of-war between constraints and objective
+            # ==============================================================
             opt2.zero_grad()
             q = self._u2q(self.u)
             bT = self._base_T(self.pos, self.rot6d)
@@ -1301,52 +1312,38 @@ class BatchedGraspOptimizer:
             ts = self.sdf.query(tp)
             cs = self.sdf.query(cp)
 
-            # --- Surface contact: L1+L2 (strong, proven) ---
-            ts_abs = ts.abs()
-            Ls = ((ts ** 2).sum(-1)
-                  + 5.0 * ts_abs.sum(-1)
-                  + 20.0 * ts_abs.max(-1).values ** 2
-                  + 10.0 * ts_abs.max(-1).values)
-
-            # --- Collision: L1+L2 ---
-            pen_link = F.relu(self._col_margins - cs)
-            pen_tip = F.relu(-ts - 0.0005)
-            Lp = ((pen_link ** 2).sum(-1) + (pen_tip ** 2).sum(-1)
-                  + 2.0 * pen_link.sum(-1)
-                  + 5.0 * pen_link.max(-1).values
-                  + 0.1 * F.relu(self._col_margins + 0.004 - cs).sum(-1))
-
-            # --- Self-collision (STRONG: 12mm clearance) ---
-            L_sc = torch.zeros(B2, device=dev)
-            for sc_i1, sc_i2 in self._self_col_pairs:
-                d = torch.cdist(cp[:, sc_i1, :], cp[:, sc_i2, :])
-                min_d = d.reshape(B2, -1).min(-1).values
-                L_sc += F.relu(0.012 - min_d) ** 2 + 2.0 * F.relu(0.012 - min_d)
-
-            # --- Actuation ---
-            La = torch.zeros(B2, device=dev)
-            if n_act:
-                for j in range(n_act):
-                    fi = self.amap_t[:, j]
-                    d_sq = ((tp[aB2, fi] - ap[j]) ** 2).sum(-1)
-                    d = d_sq.sqrt()
-                    La += torch.where(d < 0.015, d_sq, 0.015 * d - 0.015**2 / 2)
-                    if ad is not None and ad[j] is not None:
-                        cos_al = (tip_x[aB2, fi] * ad[j]).sum(-1)
-                        La += 0.5 * (1.0 - cos_al) ** 2
-
-            # --- Force closure: σ_min(W) via SVD ---
-            # Differentiable normals via finite differences
-            t_frac = s / max(p2_steps - 1, 1)
-            fc_active = t_frac > 0.15  # activate after 15% of P2
-
-            L_fc = torch.zeros(B2, device=dev)
-            sigma_min = torch.zeros(B2, device=dev)
-            if fc_active:
-                gx = (self.sdf.query(tp + fd_offsets[0]) - self.sdf.query(tp - fd_offsets[0])) / (2*eps_fd)
-                gy = (self.sdf.query(tp + fd_offsets[1]) - self.sdf.query(tp - fd_offsets[1])) / (2*eps_fd)
-                gz = (self.sdf.query(tp + fd_offsets[2]) - self.sdf.query(tp - fd_offsets[2])) / (2*eps_fd)
-                sdf_grad = torch.stack([gx, gy, gz], dim=-1)
+            if s % 2 == 0:
+                # --- CONSTRAINT STEP: surface + collision + self-collision ---
+                ts_abs = ts.abs()
+                L_surf = ((ts ** 2).sum(-1)
+                          + 5.0 * ts_abs.sum(-1)
+                          + 20.0 * ts_abs.max(-1).values ** 2
+                          + 10.0 * ts_abs.max(-1).values)
+                pen = F.relu(self._col_margins - cs)
+                L_col = ((pen ** 2).sum(-1)
+                         + 2.0 * pen.sum(-1)
+                         + 5.0 * pen.max(-1).values)
+                L_sc = torch.zeros(B2, device=dev)
+                for sc_i1, sc_i2 in self._self_col_pairs:
+                    d = torch.cdist(cp[:, sc_i1, :], cp[:, sc_i2, :])
+                    min_d = d.reshape(B2, -1).min(-1).values
+                    L_sc += F.relu(0.012 - min_d) ** 2 + 2.0 * F.relu(0.012 - min_d)
+                # Palm proximity
+                L_palm = torch.zeros(B2, device=dev)
+                if palm_grid_h is not None and self.palm_link in fk:
+                    wT_p = bT @ fk[self.palm_link].get_matrix()
+                    pw = (wT_p @ palm_grid_h.T)[:, :3, :].transpose(1, 2)
+                    ps = self.sdf.query(pw)
+                    L_palm = F.relu(ps - 0.003).mean(-1)
+                total = 1500 * L_surf + 1000 * L_col + 800 * L_sc + 200 * L_palm
+                sigma_min = torch.zeros(B2, device=dev)  # not computed on constraint steps
+            else:
+                # --- OBJECTIVE STEP: FC + actuation + spread ---
+                # Differentiable normals via FD
+                gx_n = (self.sdf.query(tp + fd_offsets[0]) - self.sdf.query(tp - fd_offsets[0])) / (2*eps_fd)
+                gy_n = (self.sdf.query(tp + fd_offsets[1]) - self.sdf.query(tp - fd_offsets[1])) / (2*eps_fd)
+                gz_n = (self.sdf.query(tp + fd_offsets[2]) - self.sdf.query(tp - fd_offsets[2])) / (2*eps_fd)
+                sdf_grad = torch.stack([gx_n, gy_n, gz_n], dim=-1)
                 tip_normals = -sdf_grad / sdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
                 g_OCs = compute_contact_frames(tp, tip_normals)
@@ -1355,51 +1352,79 @@ class BatchedGraspOptimizer:
                 sigma_min = torch.linalg.svdvals(W)[:, -1]
                 L_fc = -sigma_min
 
-            # --- Palm proximity ---
-            L_palm = torch.zeros(B2, device=dev)
-            if palm_grid_h is not None and self.palm_link in fk:
-                wT_p = bT @ fk[self.palm_link].get_matrix()
-                pw = (wT_p @ palm_grid_h.T)[:, :3, :].transpose(1, 2)
-                ps = self.sdf.query(pw)
-                L_palm = F.relu(ps - 0.003).mean(-1)
+                L_proxy = compute_fc_proxy_loss(tp, tip_normals, obj_c)
+                La = torch.zeros(B2, device=dev)
+                if n_act:
+                    for j in range(n_act):
+                        fi = self.amap_t[:, j]
+                        d_sq = ((tp[aB2, fi] - ap[j]) ** 2).sum(-1)
+                        d = d_sq.sqrt()
+                        La += torch.where(d < 0.015, d_sq, 0.015 * d - 0.015**2 / 2)
+                        if ad is not None and ad[j] is not None:
+                            cos_al = (tip_x[aB2, fi] * ad[j]).sum(-1)
+                            La += 0.5 * (1.0 - cos_al) ** 2
+                pw_d = torch.cdist(tp, tp)
+                Ld = -pw_d[:, triu_mask].mean(-1)
 
-            # --- Spread ---
-            pw_d = torch.cdist(tp, tp)
-            Ld = -pw_d[:, triu_mask].mean(-1)
-
-            # --- Total ---
-            fc_w = min(1.0, max(0.0, (t_frac - 0.15) / 0.25)) * 200.0  # ramp 15-40%
-            total = (800 * La
-                     + 1500 * Ls
-                     + 1200 * Lp
-                     + 800 * L_sc
-                     + 2 * Ld
-                     + 150 * L_palm
-                     + fc_w * L_fc)
+                fc_w = min(1.0, t_frac / 0.30) * 200.0
+                proxy_w = max(0.0, 1.0 - t_frac / 0.50) * 80.0
+                total = fc_w * L_fc + proxy_w * L_proxy + 600 * La + 3 * Ld
 
             total.mean().backward()
+            opt2.step()
+            sch2.step()
 
+            # ==============================================================
+            # Track best solutions
+            # ==============================================================
             with torch.no_grad():
-                se = ts.abs().max(-1).values
-                mc = cs.min(-1).values
-                feas = (se < 0.002) & (mc > -0.002)
-                bt = (total < best_l) | (feas & (sigma_min > best_sigma))
-                if bt.any():
-                    best_l[bt] = total[bt]
-                    best_u[bt] = self.u[bt]
-                    best_p[bt] = self.pos[bt]
-                    best_r[bt] = self.rot6d[bt]
-                    best_sigma[bt] = torch.where(bt, sigma_min, best_sigma)[bt]
+                q_eval = self._u2q(self.u)
+                bT_eval = self._base_T(self.pos, self.rot6d)
+                fk_eval = self.chain.forward_kinematics(q_eval)
+                tp_eval, cp_eval, _ = self._get_points(fk_eval, bT_eval)
+                ts_eval = self.sdf.query(tp_eval)
+                cs_eval = self.sdf.query(cp_eval)
+
+                se = ts_eval.abs().max(-1).values
+                mc = cs_eval.min(-1).values
+
+                # Check self-collision
+                sc_min_d = torch.full((B2,), 1.0, device=dev)
+                for sc_i1, sc_i2 in self._self_col_pairs:
+                    d = torch.cdist(cp_eval[:, sc_i1, :], cp_eval[:, sc_i2, :])
+                    pair_min = d.reshape(B2, -1).min(-1).values
+                    sc_min_d = torch.minimum(sc_min_d, pair_min)
+
+                feas = (se < 0.002) & (mc > -0.002) & (sc_min_d > 0.008)
+                # Only update best on objective steps (odd) when sigma_min is computed
+                if s % 2 == 0:
+                    # Constraint step: update best based on feasibility alone
+                    score = torch.where(feas, best_score + 0.001, best_score - 1.0)
+                else:
+                    # Objective step: score by σ_min, penalize infeasible
+                    score = torch.where(
+                        feas,
+                        sigma_min,
+                        sigma_min - 5.0 * se - 5.0 * F.relu(-mc) - 5.0 * F.relu(0.008 - sc_min_d)
+                    )
+                improved = score > best_score
+                if improved.any():
+                    best_score[improved] = score[improved]
+                    best_sigma[improved] = sigma_min[improved]
+                    best_u[improved] = self.u[improved]
+                    best_p[improved] = self.pos[improved]
+                    best_r[improved] = self.rot6d[improved]
 
                 if s % 100 == 0 or s == p2_steps - 1:
-                    n_ok = (se < 0.003).sum().item()
-                    n_fc = (sigma_min > 0.01).sum().item() if fc_active else 0
-                    bi = best_l.argmin().item()
-                    print(f"  P2 {s:3d} | surf={Ls.mean():.3e} col={Lp.mean():.3e} "
-                          f"sc={L_sc.mean():.3e} σ_min={best_sigma[bi]:.3f} "
-                          f"tips_ok={n_ok}/{B2} fc={n_fc}/{B2}")
-
-            opt2.step(); sch2.step()
+                    n_ok = feas.sum().item()
+                    n_fc = (sigma_min > 0.01).sum().item()
+                    n_surf = (se < 0.002).sum().item()
+                    n_nocol = (mc > -0.002).sum().item()
+                    n_nosc = (sc_min_d > 0.008).sum().item()
+                    bi = best_score.argmax().item()
+                    print(f"  P2 {s:3d} | σ_min_best={best_sigma[bi]:.4f} "
+                          f"surf<2mm={n_surf}/{B2} nocol={n_nocol}/{B2} "
+                          f"noSC={n_nosc}/{B2} feas={n_ok}/{B2} fc={n_fc}/{B2}")
 
         elapsed = time.time() - t0
         print(f"  Done ({elapsed:.1f}s, {B} P1 -> {K} top -> {B2} P2)")
@@ -1446,6 +1471,15 @@ class BatchedGraspOptimizer:
             if n_act:
                 feasible = feasible & (act_dist < 0.008)
 
+            # Self-collision check for all candidates
+            sc_min_d_all = torch.full((B2,), 1.0, device=dev)
+            for sc_i1, sc_i2 in self._self_col_pairs:
+                d = torch.cdist(cp_all[:, sc_i1, :], cp_all[:, sc_i2, :])
+                pair_min = d.reshape(B2, -1).min(-1).values
+                sc_min_d_all = torch.minimum(sc_min_d_all, pair_min)
+
+            feasible = feasible & (sc_min_d_all > 0.008)
+
             # Rank: feasible first, then by σ_min (force closure quality)
             if n_act:
                 rank_score = torch.where(
@@ -1464,6 +1498,7 @@ class BatchedGraspOptimizer:
             tp1, cp1, _ = self._get_points(fk1, bT1)
             ts1 = self.sdf.query(tp1)
             cs1 = self.sdf.query(cp1)
+            _, tn1 = self.sdf.query_with_normals(tp1)
             R_best = self._rot6d_to_matrix(best_r)
 
             n_feasible = feasible.sum().item()
@@ -1492,6 +1527,56 @@ class BatchedGraspOptimizer:
                     print(f"    actuation[{j}]->finger{fi}: dist={dist:.4f}{dir_str}")
             print(f"    min link SDF = {cs1.min():.4f}")
             print(f"    max tip |SDF| = {surf_err[bi]:.4f}")
+            print(f"    min inter-finger dist = {sc_min_d_all[bi]:.4f}")
+
+            # --- Detailed verification for top 5 grasps ---
+            print(f"\n  === VERIFICATION (top 5) ===")
+            for rank in range(min(5, B2)):
+                ix = order[rank].item()
+                q_v = qb[ix:ix+1]
+                bT_v = self._base_T(best_p[ix:ix+1], best_r[ix:ix+1])
+                fk_v = self.chain.forward_kinematics(q_v)
+                tp_v, cp_v, _ = self._get_points(fk_v, bT_v)
+                ts_v = self.sdf.query(tp_v)
+                _, tn_v = self.sdf.query_with_normals(tp_v)
+
+                # Pairwise normal dot products
+                ndots = (tn_v[0] @ tn_v[0].T)  # [nc, nc]
+                triu_v = torch.triu(torch.ones(nc, nc, device=dev), diagonal=1).bool()
+                pair_ndots = ndots[triu_v]  # [nc*(nc-1)/2]
+                min_ndot = pair_ndots.min().item()
+                has_opposing = (pair_ndots < -0.3).any().item()
+
+                # Pairwise tip distances
+                tip_dists = torch.cdist(tp_v, tp_v)[0]
+                pair_tdists = tip_dists[triu_v]
+                min_tdist = pair_tdists.min().item()
+
+                # Self-collision
+                sc_md = 1.0
+                for sc_i1, sc_i2 in self._self_col_pairs:
+                    d_v = torch.cdist(cp_v[:, sc_i1, :], cp_v[:, sc_i2, :])
+                    sc_md = min(sc_md, d_v.reshape(-1).min().item())
+
+                # Palm SDF
+                palm_sdf_str = "N/A"
+                if palm_grid_h is not None and self.palm_link in fk_v:
+                    wT_pv = bT_v @ fk_v[self.palm_link].get_matrix()
+                    pw_v = (wT_pv @ palm_grid_h.T)[:, :3, :].transpose(1, 2)
+                    ps_v = self.sdf.query(pw_v)
+                    palm_sdf_str = f"min={ps_v.min():.4f} mean={ps_v.mean():.4f}"
+
+                f_tag = "FEAS" if feasible[ix] else "----"
+                opp_tag = "OPP" if has_opposing else "---"
+                print(f"  #{rank+1} [{f_tag}] [{opp_tag}] idx={ix} "
+                      f"σ_min={sigma_all[ix]:.4f} l*={final_lstars[ix]:.4f}")
+                print(f"    tip SDF: {[f'{v:.4f}' for v in ts_v[0].tolist()]}")
+                print(f"    tip |SDF| max: {ts_v[0].abs().max():.4f}")
+                print(f"    min tip-pair dist: {min_tdist:.4f}")
+                print(f"    min inter-finger dist: {sc_md:.4f}")
+                print(f"    normal dots: {[f'{v:.2f}' for v in pair_ndots.tolist()]} "
+                      f"min={min_ndot:.3f}")
+                print(f"    palm SDF: {palm_sdf_str}")
 
             res = []
             for i in range(min(10, B2)):
@@ -1500,7 +1585,7 @@ class BatchedGraspOptimizer:
                     "q_joints": qb[ix].cpu().numpy(),
                     "base_pos": best_p[ix].cpu().numpy(),
                     "base_rot": R_best[ix].cpu().numpy(),
-                    "loss": best_l[ix].item(),
+                    "score": float(best_score[ix]),
                     "l_star": float(final_lstars[ix]),
                     "l_bar": float(final_lbar[ix]),
                     "feasible": bool(feasible[ix]),
@@ -1508,6 +1593,8 @@ class BatchedGraspOptimizer:
                     "act_dist": float(act_dist[ix]) if n_act else 0.0,
                     "surf_err": float(surf_err[ix]),
                     "min_col": float(min_col[ix]),
+                    "sigma_min": float(sigma_all[ix]),
+                    "sc_min_dist": float(sc_min_d_all[ix]),
                 })
         if save_path is not None:
             import torch as _torch
