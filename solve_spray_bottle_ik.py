@@ -138,7 +138,7 @@ def compute_palm_points_batch(chain, q, base_T, fk, device):
     return palm_world
 
 
-_COL_CACHE = {}
+_COL_CACHE = {}  # cleared on module reload
 
 def precompute_collision_points(device):
     """Load and cache collision points in link-local frames (call ONCE)."""
@@ -162,7 +162,7 @@ def precompute_collision_points(device):
             vp = np.array(vis_pose, dtype=np.float64)
             Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
             verts = (Rv @ verts.T).T + vp[:3]
-        n_pts = min(32, len(verts))
+        n_pts = min(96, len(verts))  # more points for better collision coverage
         idx = np.random.choice(len(verts), n_pts, replace=False)
         pts = verts[idx].astype(np.float32)
         pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
@@ -257,7 +257,7 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
     init_pos = torch.tensor([-0.05, -0.063, 0.09], dtype=torch.float32, device=dev)
     pos_xz = (torch.tensor([[-0.05, 0.09]], device=dev).expand(B, -1)
               + 0.008 * torch.randn(B, 2, device=dev)).detach().requires_grad_(True)
-    pos_y_fixed = -0.063  # frozen
+    pos_y_fixed = -0.058  # frozen: palm inner at world_y = 0.028+(-0.058) = -0.030
 
     def get_base_pos():
         """Reconstruct [x, y_fixed, z] from optimizable xz."""
@@ -486,7 +486,7 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
                  + w_act * L_act_smooth
                  + 100.0 * L_dir
                  + w_palm * L_palm
-                 + 800.0 * L_col            # STRONG link collision
+                 + 1500.0 * L_col           # VERY STRONG link collision
                  + 200.0 * L_pen_tip
                  + 50.0 * L_th
                  + w_oppose * L_oppose
