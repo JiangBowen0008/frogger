@@ -45,6 +45,7 @@ class BatchedSDF:
         R_WO = X_WO_matrix[:3, :3].astype(np.float64)
         t_WO = X_WO_matrix[:3, 3].astype(np.float64)
         verts_W = (R_WO @ verts_O.astype(np.float64).T).T + t_WO
+        self._verts_W = verts_W  # store for OBB computation
 
         self.bbox_min = np.min(verts_W, axis=0) - bounds_padding
         self.bbox_max = np.max(verts_W, axis=0) + bounds_padding
@@ -889,10 +890,14 @@ class BatchedGraspOptimizer:
 
     # -- initialisation ---------------------------------------------------
     def _init(self, center, n_act, act_positions=None, act_directions=None):
-        """Initialise joint angles and wrist poses.
+        """Initialise joint angles and wrist poses using OBB-based sampling.
 
-        For actuation grasps, biases 75% of hands toward the actuation
-        target so fingers start near both the target and the object body.
+        Replicates FroGGer's HeuristicICSampler strategy:
+        1. Compute object's oriented bounding box (OBB) via PCA
+        2. Sample palm y-axis aligned with OBB axes (probability ∝ length)
+        3. Sample palm x-axis (outward) from remaining OBB axes
+        4. Position palm by offsetting from object center along -x_hat
+        5. Add von-Mises-like noise for diversity
         """
         B, dev = self.num_envs, self.device
 
@@ -919,81 +924,75 @@ class BatchedGraspOptimizer:
 
         c = torch.tensor(center, dtype=torch.float32, device=dev)
 
-        # 1) Approach direction: for actuation grasps, bias 75% toward
-        #    approaching from behind the actuation point (opposite push dir)
-        theta = torch.acos(2 * torch.rand(B, device=dev) - 1)
-        phi = 2 * np.pi * torch.rand(B, device=dev)
-        x_hat = torch.stack([
-            torch.sin(theta) * torch.cos(phi),
-            torch.sin(theta) * torch.sin(phi),
-            torch.cos(theta),
-        ], -1)
+        # --- OBB-based palm pose sampling (following FroGGer) ---
+        # Compute OBB axes from mesh vertices
+        obb_axes = self._obb_axes  # [3, 3] columns = OBB axes, sorted by length
+        obb_lengths = self._obb_lengths  # [3] axis lengths
 
-        # For actuation: bias approach direction to come from opposite
-        # side of push direction, centered on actuation point
-        if n_act and act_positions is not None:
-            n_biased = int(0.75 * B)
-            # Midpoint of all actuation targets
-            act_mid = torch.stack([
-                torch.tensor(p, dtype=torch.float32, device=dev)
-                for p in act_positions
-            ]).mean(dim=0)
+        # For each environment, randomly pick OBB axes for palm y and x
+        # Probability ∝ axis length (longer axes more likely for y-axis)
+        probs = obb_lengths / obb_lengths.sum()
+        y_axis_idx = torch.multinomial(probs.expand(B, -1), 1).squeeze(-1)  # [B]
 
-            # Approach direction: from object center toward actuation point
-            # (so fingers extend past the actuation point to the object body)
-            approach = F.normalize(act_mid - c, dim=0)  # [3]
+        # y-axis from OBB, with random sign and noise
+        y_hat = obb_axes[:, y_axis_idx].T  # [B, 3]
+        y_sign = 2.0 * (torch.rand(B, device=dev) > 0.5).float() - 1.0
+        y_hat = y_hat * y_sign.unsqueeze(-1)
+        y_hat = y_hat + 0.15 * torch.randn(B, 3, device=dev)  # von Mises-like noise
+        y_hat = F.normalize(y_hat, dim=-1)
 
-            # If we have a push direction, approach from opposite side
-            if act_directions is not None and act_directions[0] is not None:
-                push_d = torch.tensor(act_directions[0], dtype=torch.float32, device=dev)
-                push_d = F.normalize(push_d, dim=0)
-                # Approach from opposite the push direction
-                approach = -push_d
+        # x-axis from remaining OBB axes (palm outward direction)
+        remaining_mask = torch.ones(B, 3, device=dev)
+        remaining_mask.scatter_(1, y_axis_idx.unsqueeze(-1), 0)
+        remaining_probs = obb_lengths.unsqueeze(0) * remaining_mask
+        remaining_probs = remaining_probs / remaining_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        x_axis_idx = torch.multinomial(remaining_probs, 1).squeeze(-1)
 
-            # Tiered noise: 50% tight (good for convergence), 25% medium, 25% wide
-            n_tight = n_biased // 2
-            n_med = n_biased // 4
-            x_hat[:n_tight] = approach.unsqueeze(0) + 0.3 * torch.randn(n_tight, 3, device=dev)
-            x_hat[n_tight:n_tight+n_med] = approach.unsqueeze(0) + 0.6 * torch.randn(n_med, 3, device=dev)
-            x_hat[n_tight+n_med:n_biased] = approach.unsqueeze(0) + 1.0 * torch.randn(n_biased-n_tight-n_med, 3, device=dev)
-            x_hat[:n_biased] = F.normalize(x_hat[:n_biased], dim=-1)
+        x_hat = obb_axes[:, x_axis_idx].T  # [B, 3]
+        x_sign = 2.0 * (torch.rand(B, device=dev) > 0.5).float() - 1.0
+        x_hat = x_hat * x_sign.unsqueeze(-1)
+        # Orthogonalize x wrt y
+        x_hat = x_hat - (x_hat * y_hat).sum(-1, keepdim=True) * y_hat
+        x_hat = F.normalize(x_hat, dim=-1)
 
-        # 2) z_hat perpendicular to x_hat
-        rand_axis = torch.randn(B, 3, device=dev)
-        z_hat = rand_axis - (rand_axis * x_hat).sum(-1, keepdim=True) * x_hat
+        z_hat = torch.cross(x_hat, y_hat, dim=-1)
         z_hat = F.normalize(z_hat, dim=-1)
 
-        # 3) y_hat = z_hat x x_hat
-        y_hat = torch.cross(z_hat, x_hat, dim=-1)
-        y_hat = F.normalize(y_hat, dim=-1)
-        z_hat = torch.cross(x_hat, y_hat, dim=-1)
+        # For actuation targets: override some environments to approach
+        # from the opposite side of the push direction
+        if n_act and act_positions is not None and act_directions is not None:
+            n_biased = B // 2
+            if act_directions[0] is not None:
+                push_d = torch.tensor(act_directions[0], dtype=torch.float32, device=dev)
+                push_d = F.normalize(push_d, dim=0)
+                # Palm x-axis should point AWAY from push dir (palm faces object)
+                x_hat[:n_biased] = (-push_d).unsqueeze(0) + 0.3 * torch.randn(n_biased, 3, device=dev)
+                x_hat[:n_biased] = F.normalize(x_hat[:n_biased], dim=-1)
+                # Recompute y, z for these
+                rand_ax = torch.randn(n_biased, 3, device=dev)
+                y_hat[:n_biased] = rand_ax - (rand_ax * x_hat[:n_biased]).sum(-1, keepdim=True) * x_hat[:n_biased]
+                y_hat[:n_biased] = F.normalize(y_hat[:n_biased], dim=-1)
+                z_hat[:n_biased] = torch.cross(x_hat[:n_biased], y_hat[:n_biased], dim=-1)
 
-        # 4) Position palm: offset from object center (or actuation target)
-        margin = 0.02 + 0.12 * torch.rand(B, device=dev)
+        # Position palm: offset from center along -x_hat (palm faces object)
+        # Bisect: place palm at object boundary + small margin
+        margin = 0.03 + 0.08 * torch.rand(B, device=dev)  # 3-11cm from center
+        palm_pos = c.unsqueeze(0) + margin.unsqueeze(-1) * x_hat - frog_offset * z_hat
+
+        # For actuation: anchor to midpoint of actuation targets
         if n_act and act_positions is not None:
-            # Biased envs: position relative to actuation point
-            n_biased = int(0.75 * B)
             act_mid = torch.stack([
                 torch.tensor(p, dtype=torch.float32, device=dev)
                 for p in act_positions
             ]).mean(dim=0)
-            # Mix: center between actuation target and object center
             anchor = 0.5 * (act_mid + c)
-            palm_pos = torch.empty(B, 3, device=dev)
-            palm_pos[:n_biased] = (
+            n_act_biased = B // 2
+            palm_pos[:n_act_biased] = (
                 anchor.unsqueeze(0)
-                + margin[:n_biased].unsqueeze(-1) * x_hat[:n_biased]
-                - frog_offset * z_hat[:n_biased]
+                + margin[:n_act_biased].unsqueeze(-1) * x_hat[:n_act_biased]
+                - frog_offset * z_hat[:n_act_biased]
             )
-            palm_pos[n_biased:] = (
-                c.unsqueeze(0)
-                + margin[n_biased:].unsqueeze(-1) * x_hat[n_biased:]
-                - frog_offset * z_hat[n_biased:]
-            )
-        else:
-            palm_pos = (c.unsqueeze(0)
-                        + margin.unsqueeze(-1) * x_hat
-                        - frog_offset * z_hat)
+
         palm_pos = palm_pos + 0.01 * torch.randn(B, 3, device=dev)
         self.pos = palm_pos.detach().requires_grad_(True)
 
@@ -1043,6 +1042,22 @@ class BatchedGraspOptimizer:
         nc = 5 if self.palm_contact else 4  # number of contacts
         m = nc * ns  # total basis wrenches
 
+        # Compute OBB of object mesh for initialization
+        verts_W = self.sdf._verts_W if hasattr(self.sdf, '_verts_W') else None
+        if verts_W is None:
+            # Fallback: use identity OBB axes
+            self._obb_axes = torch.eye(3, device=dev)
+            self._obb_lengths = torch.ones(3, device=dev)
+        else:
+            cov = np.cov(verts_W.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            order = eigvals.argsort()[::-1]
+            eigvecs = eigvecs[:, order]
+            proj = verts_W @ eigvecs
+            lengths = proj.max(axis=0) - proj.min(axis=0)
+            self._obb_axes = torch.tensor(eigvecs, dtype=torch.float32, device=dev)
+            self._obb_lengths = torch.tensor(lengths, dtype=torch.float32, device=dev)
+
         # Extract actuation positions and directions for biased init
         act_pos_list = [t[0] for t in actuation_targets] if n_act else None
         act_dir_list = [t[1] for t in actuation_targets] if n_act else None
@@ -1068,21 +1083,23 @@ class BatchedGraspOptimizer:
 
         obj_c = torch.tensor(object_center, dtype=torch.float32, device=dev)
 
-        # -- Phase 0: Quick warm-start with high LR ---
-        # Aggressively optimize all parameters to bring tips near surface.
-        # Uses high LR and only surface+actuation losses (no collision yet).
+        # -- Phase 0: Two-stage warm-start ---
+        # Stage A: FREEZE base, optimize JOINTS only (batched IK: curl fingers)
+        # Stage B: Optimize BASE POSITION only (approach object, bring palm near)
         p0_steps = steps // 5
-        opt0 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr * 3.0)
-        sch0 = torch.optim.lr_scheduler.CosineAnnealingLR(opt0, p0_steps, lr * 0.5)
-        for s in range(p0_steps):
-            opt0.zero_grad()
+        p0a = p0_steps * 2 // 3  # joints
+        p0b = p0_steps - p0a      # base approach
+
+        # Stage A: joints only
+        opt0a = torch.optim.Adam([self.u], lr=lr * 3.0)
+        for s in range(p0a):
+            opt0a.zero_grad()
             q = self._u2q(self.u)
             bT = self._base_T(self.pos, self.rot6d)
             fk = self.chain.forward_kinematics(q)
             tp, _, _ = self._get_points(fk, bT)
             ts = self.sdf.query(tp)
             ts_abs = ts.abs()
-            # Pull tips toward surface + actuation (no collision to avoid tug-of-war)
             loss0 = 500 * ((ts ** 2).sum(-1) + 5 * ts_abs.sum(-1)
                            + 20 * ts_abs.max(dim=-1).values ** 2
                            + 10 * ts_abs.max(dim=-1).values)
@@ -1091,7 +1108,24 @@ class BatchedGraspOptimizer:
                     fi = self.amap_t[:, j]
                     loss0 += 200 * ((tp[torch.arange(B, device=dev), fi] - ap[j]) ** 2).sum(-1)
             loss0.mean().backward()
-            opt0.step(); sch0.step()
+            opt0a.step()
+
+        # Stage B: base position only (keep joints and rotation frozen)
+        opt0b = torch.optim.Adam([self.pos], lr=lr * 2.0)
+        for s in range(p0b):
+            opt0b.zero_grad()
+            q = self._u2q(self.u.detach())
+            bT = self._base_T(self.pos, self.rot6d.detach())
+            fk = self.chain.forward_kinematics(q)
+            tp, _, _ = self._get_points(fk, bT)
+            ts = self.sdf.query(tp)
+            ts_abs = ts.abs()
+            loss0 = 500 * ((ts ** 2).sum(-1) + 5 * ts_abs.sum(-1)
+                           + 20 * ts_abs.max(dim=-1).values ** 2
+                           + 10 * ts_abs.max(dim=-1).values)
+            loss0.mean().backward()
+            opt0b.step()
+
         with torch.no_grad():
             q0 = self._u2q(self.u)
             bT0 = self._base_T(self.pos, self.rot6d)
