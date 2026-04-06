@@ -354,11 +354,11 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
 
         total = (500.0 * L_surf
                  + 300.0 * L_act
-                 + 50.0 * L_dir
+                 + 100.0 * L_dir
                  + 100.0 * L_th
                  + 80.0 * L_mf
                  + 80.0 * L_rf
-                 + 200.0 * L_palm
+                 + 500.0 * L_palm
                  + 500.0 * L_col           # STRONG collision avoidance
                  + 200.0 * L_pen_tip       # tip penetration
                  + 20.0 * L_pos_reg        # moderate position reg
@@ -479,12 +479,12 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
         t_frac = step / max(steps // 2 - 1, 1)
         w_act = 300.0
         w_surf = 500.0 + 500.0 * t_frac
-        w_palm = 200.0
+        w_palm = 500.0
         w_oppose = 30.0 * min(1.0, t_frac / 0.3)
 
         total = (w_surf * L_surf
                  + w_act * L_act_smooth
-                 + 50.0 * L_dir
+                 + 100.0 * L_dir
                  + w_palm * L_palm
                  + 800.0 * L_col            # STRONG link collision
                  + 200.0 * L_pen_tip
