@@ -41,7 +41,9 @@ class CapsuleModel:
         self.device = device
         self.capsules = {}  # link_name -> (p0, p1, radius) in link frame
 
-        mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{hand}")
+        mesh_dir = os.path.join(os.path.dirname(__file__), f"models/leap_{hand}")
+        if not os.path.exists(mesh_dir):
+            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{hand}")
         vis_meshes = _visual_meshes(hand, hand_type)
         _, col_names = _link_names(hand, hand_type)
 
@@ -145,49 +147,35 @@ class CapsuleModel:
 # Contact projection
 # ============================================================
 def project_tips_to_surface(chain, u, base_T, sdf, q_lo, q_hi,
-                            tip_links, tip_offsets, n_steps=5, lr=0.5):
-    """Project fingertips onto the object surface using IK steps.
+                            tip_links, tip_offsets, skip_indices=None,
+                            n_steps=5, lr=2.0):
+    """Project fingertips onto the object surface.
 
-    After each optimizer step, this function adjusts joint angles
-    to move fingertips toward SDF=0.
+    Uses aggressive gradient steps on sdf² with high LR.
+    Also clips sdf to prevent overshooting.
     """
     dev = u.device
+    if skip_indices is None:
+        skip_indices = []
 
-    for _ in range(n_steps):
-        with torch.no_grad():
-            q = q_lo + torch.sigmoid(u) * (q_hi - q_lo)
-            fk = chain.forward_kinematics(q)
-
-            tips = []
-            for link, off in zip(tip_links, tip_offsets):
-                T = fk[link].get_matrix()[0]
-                tip = base_T[0, :3, :3] @ (T[:3, :3] @ off + T[:3, 3]) + base_T[0, :3, 3]
-                tips.append(tip)
-
-            tp = torch.stack(tips).unsqueeze(0)  # [1, nc, 3]
-            sdf_vals, normals = sdf.query_with_normals(tp.cuda())
-            sdf_vals = sdf_vals.cpu()[0]  # [nc]
-            normals = normals.cpu()[0]    # [nc, 3] inward normals
-
-            # Target: move each tip by -sdf * (-normal) = sdf * normal (toward surface)
-            # (normals point inward, sdf>0 means outside, so move inward)
-            delta = -sdf_vals.unsqueeze(-1) * (-normals)  # [nc, 3]
-
-        # Compute gradient of sum(sdf²) w.r.t. u to get the projection direction
+    for step in range(n_steps):
         u_proj = u.detach().requires_grad_(True)
         q_proj = q_lo + torch.sigmoid(u_proj) * (q_hi - q_lo)
         fk_proj = chain.forward_kinematics(q_proj)
-        tips_proj = []
-        for link, off in zip(tip_links, tip_offsets):
+
+        surf_loss = torch.tensor(0.0)
+        for i, (link, off) in enumerate(zip(tip_links, tip_offsets)):
+            if i in skip_indices:
+                continue
             T = fk_proj[link].get_matrix()[0]
             tip = base_T[0, :3, :3] @ (T[:3, :3] @ off + T[:3, 3]) + base_T[0, :3, 3]
-            tips_proj.append(tip)
-        tp_proj = torch.stack(tips_proj)
-        sdf_proj = sdf.query(tp_proj.unsqueeze(0).cuda()).cpu()
-        surf_loss = (sdf_proj ** 2).sum()
+            s = sdf.query(tip.unsqueeze(0).unsqueeze(0).cuda()).cpu()
+            # L2 + strong L1 for constant gradient far from surface
+            surf_loss = surf_loss + (s ** 2).sum() + 5.0 * s.abs().sum()
         surf_loss.backward()
 
         if u_proj.grad is not None:
+            # Adaptive LR: larger when far from surface
             u.data -= lr * u_proj.grad
 
 
@@ -322,9 +310,9 @@ def solve_constrained_grasp(
                 tips.append(tip)
                 tip_x.append(bT[0, :3, :3] @ T[:3, 0])
 
-            # === Objective: actuation + force closure proxy ===
-            L = 60 * ((tips[0] - act_pos) ** 2).sum()
-            L += 25 * (1 - (tip_x[0] * target_dir).sum()) ** 2
+            # === Objective: actuation (DOMINANT) + force closure proxy ===
+            L = 300 * ((tips[0] - act_pos) ** 2).sum()
+            L += 50 * (1 - (tip_x[0] * target_dir).sum()) ** 2
 
             # === Palm contact at margin ===
             pw = (bT[0, :3, :3] @ pp_base.T).T + bT[0, :3, 3]
@@ -336,27 +324,50 @@ def solve_constrained_grasp(
             L += 20 * ((tips[2] - rf_target) ** 2).sum()
             L += 20 * ((tips[3] - th_target) ** 2).sum()
 
-            # === Surface contact for ALL fingers (strong) ===
+            # === Surface contact for MF, RF, TH (NOT IF — actuation handles it) ===
+            non_if_tips = torch.stack(tips[1:]).unsqueeze(0)  # skip IF
+            ts_noif = sdf.query(non_if_tips.cuda()).cpu()
+            L += 500 * (ts_noif ** 2).sum() + 200 * ts_noif.abs().sum()
+            L += 1000 * ts_noif.abs().max()  # worst finger
+            # Also query all tips for reporting
             tp = torch.stack(tips).unsqueeze(0)
             ts = sdf.query(tp.cuda()).cpu()
-            L += 100 * (ts ** 2).sum()  # STRONG surface penalty
 
             # === Capsule collision (replaces point-cloud) ===
             _, cap_pen = capsule_model.query_collision(fk, bT, sdf)
             L += 200 * cap_pen
 
+            # === Palm anti-penetration (dense grid, in same loss) ===
+            palm_R_np = np.array([[-0, 0, -1], [0, 1, 0], [1, 0, -0]])
+            palm_t_np = np.array([0, 0.035, 0.1])
+            if not hasattr(solve_constrained_grasp, '_pp_dense'):
+                pp_d = []
+                for px in np.linspace(-0.01, -0.09, 8):
+                    for py in np.linspace(-0.06, 0.02, 6):
+                        pp_d.append([px, py, 0])
+                solve_constrained_grasp._pp_dense = torch.tensor(
+                    (palm_R_np @ np.array(pp_d).T).T + palm_t_np,
+                    dtype=torch.float32,
+                )
+            pw_d = (bT[0, :3, :3] @ solve_constrained_grasp._pp_dense.T).T + bT[0, :3, 3]
+            ps_d = sdf.query(pw_d.unsqueeze(0).cuda()).cpu()
+            L += 100 * F.relu(-ps_d - 0.002).sum()  # light palm anti-pen
+
             # === Position/rotation regularization ===
-            L += 50 * ((pos - pos_init) ** 2).sum()
-            L += 30 * ((rot6d - r6d_init) ** 2).sum()
+            L += 20 * ((pos - pos_init) ** 2).sum()
+            L += 15 * ((rot6d - r6d_init) ** 2).sum()
 
             L.backward()
             opt.step()
 
             # === CONSTRAINT PROJECTION: force tips onto surface ===
-            if s % 10 == 0 and s > 100:
+            # Skip IF (index 0) — it should stay at actuation point
+            if s % 5 == 0 and s > 50:  # more frequent projection
                 project_tips_to_surface(
                     chain, u, bT.detach(), sdf, q_lo, q_hi,
-                    tip_links, tip_offsets, n_steps=3, lr=0.3,
+                    tip_links, tip_offsets,
+                    skip_indices=[0],  # don't project IF
+                    n_steps=3, lr=0.3,
                 )
 
         # Evaluate
