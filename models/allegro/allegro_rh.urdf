@@ -1,0 +1,344 @@
+<?xml version="1.0" ?>
+<robot name="algr_rh">
+  <link name="algr_rh_palm">
+    <inertial>
+      <origin xyz="-0.0093 0 0.0475" rpy="0 0 0" />
+      <mass value="0.4154" />
+      <inertia ixx="0.00075444" ixy="0" ixz="0" iyy="0.00037004" iyz="0" izz="0.00049964" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.095" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/base_link_right.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_if_bs">
+    <inertial>
+      <origin xyz="0 0 0.0082" rpy="0 0 0" />
+      <mass value="0.0119" />
+      <inertia ixx="1.0167e-06" ixy="0" ixz="0" iyy="6.4768e-07" iyz="0" izz="1.1309e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_0.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_if_px">
+    <inertial>
+      <origin xyz="0 -6.9389e-18 0.027" rpy="0 0 0" />
+      <mass value="0.065" />
+      <inertia ixx="1.9891e-05" ixy="0" ixz="0" iyy="1.7876e-05" iyz="0" izz="6.1772e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_1.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_if_md">
+    <inertial>
+      <origin xyz="0 6.9389e-18 0.0192" rpy="0 0 0" />
+      <mass value="0.0355" />
+      <inertia ixx="6.5995e-06" ixy="0" ixz="0" iyy="5.4987e-06" iyz="0" izz="3.3737e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_2.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_if_ds">
+    <inertial>
+      <origin xyz="0 1.3878e-17 0.011823" rpy="0 0 0" />
+      <mass value="0.0264" />
+      <inertia ixx="4.7816e-06" ixy="0" ixz="0" iyy="4.4476e-06" iyz="0" izz="2.0646e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_3.0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0.0267" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/link_3.0_tip.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_mf_bs">
+    <inertial>
+      <origin xyz="0 0 0.0082" rpy="0 0 0" />
+      <mass value="0.0119" />
+      <inertia ixx="1.0167e-06" ixy="0" ixz="0" iyy="6.4768e-07" iyz="0" izz="1.1309e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_0.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_mf_px">
+    <inertial>
+      <origin xyz="0 0 0.027" rpy="0 0 0" />
+      <mass value="0.065" />
+      <inertia ixx="1.9891e-05" ixy="0" ixz="0" iyy="1.7876e-05" iyz="0" izz="6.1772e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_1.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_mf_md">
+    <inertial>
+      <origin xyz="0 0 0.0192" rpy="0 0 0" />
+      <mass value="0.0355" />
+      <inertia ixx="6.5995e-06" ixy="0" ixz="0" iyy="5.4987e-06" iyz="0" izz="3.3737e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_2.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_mf_ds">
+    <inertial>
+      <origin xyz="0 0 0.011823" rpy="0 0 0" />
+      <mass value="0.0264" />
+      <inertia ixx="4.7816e-06" ixy="0" ixz="0" iyy="4.4476e-06" iyz="0" izz="2.0646e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_3.0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0.0267" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/link_3.0_tip.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_rf_bs">
+    <inertial>
+      <origin xyz="0 0 0.0082" rpy="0 0 0" />
+      <mass value="0.0119" />
+      <inertia ixx="1.0167e-06" ixy="0" ixz="0" iyy="6.4768e-07" iyz="0" izz="1.1309e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_0.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_rf_px">
+    <inertial>
+      <origin xyz="0 6.9389e-18 0.027" rpy="0 0 0" />
+      <mass value="0.065" />
+      <inertia ixx="1.9891e-05" ixy="0" ixz="0" iyy="1.7876e-05" iyz="0" izz="6.1772e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_1.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_rf_md">
+    <inertial>
+      <origin xyz="0 -6.9389e-18 0.0192" rpy="0 0 0" />
+      <mass value="0.0355" />
+      <inertia ixx="6.5995e-06" ixy="0" ixz="0" iyy="5.4987e-06" iyz="0" izz="3.3737e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_2.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_rf_ds">
+    <inertial>
+      <origin xyz="0 -1.3878e-17 0.011823" rpy="0 0 0" />
+      <mass value="0.0264" />
+      <inertia ixx="4.7816e-06" ixy="0" ixz="0" iyy="4.4476e-06" iyz="0" izz="2.0646e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_3.0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0.0267" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/link_3.0_tip.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_th_mp">
+    <inertial>
+      <origin xyz="-0.0179 0.009 0.0145" rpy="0 0 0" />
+      <mass value="0.0176" />
+      <inertia ixx="4.7318e-06" ixy="0" ixz="0" iyy="4.9161e-06" iyz="0" izz="3.5752e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_12.0_right.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_th_bs">
+    <inertial>
+      <origin xyz="-6.9389e-18 -5.2042e-18 0.00885" rpy="0 0 0" />
+      <mass value="0.0119" />
+      <inertia ixx="1.0606e-06" ixy="0" ixz="0" iyy="6.9164e-07" iyz="-7.1621e-38" izz="1.1309e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_13.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_th_px">
+    <inertial>
+      <origin xyz="-6.9389e-18 3.4694e-18 0.0257" rpy="0 0 0" />
+      <mass value="0.038" />
+      <inertia ixx="1.0761e-05" ixy="0" ixz="0" iyy="9.5827e-06" iyz="0" izz="3.6113e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_14.0.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <link name="algr_rh_th_ds">
+    <inertial>
+      <origin xyz="-6.9389e-18 -1.7347e-17 0.019365" rpy="0 0 0" />
+      <mass value="0.0556" />
+      <inertia ixx="1.6162e-05" ixy="0" ixz="0" iyy="1.5383e-05" iyz="0" izz="4.4611e-06" />
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="meshes/link_15.0.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0.0423" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/link_15.0_tip.obj" />
+      </geometry>
+    </visual>
+  </link>
+  <joint name="algr_rh_if_axl" type="revolute">
+    <parent link="algr_rh_palm" />
+    <child link="algr_rh_if_bs" />
+    <origin xyz="0 0.0435 0.093458" rpy="-0.087267 0 0" />
+    <axis xyz="0 -3.0743998e-07 1" />
+    <limit lower="-0.47" upper="0.47" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_if_mcp" type="revolute">
+    <parent link="algr_rh_if_bs" />
+    <child link="algr_rh_if_px" />
+    <origin xyz="0 -3.97115e-07 0.016400375" rpy="0 0 0" />
+    <axis xyz="0 1 3.0743998e-07" />
+    <limit lower="-0.196" upper="1.61" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_if_pip" type="revolute">
+    <parent link="algr_rh_if_px" />
+    <child link="algr_rh_if_md" />
+    <origin xyz="0 6.0339918e-07 0.05399954" rpy="0 0 0" />
+    <axis xyz="0 1 3.0743998e-07" />
+    <limit lower="-0.174" upper="1.709" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_if_dip" type="revolute">
+    <parent link="algr_rh_if_md" />
+    <child link="algr_rh_if_ds" />
+    <origin xyz="0 1.872352e-07 0.038400142" rpy="0 0 0" />
+    <axis xyz="0 1 3.0743998e-07" />
+    <limit lower="-0.227" upper="1.618" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_mf_axl" type="revolute">
+    <parent link="algr_rh_palm" />
+    <child link="algr_rh_mf_bs" />
+    <origin xyz="0 0 0.0957" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.47" upper="0.47" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_mf_mcp" type="revolute">
+    <parent link="algr_rh_mf_bs" />
+    <child link="algr_rh_mf_px" />
+    <origin xyz="0 0 0.0164" rpy="0 0 0" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.196" upper="1.61" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_mf_pip" type="revolute">
+    <parent link="algr_rh_mf_px" />
+    <child link="algr_rh_mf_md" />
+    <origin xyz="0 0 0.054" rpy="0 0 0" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.174" upper="1.709" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_mf_dip" type="revolute">
+    <parent link="algr_rh_mf_md" />
+    <child link="algr_rh_mf_ds" />
+    <origin xyz="0 0 0.0384" rpy="0 0 0" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.227" upper="1.618" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_rf_axl" type="revolute">
+    <parent link="algr_rh_palm" />
+    <child link="algr_rh_rf_bs" />
+    <origin xyz="0 -0.0435 0.093458" rpy="0.087267 0 0" />
+    <axis xyz="0 3.0743998e-07 1" />
+    <limit lower="-0.47" upper="0.47" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_rf_mcp" type="revolute">
+    <parent link="algr_rh_rf_bs" />
+    <child link="algr_rh_rf_px" />
+    <origin xyz="0 3.97115e-07 0.016400375" rpy="0 0 0" />
+    <axis xyz="0 1 -3.0743998e-07" />
+    <limit lower="-0.196" upper="1.61" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_rf_pip" type="revolute">
+    <parent link="algr_rh_rf_px" />
+    <child link="algr_rh_rf_md" />
+    <origin xyz="0 -6.0339918e-07 0.05399954" rpy="0 0 0" />
+    <axis xyz="0 1 -3.0743998e-07" />
+    <limit lower="-0.174" upper="1.709" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_rf_dip" type="revolute">
+    <parent link="algr_rh_rf_md" />
+    <child link="algr_rh_rf_ds" />
+    <origin xyz="0 -1.872352e-07 0.038400142" rpy="0 0 0" />
+    <axis xyz="0 1 -3.0743998e-07" />
+    <limit lower="-0.227" upper="1.618" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_th_cmc" type="revolute">
+    <parent link="algr_rh_palm" />
+    <child link="algr_rh_th_mp" />
+    <origin xyz="-0.0182 0.019333 0.049013" rpy="3.14159 -1.48353 1.5708" />
+    <axis xyz="-1 -3.2014079e-07 -3.6576539e-07" />
+    <limit lower="0.263" upper="1.396" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_th_axl" type="revolute">
+    <parent link="algr_rh_th_mp" />
+    <child link="algr_rh_th_bs" />
+    <origin xyz="-0.027000232 0.0050000315 0.039900048" rpy="-5.459392e-23 0 1.323489e-23" />
+    <axis xyz="-3.6576571e-07 1.0056376e-06 1" />
+    <limit lower="-0.105" upper="1.163" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_th_mcp" type="revolute">
+    <parent link="algr_rh_th_bs" />
+    <child link="algr_rh_th_px" />
+    <origin xyz="6.8258362e-07 1.7800303e-08 0.017700295" rpy="-5.459392e-23 0 1.323489e-23" />
+    <axis xyz="-3.2014042e-07 1 -1.0056377e-06" />
+    <limit lower="-0.189" upper="1.644" effort="0.7" velocity="7.0" />
+  </joint>
+  <joint name="algr_rh_th_ipl" type="revolute">
+    <parent link="algr_rh_th_px" />
+    <child link="algr_rh_th_ds" />
+    <origin xyz="-2.3657614e-07 5.1689311e-08 0.051399611" rpy="-5.459392e-23 0 1.323489e-23" />
+    <axis xyz="-3.2014042e-07 1 -1.0056377e-06" />
+    <limit lower="-0.162" upper="1.719" effort="0.7" velocity="7.0" />
+  </joint>
+</robot>
