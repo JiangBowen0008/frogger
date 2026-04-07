@@ -251,17 +251,21 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
     # The IF extends in +z base direction by ~7cm, world +x direction
     # But we need it to curl AROUND, not just extend straight
 
-    # Base position: y is FROZEN at -0.063 so palm contacts bottle
-    # (palm inner at base_x=0.028, world_y = 0.028 + (-0.063) = -0.035 = bottle surface)
-    # Only x and z are optimizable
-    init_pos = torch.tensor([-0.05, -0.063, 0.09], dtype=torch.float32, device=dev)
-    pos_xz = (torch.tensor([[-0.05, 0.09]], device=dev).expand(B, -1)
-              + 0.008 * torch.randn(B, 2, device=dev)).detach().requires_grad_(True)
-    pos_y_fixed = -0.058  # frozen: palm inner at world_y = 0.028+(-0.058) = -0.030
+    # Base position: x and y are FROZEN so palm stays centered on bottle
+    # world_x = base_z + pos_x. Palm at base z=0.05, bottle center x=-0.005
+    # => pos_x = -0.005 - 0.05 = -0.055
+    # world_y = base_x + pos_y. Palm inner at base x=0.028, bottle surface y=-0.030
+    # => pos_y = -0.030 - 0.028 = -0.058
+    # Base position: y is FROZEN, x and z are optimizable with strong regularization
+    pos_y_fixed = -0.058
+    init_xz = torch.tensor([-0.055, 0.07], dtype=torch.float32, device=dev)
+    pos_xz = (init_xz.unsqueeze(0).expand(B, -1)
+              + 0.005 * torch.randn(B, 2, device=dev)).detach().requires_grad_(True)
 
     def get_base_pos():
         """Reconstruct [x, y_fixed, z] from optimizable xz."""
-        y_col = torch.full((pos_xz.shape[0], 1), pos_y_fixed, device=dev)
+        B_cur = pos_xz.shape[0]
+        y_col = torch.full((B_cur, 1), pos_y_fixed, device=dev)
         return torch.cat([pos_xz[:, :1], y_col, pos_xz[:, 1:]], dim=-1)
 
     base_pos_param = get_base_pos()  # initial value for reference
@@ -347,7 +351,7 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
         L_pen_tip = F.relu(-ts - 0.001).sum(-1)
 
         # 8. Position regularization: keep base position close to init (STRONG)
-        L_pos_reg = ((get_base_pos() - init_pos) ** 2).sum(-1)
+        L_pos_reg = ((pos_xz - init_xz) ** 2).sum(-1)
 
         # 9. Finger spread: MF, RF, TH should be on opposite side from palm
         L_spread = F.relu(-tip_pos[:, 1, 1]) + F.relu(-tip_pos[:, 2, 1]) + F.relu(-tip_pos[:, 3, 1])
@@ -361,7 +365,7 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
                  + 500.0 * L_palm
                  + 500.0 * L_col           # STRONG collision avoidance
                  + 200.0 * L_pen_tip       # tip penetration
-                 + 20.0 * L_pos_reg        # moderate position reg
+                 + 100.0 * L_pos_reg       # strong position reg to prevent x drift
                  + 50.0 * L_spread)
 
         total.mean().backward()
@@ -400,7 +404,7 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
     B2 = K * M
     with torch.no_grad():
         u2 = u_param[top_idx].repeat(M, 1) + 0.05 * torch.randn(K * M, 16, device=dev)
-        p2_xz = pos_xz[top_idx].repeat(M, 1) + 0.002 * torch.randn(K * M, 2, device=dev)
+        p2_xz = pos_xz[top_idx].repeat(M, 1) + 0.003 * torch.randn(K * M, 2, device=dev)
     u_param = u2.detach().requires_grad_(True)
     pos_xz = p2_xz.detach().requires_grad_(True)
 
@@ -474,7 +478,7 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
         L_spread_dist = -pw[:, triu_mask].mean(-1)
 
         # Position reg
-        L_pos_reg = ((get_base_pos() - init_pos) ** 2).sum(-1)
+        L_pos_reg = ((pos_xz - init_xz) ** 2).sum(-1)
 
         t_frac = step / max(steps // 2 - 1, 1)
         w_act = 300.0
@@ -491,7 +495,7 @@ def solve_ik(num_envs=512, steps=2000, lr=0.008):
                  + 50.0 * L_th
                  + w_oppose * L_oppose
                  + 3.0 * L_spread_dist
-                 + 30.0 * L_pos_reg)
+                 + 100.0 * L_pos_reg)
 
         total.mean().backward()
         opt2.step()
