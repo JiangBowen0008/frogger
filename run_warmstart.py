@@ -63,13 +63,16 @@ def rot6d_to_matrix(r):
 results = []
 for trial in range(10):
     torch.manual_seed(trial * 7 + 1)
-    # Initialize IF at the specific curl that reaches actuation with correct dir
-    # Found via exhaustive search: axl=0.2, mcp=0.67, pip=0.7, dip=0.7
-    u_start = u_init.clone()
-    # Convert percentage to u-space via inverse sigmoid
-    if_pcts = torch.tensor([0.2, 0.667, 0.7, 0.7])
-    u_start[:4] = torch.log(if_pcts / (1.0 - if_pcts))  # logit
-    u = (u_start.unsqueeze(0) + 0.05 * torch.randn(1, 16)).requires_grad_(True)
+    # Initialize ALL fingers at moderate-high curl to be near the object
+    # This ensures fingers start within reach of the surface
+    default_pcts = torch.tensor([
+        0.98, 0.3, 0.5, 0.5,  # IF: exact values for actuation reach
+        0.3, 0.5, 0.6, 0.6,   # MF: moderate curl
+        0.3, 0.5, 0.6, 0.6,   # RF: moderate curl
+        0.5, 0.5, 0.5, 0.4,   # TH: moderate
+    ])
+    u_start = torch.log(default_pcts / (1.0 - default_pcts))
+    u = (u_start.unsqueeze(0) + 0.2 * torch.randn(1, 16)).requires_grad_(True)
     pos = (
         torch.tensor(pos_ws).unsqueeze(0) + 0.003 * torch.randn(1, 3)
     ).requires_grad_(True)
