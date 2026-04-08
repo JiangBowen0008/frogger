@@ -41,7 +41,7 @@ tip_links = [
 ]
 
 # Load warm start
-ws = torch.load("output/grasps/spray_bottle_act_warmstart.pt", weights_only=False)[0]
+ws = torch.load("output/grasps/spray_bottle_good_warmstart.pt", weights_only=False)[0]
 u_init = torch.log(
     (torch.tensor(ws["q_joints"]) - q_lo) / (q_hi - torch.tensor(ws["q_joints"]))
 ).clamp(-5, 5)
@@ -69,7 +69,8 @@ for trial in range(10):
     ).requires_grad_(True)
     rot6d = (r6d_ws.unsqueeze(0) + 0.03 * torch.randn(1, 6)).requires_grad_(True)
 
-    opt = torch.optim.Adam([u, pos, rot6d], lr=0.003)
+    # FREEZE base pose — only optimize joints
+    opt = torch.optim.Adam([u], lr=0.005)
 
     for s in range(1500):
         opt.zero_grad()
@@ -98,13 +99,51 @@ for trial in range(10):
         L += 300 * (ts_noif ** 2).sum() + 100 * ts_noif.abs().sum()
         L += 500 * ts_noif.abs().max()
 
+        # Palm contact at margin
+        palm_R_np = np.array([[-0, 0, -1], [0, 1, 0], [1, 0, -0]])
+        palm_t_np = np.array([0, 0.035, 0.1])
+        pp_link = np.array([
+            [-0.03, -0.03, 0], [-0.05, -0.03, 0], [-0.07, -0.03, 0],
+            [-0.03, 0.01, 0], [-0.05, 0.01, 0], [-0.07, 0.01, 0],
+        ])
+        pp_base = torch.tensor(
+            (palm_R_np @ pp_link.T).T + palm_t_np, dtype=torch.float32,
+        )
+        pw = (bT[0, :3, :3] @ pp_base.T).T + bT[0, :3, 3]
+        ps = sdf.query(pw.unsqueeze(0).cuda()).cpu()
+        L += 60 * ((ps - 0.002) ** 2).sum()  # STRONG palm contact
+
+        # Palm anti-penetration
+        pp_dense_link = []
+        for px in np.linspace(-0.01, -0.09, 8):
+            for py in np.linspace(-0.06, 0.02, 6):
+                pp_dense_link.append([px, py, 0])
+        pp_dense_base = torch.tensor(
+            (palm_R_np @ np.array(pp_dense_link).T).T + palm_t_np,
+            dtype=torch.float32,
+        )
+        pw_d = (bT[0, :3, :3] @ pp_dense_base.T).T + bT[0, :3, 3]
+        ps_d = sdf.query(pw_d.unsqueeze(0).cuda()).cpu()
+        L += 200 * torch.relu(-ps_d - 0.001).sum()
+
         # Tip penetration
         all_ts = sdf.query(torch.stack(tips).unsqueeze(0).cuda()).cpu()
         L += 50 * torch.relu(-all_ts - 0.001).sum()
 
-        # Position/rotation reg
-        L += 30 * ((pos - torch.tensor(pos_ws)) ** 2).sum()
-        L += 20 * ((rot6d - r6d_ws) ** 2).sum()
+        # Link body collision (capsule model)
+        from constrained_grasp_solver import CapsuleModel
+        if not hasattr(project_tips_to_surface, '_cap') or trial == 0 and s == 0:
+            project_tips_to_surface._cap = CapsuleModel("rh", "leap", device="cpu")
+        # Exclude ALL fingertip (ds) links + IF from collision
+        # ds links must touch surface; IF must reach actuation
+        _, cap_pen = project_tips_to_surface._cap.query_collision(
+            fk, bT, sdf, exclude_links=["_ds", "if_"]
+        )
+        L += 100 * cap_pen
+
+        # Position/rotation reg (STRONG to keep palm on correct side)
+        L += 80 * ((pos - torch.tensor(pos_ws)) ** 2).sum()
+        L += 50 * ((rot6d - r6d_ws) ** 2).sum()
 
         L.backward()
         opt.step()

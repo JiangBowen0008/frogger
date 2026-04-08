@@ -81,8 +81,9 @@ class CapsuleModel:
             perp = (verts - center) - along
             radius = np.sqrt((perp ** 2).sum(axis=1)).max()
 
-            # Shrink radius slightly to avoid over-conservative collision
-            radius *= 0.85
+            # Shrink radius significantly — LEAP links have irregular shapes
+            # that capsules overestimate. Use 60% of max radius.
+            radius *= 0.60
 
             self.capsules[nm] = (
                 torch.tensor(p0, dtype=torch.float32, device=device),
@@ -92,7 +93,7 @@ class CapsuleModel:
 
         print(f"  CapsuleModel: {len(self.capsules)} links")
 
-    def query_collision(self, fk, base_T, sdf, exclude_palm=True):
+    def query_collision(self, fk, base_T, sdf, exclude_palm=True, exclude_links=None):
         """Check capsule-object collision for all links.
 
         Returns:
@@ -103,8 +104,12 @@ class CapsuleModel:
         violations = []
         all_pen = torch.tensor(0.0, device=dev)
 
+        if exclude_links is None:
+            exclude_links = []
         for nm, (p0_local, p1_local, radius) in self.capsules.items():
             if exclude_palm and 'palm' in nm:
+                continue
+            if any(ex in nm for ex in exclude_links):
                 continue
             if nm not in fk:
                 continue
