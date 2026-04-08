@@ -63,7 +63,13 @@ def rot6d_to_matrix(r):
 results = []
 for trial in range(10):
     torch.manual_seed(trial * 7 + 1)
-    u = (u_init.unsqueeze(0) + 0.1 * torch.randn(1, 16)).requires_grad_(True)
+    # Initialize IF at the specific curl that reaches actuation with correct dir
+    # Found via exhaustive search: axl=0.2, mcp=0.67, pip=0.7, dip=0.7
+    u_start = u_init.clone()
+    # Convert percentage to u-space via inverse sigmoid
+    if_pcts = torch.tensor([0.2, 0.667, 0.7, 0.7])
+    u_start[:4] = torch.log(if_pcts / (1.0 - if_pcts))  # logit
+    u = (u_start.unsqueeze(0) + 0.05 * torch.randn(1, 16)).requires_grad_(True)
     pos = (
         torch.tensor(pos_ws).unsqueeze(0) + 0.003 * torch.randn(1, 3)
     ).requires_grad_(True)
