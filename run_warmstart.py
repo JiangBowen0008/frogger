@@ -117,7 +117,7 @@ for trial in range(10):
         )
         pw = (bT[0, :3, :3] @ pp_base.T).T + bT[0, :3, 3]
         ps = sdf.query(pw.unsqueeze(0).cuda()).cpu()
-        L += 60 * ((ps - 0.002) ** 2).sum()  # STRONG palm contact
+        L += 60 * ((ps - 0.008) ** 2).sum()  # palm at 8mm margin (prevents deep pen)
 
         # Palm anti-penetration
         pp_dense_link = []
@@ -130,7 +130,7 @@ for trial in range(10):
         )
         pw_d = (bT[0, :3, :3] @ pp_dense_base.T).T + bT[0, :3, 3]
         ps_d = sdf.query(pw_d.unsqueeze(0).cuda()).cpu()
-        L += 200 * torch.relu(-ps_d - 0.001).sum()
+        L += 500 * torch.relu(-ps_d - 0.001).sum()  # VERY strong anti-pen
 
         # Tip penetration
         all_ts = sdf.query(torch.stack(tips).unsqueeze(0).cuda()).cpu()
