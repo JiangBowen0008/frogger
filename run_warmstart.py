@@ -134,10 +134,11 @@ for trial in range(10):
         from constrained_grasp_solver import CapsuleModel
         if not hasattr(project_tips_to_surface, '_cap') or trial == 0 and s == 0:
             project_tips_to_surface._cap = CapsuleModel("rh", "leap", device="cpu")
-        # Exclude ALL fingertip (ds) links + IF from collision
-        # ds links must touch surface; IF must reach actuation
+        # Exclude only IF links (must reach actuation on surface)
+        # Keep all other links including ds for collision — tips ARE projected
+        # to surface but the link bodies behind them shouldn't penetrate
         _, cap_pen = project_tips_to_surface._cap.query_collision(
-            fk, bT, sdf, exclude_links=["_ds", "if_"]
+            fk, bT, sdf, exclude_links=["if_"]
         )
         L += 100 * cap_pen
 
