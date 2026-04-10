@@ -1474,11 +1474,16 @@ class BatchedGraspOptimizer:
 
         # -- Phase 1: Get fingertips onto surface -------------------------
         p1_steps = steps * 2 // 5
-        # FREEZE rotation: palm orientation (facing object) must be preserved.
-        # Only optimize joints (finger curling) and base position (palm approach).
         opt1 = torch.optim.Adam([self.u, self.pos], lr=lr)
         sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, p1_steps, lr * 0.1)
         aB = torch.arange(B, device=dev)
+
+        # Augmented Lagrangian multipliers for collision constraint.
+        # λ adapts per-environment: increases when violated, stays when satisfied.
+        # Replaces fixed collision weight — no manual tuning needed.
+        col_lambda = torch.zeros(B, device=dev)  # Lagrange multiplier
+        col_rho = 100.0  # penalty parameter (fixed)
+        AL_UPDATE_EVERY = 50  # update λ every N steps
 
         t0 = time.time()
         for s in range(p1_steps):
@@ -1497,15 +1502,21 @@ class BatchedGraspOptimizer:
                   + 20.0 * ts_abs_p1.max(dim=-1).values ** 2
                   + 10.0 * ts_abs_p1.max(dim=-1).values)
             # (Approach direction handled by routing constraint L_route)
-            # Collision: non-tip links must stay outside (sdf >= margin)
+            # Collision via Augmented Lagrangian: adaptive multiplier λ auto-tunes.
+            # L_col = λ * g + (ρ/2) * max(0, g)²  where g = max violation
             pen_link = F.relu(self._col_margins - cs)
             pen_tip = F.relu(-ts - 0.0005)
-            # Collision: max-based (count-invariant) + small mean (gradient signal)
-            pen_max = pen_link.max(-1).values  # [B]
-            n_col = max(cs.shape[-1], 1)
-            Lp = (pen_max ** 2 + 5.0 * pen_max
+            pen_max = pen_link.max(-1).values  # [B] worst collision violation
+            # AL loss: multiplier term + quadratic penalty
+            Lp = (col_lambda * pen_max
+                  + (col_rho / 2.0) * pen_max ** 2
                   + (pen_tip ** 2).sum(-1)
-                  + pen_link.mean(-1) * 10.0)  # light mean — allows tips to reach surface
+                  + pen_link.mean(-1) * 5.0)  # light mean for gradient signal
+
+            # Update multiplier every N steps (outside gradient computation)
+            if s % AL_UPDATE_EVERY == 0 and s > 0:
+                with torch.no_grad():
+                    col_lambda = (col_lambda + col_rho * pen_max.detach()).clamp(min=0, max=5000)
             # Attraction: bring tips close to surface (focus on worst finger)
             Lat = ts.abs().sum(-1) + 3 * ts.abs().max(dim=-1).values
             # Spread: encourage fingers to spread out
@@ -1579,7 +1590,7 @@ class BatchedGraspOptimizer:
             L_wrap = wrap_dirs.sum(dim=1).norm(dim=-1) ** 2
 
             total = (100 * La_p1
-                     + 800 * Ls + 300 * Lp + 500 * L_sc
+                     + 800 * Ls + Lp + 500 * L_sc  # Lp already weighted by λ+ρ (AL)
                      + 60 * Lat + 3 * Ld + 100 * L_wrap + 500 * L_route)
             total.mean().backward()
             opt1.step(); sch1.step()
@@ -1668,6 +1679,10 @@ class BatchedGraspOptimizer:
         best_r = self.rot6d.clone().detach()
         best_score = torch.full((B2,), -float("inf"), device=dev)
 
+        # Augmented Lagrangian for Phase 2 collision
+        col_lambda_p2 = torch.zeros(B2, device=dev)
+        col_rho_p2 = 200.0
+
         # Palm grid for proximity
         palm_grid_h = None
         if self.palm_link in self.chain.get_link_names():
@@ -1721,12 +1736,16 @@ class BatchedGraspOptimizer:
                           + 5.0 * ts_abs.sum(-1)
                           + 20.0 * ts_abs.max(-1).values ** 2
                           + 10.0 * ts_abs.max(-1).values)
-                n_col = cs.shape[-1]
                 pen = F.relu(self._col_margins - cs)
-                # Collision: max-based + normalized mean
-                L_col = (pen.max(-1).values ** 2
-                         + 5.0 * pen.max(-1).values
-                         + pen.mean(-1) * 10.0)
+                pen_max_p2 = pen.max(-1).values
+                # Augmented Lagrangian collision
+                L_col = (col_lambda_p2 * pen_max_p2
+                         + (col_rho_p2 / 2.0) * pen_max_p2 ** 2
+                         + pen.mean(-1) * 5.0)
+                # Update multiplier
+                if s % 20 == 0 and s > 0:
+                    with torch.no_grad():
+                        col_lambda_p2 = (col_lambda_p2 + col_rho_p2 * pen_max_p2.detach()).clamp(0, 10000)
                 sc_cp = self._get_sc_points(fk, bT)
                 L_sc = torch.zeros(B2, device=dev)
                 if sc_cp is not None:
@@ -1754,7 +1773,7 @@ class BatchedGraspOptimizer:
                 else:
                     palm_dir_p2 = F.normalize(tip_dirs_p2[:, :4, :2].mean(dim=1), dim=-1)
                 L_route_p2 = F.relu((tip_dirs_xy_p2[:, 3] * palm_dir_p2).sum(-1) + 0.1)
-                total = 1500 * L_surf + 1000 * L_col + 800 * L_sc + 200 * L_palm + 500 * L_route_p2
+                total = 1500 * L_surf + L_col + 800 * L_sc + 200 * L_palm + 500 * L_route_p2
                 sigma_min = torch.zeros(B2, device=dev)  # not computed on constraint steps
             else:
                 # --- OBJECTIVE STEP: FC + actuation + spread ---
