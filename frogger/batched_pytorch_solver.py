@@ -740,114 +740,76 @@ class BatchedGraspOptimizer:
         tip_set = set(self.tip_link_names)
 
         if self.hand_type == "leap":
-            # Hybrid collision: URDF box corners for palm, PCA-filtered visual
-            # mesh for tips, visual mesh for other links.
-            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}")
-            vis = _visual_meshes(self.hand, self.hand_type)
-            import xml.etree.ElementTree as _ET_col
-            N_PTS_TIP = 150   # PCA-filtered contact surface
-            N_PTS_OTHER = 200
-
-            # Parse URDF box corners for palm
+            # VOLUMETRIC BOX collision: fill each URDF box with a 3D grid.
+            # This catches volume overlap, not just surface contact.
+            # The boxes are from MuJoCo Menagerie — physical collision geometry.
             _urdf_col = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}/leap.urdf")
-            _palm_box_pts = None
-            if os.path.exists(_urdf_col):
-                _tree = _ET_col.parse(_urdf_col)
-                for _le in _tree.getroot().findall("link"):
-                    if "palm" not in _le.get("name", ""):
-                        continue
-                    _bpts = []
-                    for _col in _le.findall("collision"):
-                        _g = _col.find("geometry")
-                        if _g is None: continue
-                        _b = _g.find("box")
-                        if _b is None: continue
-                        _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
-                        _h = np.array([_sx/2, _sy/2, _sz/2])
-                        _o = _col.find("origin")
-                        _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
-                        _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
-                        _R = ScipyR.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
-                        for sx in [-1, 1]:
-                            for sy in [-1, 1]:
-                                for sz in [-1, 1]:
-                                    _bpts.append(_R @ np.array([sx*_h[0], sy*_h[1], sz*_h[2]]) + _p)
-                    if _bpts:
-                        _palm_box_pts = np.array(_bpts, dtype=np.float32)
+            _tree = ET.parse(_urdf_col)
+            _root = _tree.getroot()
+
+            # Parse ALL boxes for ALL links
+            _link_boxes = {}
+            for _le in _root.findall("link"):
+                _ln = _le.get("name")
+                if _ln not in self.collision_link_names:
+                    continue
+                boxes = []
+                for _col_e in _le.findall("collision"):
+                    _g = _col_e.find("geometry")
+                    if _g is None: continue
+                    _b = _g.find("box")
+                    if _b is None: continue
+                    _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
+                    _h = np.array([_sx/2, _sy/2, _sz/2])
+                    _o = _col_e.find("origin")
+                    _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
+                    _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
+                    _R = ScipyR.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
+                    boxes.append((_p, _R, _h))
+                if boxes:
+                    _link_boxes[_ln] = boxes
+
+            # Generate volumetric grid points inside each box
+            VOL_STEP = 0.005  # 5mm grid spacing inside boxes
+            N_MAX_PALM = 400
+            N_MAX_OTHER = 150
 
             col_data = []
             for nm in self.collision_link_names:
                 is_palm = "palm" in nm
                 is_tip = nm in tip_set
 
-                if is_palm and _palm_box_pts is not None:
-                    # Palm: box corners + inner surface visual mesh points.
-                    # The rigid palm can't penetrate, so the inner surface (z<0)
-                    # must also be checked. Combine box + visual mesh FPS.
-                    all_verts = []
-                    for mesh_file, vis_pose in vis[nm]:
-                        path = os.path.join(mesh_dir, mesh_file)
-                        if not os.path.exists(path):
-                            continue
-                        lm = trimesh.load(path, force="mesh")
-                        verts = np.asarray(lm.vertices, dtype=np.float64)
-                        if vis_pose is not None:
-                            vp = np.array(vis_pose, dtype=np.float64)
-                            Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
-                            verts = (Rv @ verts.T).T + vp[:3]
-                        all_verts.append(verts)
-                    palm_mesh = np.vstack(all_verts) if all_verts else np.zeros((0, 3))
-                    # FPS from full palm mesh (200 points) + box corners (80)
-                    if len(palm_mesh) > 200:
-                        palm_fps = self._fps(palm_mesh, 200).astype(np.float32)
+                if nm in _link_boxes:
+                    all_pts = []
+                    for _p, _R, _h in _link_boxes[nm]:
+                        # 3D grid INSIDE the box (volumetric)
+                        nx = max(2, int(2*_h[0] / VOL_STEP) + 1)
+                        ny = max(2, int(2*_h[1] / VOL_STEP) + 1)
+                        nz = max(2, int(2*_h[2] / VOL_STEP) + 1)
+                        # Cap grid density to avoid too many points
+                        nx, ny, nz = min(nx, 6), min(ny, 6), min(nz, 6)
+                        gx = np.linspace(-_h[0], _h[0], nx)
+                        gy = np.linspace(-_h[1], _h[1], ny)
+                        gz = np.linspace(-_h[2], _h[2], nz)
+                        gxx, gyy, gzz = np.meshgrid(gx, gy, gz, indexing='ij')
+                        box_pts = np.stack([gxx.ravel(), gyy.ravel(), gzz.ravel()], axis=-1)
+                        # Transform to link frame
+                        pts_link = (_R @ box_pts.T).T + _p
+                        all_pts.append(pts_link)
+                    all_pts = np.vstack(all_pts)
+                    n_max = N_MAX_PALM if is_palm else N_MAX_OTHER
+                    if len(all_pts) > n_max:
+                        pts = self._fps(all_pts, n_max).astype(np.float32)
                     else:
-                        palm_fps = palm_mesh.astype(np.float32)
-                    pts = np.vstack([_palm_box_pts, palm_fps])
-                elif nm not in vis:
-                    pts = np.array([[0, 0, 0]], dtype=np.float32)
+                        pts = all_pts.astype(np.float32)
                 else:
-                    all_verts = []
-                    for mesh_file, vis_pose in vis[nm]:
-                        path = os.path.join(mesh_dir, mesh_file)
-                        if not os.path.exists(path):
-                            continue
-                        lm = trimesh.load(path, force="mesh")
-                        verts = np.asarray(lm.vertices, dtype=np.float64)
-                        if vis_pose is not None:
-                            vp = np.array(vis_pose, dtype=np.float64)
-                            Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
-                            verts = (Rv @ verts.T).T + vp[:3]
-                        all_verts.append(verts)
-                    if all_verts:
-                        all_verts = np.vstack(all_verts)
-                        n_pts = N_PTS_TIP if is_tip else N_PTS_OTHER
-
-                        # PCA lateral filter: removes motor housing protrusions
-                        # that extend sideways and cause false self-collision.
-                        # Applied to ALL finger links, not just tips.
-                        if not is_palm and len(all_verts) > n_pts:
-                            centered = all_verts - all_verts.mean(axis=0)
-                            _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-                            axis = Vt[0]
-                            proj = np.outer(centered @ axis, axis)
-                            lat_dist = np.linalg.norm(centered - proj, axis=1)
-                            mask = lat_dist < 0.008  # 8mm = tight functional body
-                            if mask.sum() >= n_pts:
-                                all_verts = all_verts[mask]
-
-                        if len(all_verts) > n_pts:
-                            pts = self._fps(all_verts, n_pts).astype(np.float32)
-                        else:
-                            pts = all_verts.astype(np.float32)
-                    else:
-                        pts = np.array([[0, 0, 0]], dtype=np.float32)
+                    pts = np.array([[0, 0, 0]], dtype=np.float32)
 
                 pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
                 col_data.append((nm, torch.tensor(pts_h, device=self.device)))
             self._col_data = col_data
             n_pts = sum(p.shape[0] for _, p in col_data)
-            print(f"  Hybrid collision (box palm + filtered tips + mesh): "
-                  f"{len(col_data)} links, {n_pts} points")
+            print(f"  Volumetric box collision: {len(col_data)} links, {n_pts} points")
 
         else:
             # Allegro: original mesh-based collision points
@@ -1481,8 +1443,8 @@ class BatchedGraspOptimizer:
         # Augmented Lagrangian multipliers for collision constraint.
         # λ adapts per-environment: increases when violated, stays when satisfied.
         # Replaces fixed collision weight — no manual tuning needed.
-        col_lambda = torch.zeros(B, device=dev)  # Lagrange multiplier
-        col_rho = 100.0  # penalty parameter (fixed)
+        col_lambda = torch.full((B,), 500.0, device=dev)  # strong collision from start
+        col_rho = 500.0  # high penalty parameter for fast adaptation
         AL_UPDATE_EVERY = 50  # update λ every N steps
 
         t0 = time.time()
@@ -1680,8 +1642,8 @@ class BatchedGraspOptimizer:
         best_score = torch.full((B2,), -float("inf"), device=dev)
 
         # Augmented Lagrangian for Phase 2 collision
-        col_lambda_p2 = torch.zeros(B2, device=dev)
-        col_rho_p2 = 200.0
+        col_lambda_p2 = torch.full((B2,), 1000.0, device=dev)  # strong from start
+        col_rho_p2 = 500.0
 
         # Palm grid for proximity
         palm_grid_h = None
