@@ -842,16 +842,27 @@ class BatchedGraspOptimizer:
 
         # Per-collision-point clearance margin: collision points must stay at
         # least this far outside the object surface (sdf >= margin).
+        # Per-point margins with CONTACT/BODY zone separation for tips.
+        # Contact zone (near tip offset): margin=-0.001 (allow 1mm penetration for contact)
+        # Body zone: margin=0.002 (must stay outside)
+        tip_off_np = self.tip_offsets.cpu().numpy()
+        tip_off_map = dict(zip(self.tip_link_names, tip_off_np[:4]))
         margins = []
         for nm, pts in col_data:
-            # Collision margins: tips at 0mm (contact allowed), others at 2-3mm
             if nm in tip_set:
-                m = 0.000   # tips: allow contact (pad at SDF=0)
+                # Split into contact zone (near pad) and body zone
+                pts_np = pts[:, :3].cpu().numpy()
+                tip_off = tip_off_map.get(nm, np.zeros(3))
+                dists = np.linalg.norm(pts_np - tip_off, axis=1)
+                for d in dists:
+                    if d < 0.012:  # within 12mm of tip offset = contact zone
+                        margins.append(-0.001)  # allow 1mm penetration
+                    else:
+                        margins.append(0.002)  # body zone: stay outside
             elif "palm" in nm:
-                m = 0.000   # palm: allow tangent contact but no penetration
+                margins.extend([0.001] * pts.shape[0])  # palm: 1mm clearance
             else:
-                m = 0.002   # other links: 2mm clearance
-            margins.extend([m] * pts.shape[0])
+                margins.extend([0.002] * pts.shape[0])  # other: 2mm clearance
         self._col_margins = torch.tensor(margins, dtype=torch.float32,
                                          device=self.device)
 
@@ -1077,13 +1088,12 @@ class BatchedGraspOptimizer:
         B, dev = self.num_envs, self.device
 
         if self.hand_type == "leap":
-            # Fingers CURLED back (behind palm) so they start OUTSIDE the object.
-            # The optimizer uncurls them toward the surface.
-            # PIP=1.2, DIP=1.2 = moderately curled (range ~[-0.5, 1.9])
+            # Fingers slightly curled — NOT maximally curled.
+            # The push-out will adjust position, not curl further.
             dq = torch.tensor(
-                [0.0, 0.0, 1.2, 1.2,
-                 0.0, 0.0, 1.2, 1.2,
-                 0.0, 0.0, 1.2, 1.2,
+                [0.0, 0.0, 0.3, 0.3,
+                 0.0, 0.0, 0.3, 0.3,
+                 0.0, 0.0, 0.3, 0.3,
                  1.0, 0.5, 0.5, 0.3],
                 device=dev,
             )
@@ -1244,18 +1254,18 @@ class BatchedGraspOptimizer:
                         if not bad.any():
                             break
 
-                        # Strategy: curl ALL finger joints + small base push-out.
-                        # MCP (indices 1,5,9) swings finger base back.
-                        # PIP/DIP (indices 2,3,6,7,10,11) curls finger body.
-                        # Thumb: indices 13,14,15
-                        curl_joints = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15]
-                        for j in curl_joints:
-                            self.u.data[bad, j] += 0.4
-
-                        # Small base push-out (3mm per iter)
+                        # Position-dominant push-out: move base away from object.
+                        # Minimal finger curl — only as last resort.
                         R_chk = self._rot6d_to_matrix(self.rot6d)
-                        z_hat_chk = R_chk[:, :, 2]
-                        self.pos.data[bad] += 0.003 * z_hat_chk[bad]
+                        z_hat_chk = R_chk[:, :, 2]  # outward normal
+                        push_amt = F.relu(-worst_col) * 0.5 + 0.003  # proportional + 3mm
+                        self.pos.data[bad] += push_amt[bad].unsqueeze(-1) * z_hat_chk[bad]
+
+                        # Light curl only for PIP/DIP (not MCP — keep fingers extended)
+                        if push_iter >= 5:  # only curl after position push fails
+                            curl_joints = [2, 3, 6, 7, 10, 11, 14, 15]
+                            for j in curl_joints:
+                                self.u.data[bad, j] += 0.15
 
             # Report
             with torch.no_grad():
@@ -1415,37 +1425,9 @@ class BatchedGraspOptimizer:
             ts = self.sdf.query(tp)
             cs = self.sdf.query(cp)
 
-            # Surface: geometry-to-object distance.
-            # For each finger, find the CLOSEST collision point to the surface.
-            # This is the actual geometry-to-object distance, not a single tip point.
-            # Only use DS (tip) collision points for geometry-to-object distance.
-            # Body links (bs/px/md) have collision margins that prevent SDF→0.
-            tip_col_ranges = {}  # finger_key -> (start_idx, end_idx) for ds link only
-            _off = 0
-            for _nm, _pts in self._col_data:
-                _n = _pts.shape[0]
-                for _fk in ['if', 'mf', 'rf', 'th']:
-                    if f'_{_fk}_ds' in _nm:  # only ds (tip) links
-                        tip_col_ranges[_fk] = [_off, _off + _n]
-                        break
-                _off += _n
-
-            # Min absolute SDF per finger from TIP collision points
-            finger_min_sdfs = []
-            for _fk in ['if', 'mf', 'rf', 'th']:
-                if _fk in tip_col_ranges:
-                    _s, _e = tip_col_ranges[_fk]
-                    _fsdf = cs[:, _s:_e].abs().min(dim=-1).values  # [B]
-                    finger_min_sdfs.append(_fsdf)
-                else:
-                    finger_min_sdfs.append(ts[:, 0].abs())
-            # Palm: use tip point SDF (palm is nc=4)
-            if self.palm_contact:
-                finger_min_sdfs.append(ts[:, 4].abs())
-            ts_geom = torch.stack(finger_min_sdfs, dim=-1)  # [B, nc]
-
-            ts_abs_p1 = ts_geom
-            Ls = ((ts_geom ** 2).sum(-1)
+            # Surface: single-point tip SDF (works better than geometry-based in Phase 1)
+            ts_abs_p1 = ts.abs()
+            Ls = ((ts ** 2).sum(-1)
                   + 5.0 * ts_abs_p1.sum(-1)
                   + 20.0 * ts_abs_p1.max(dim=-1).values ** 2
                   + 10.0 * ts_abs_p1.max(dim=-1).values)
@@ -1512,7 +1494,7 @@ class BatchedGraspOptimizer:
             L_wrap = wrap_dirs.sum(dim=1).norm(dim=-1) ** 2
 
             total = (100 * La_p1
-                     + 500 * Ls + 1500 * Lp + 300 * L_sc
+                     + 500 * Ls + 500 * Lp + 300 * L_sc
                      + 60 * Lat + 3 * Ld + 100 * L_wrap + 500 * L_route)
             total.mean().backward()
             opt1.step(); sch1.step()
@@ -1672,7 +1654,7 @@ class BatchedGraspOptimizer:
                     pw = (wT_p @ palm_grid_h.T)[:, :3, :].transpose(1, 2)
                     ps = self.sdf.query(pw)
                     L_palm = F.relu(ps - 0.003).mean(-1)
-                total = 1500 * L_surf + 3000 * L_col + 800 * L_sc + 200 * L_palm
+                total = 1500 * L_surf + 1000 * L_col + 800 * L_sc + 200 * L_palm
                 sigma_min = torch.zeros(B2, device=dev)  # not computed on constraint steps
             else:
                 # --- OBJECTIVE STEP: FC + actuation + spread ---
