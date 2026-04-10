@@ -882,17 +882,53 @@ class BatchedGraspOptimizer:
         self._col_margins = torch.tensor(margins, dtype=torch.float32,
                                          device=self.device)
 
-        # Group collision-point indices by finger for self-collision avoidance.
-        # To keep cdist memory manageable at high batch sizes, cap each
-        # finger's index list at _SC_MAX points by subsampling.
-        # Self-collision: inter-finger + palm-finger pairs only (10 pairs).
-        # Intra-finger dropped to save memory (cdist is the bottleneck).
-        _SC_MAX = 120  # need dense coverage for visual mesh SC
+        # Self-collision uses URDF BOX points (physical collision geometry),
+        # NOT visual mesh. Visual meshes have motor housing protrusions that
+        # always overlap between adjacent fingers — that's a rendering artifact,
+        # not a physical collision. The Menagerie boxes represent reality.
+        #
+        # Build a SEPARATE _sc_data point set from URDF boxes for SC.
+        # _col_data (visual mesh) is used for hand-object collision only.
+        import xml.etree.ElementTree as _ET_sc
+        _urdf_sc = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}/leap.urdf")
+        sc_data = []  # [(link_name, box_pts_tensor)]
+        if os.path.exists(_urdf_sc):
+            _tree_sc = _ET_sc.parse(_urdf_sc)
+            for _le in _tree_sc.getroot().findall("link"):
+                _ln = _le.get("name")
+                if _ln not in self.collision_link_names:
+                    continue
+                _bpts = []
+                for _col_elem in _le.findall("collision"):
+                    _g = _col_elem.find("geometry")
+                    if _g is None: continue
+                    _b = _g.find("box")
+                    if _b is None: continue
+                    _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
+                    _h = np.array([_sx/2, _sy/2, _sz/2])
+                    _o = _col_elem.find("origin")
+                    _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
+                    _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
+                    _R = ScipyR.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
+                    for sx in [-1, 1]:
+                        for sy in [-1, 1]:
+                            for sz in [-1, 1]:
+                                _bpts.append(_R @ np.array([sx*_h[0], sy*_h[1], sz*_h[2]]) + _p)
+                if _bpts:
+                    _pts = np.array(_bpts, dtype=np.float32)
+                else:
+                    _pts = np.array([[0, 0, 0]], dtype=np.float32)
+                _pts_h = np.hstack([_pts, np.ones((len(_pts), 1), dtype=np.float32)])
+                sc_data.append((_ln, torch.tensor(_pts_h, device=self.device)))
+        self._sc_data = sc_data
+        n_sc_pts = sum(p.shape[0] for _, p in sc_data)
+
+        _SC_MAX = 60
         finger_keys = ['if', 'mf', 'rf', 'th']
         _fcol = {}
         offset = 0
         palm_idx = []
-        for nm, pts in col_data:
+        for nm, pts in sc_data:
             n = pts.shape[0]
             if 'palm' in nm:
                 palm_idx.extend(range(offset, offset + n))
@@ -909,8 +945,6 @@ class BatchedGraspOptimizer:
             return idx_list
 
         self._self_col_pairs = []
-
-        # 1) Inter-finger group pairs (6 pairs)
         fk_list = [k for k in finger_keys if k in _fcol]
         for i in range(len(fk_list)):
             for j in range(i + 1, len(fk_list)):
@@ -918,8 +952,6 @@ class BatchedGraspOptimizer:
                     torch.tensor(_subsample(_fcol[fk_list[i]]), dtype=torch.long, device=self.device),
                     torch.tensor(_subsample(_fcol[fk_list[j]]), dtype=torch.long, device=self.device),
                 ))
-
-        # 2) Palm vs each finger group (4 pairs)
         if palm_idx:
             for fk in fk_list:
                 self._self_col_pairs.append((
@@ -927,8 +959,8 @@ class BatchedGraspOptimizer:
                     torch.tensor(_subsample(_fcol[fk]), dtype=torch.long, device=self.device),
                 ))
 
-        print(f"  Self-collision pairs: {len(self._self_col_pairs)} "
-              f"(inter-finger + palm-finger + intra-finger)")
+        print(f"  Self-collision: {len(self._self_col_pairs)} pairs, {n_sc_pts} box pts "
+              f"(separate from {sum(p.shape[0] for _, p in col_data)} visual mesh pts)")
 
     def _precompute_collision_points_mesh(self):
         """Fallback: sample collision points from visual meshes (for Allegro)."""
@@ -1073,6 +1105,16 @@ class BatchedGraspOptimizer:
         nc = len(tips)  # 4 or 5
         return (torch.stack(tips, 1), torch.cat(cols, dim=1),
                 torch.stack(tip_x_axes, 1))  # [B, nc, 3]
+
+    def _get_sc_points(self, fk, bT):
+        """Get self-collision box points in world frame (from URDF boxes)."""
+        sc_cols = []
+        for nm, local_pts in self._sc_data:
+            if nm in fk:
+                wT = bT @ fk[nm].get_matrix()
+                wp = (wT @ local_pts.T)[:, :3, :].transpose(1, 2)
+                sc_cols.append(wp)
+        return torch.cat(sc_cols, dim=1) if sc_cols else None
 
     def _get_pad_points(self, fk, bT):
         """Get fingertip pad sample points in world frame.
@@ -1480,12 +1522,14 @@ class BatchedGraspOptimizer:
                         cos_align = (finger_push * ad[j]).sum(-1)
                         La_p1 += 0.2 * (1.0 - cos_align) ** 2
 
-            # Self-collision: point-cloud check + direct fingertip spacing
+            # Self-collision: use URDF box points (physical geometry, not visual mesh)
+            sc_cp = self._get_sc_points(fk, bT)
             L_sc = torch.zeros(B, device=dev)
-            for sc_i1, sc_i2 in self._self_col_pairs:
-                d = torch.cdist(cp[:, sc_i1, :], cp[:, sc_i2, :])
-                min_d = d.reshape(B, -1).min(dim=-1).values
-                L_sc = L_sc + F.relu(0.015 - min_d) ** 2
+            if sc_cp is not None:
+                for sc_i1, sc_i2 in self._self_col_pairs:
+                    d = torch.cdist(sc_cp[:, sc_i1, :], sc_cp[:, sc_i2, :])
+                    min_d = d.reshape(B, -1).min(dim=-1).values
+                    L_sc = L_sc + F.relu(0.015 - min_d) ** 2
 
             # Adjacent finger spacing at ALL link levels (not just tips)
             # Prevent adjacent fingers from converging and overlapping
@@ -1680,12 +1724,14 @@ class BatchedGraspOptimizer:
                 L_col = (pen.max(-1).values ** 2
                          + 5.0 * pen.max(-1).values
                          + pen.mean(-1) * 10.0)
+                sc_cp = self._get_sc_points(fk, bT)
                 L_sc = torch.zeros(B2, device=dev)
-                for sc_i1, sc_i2 in self._self_col_pairs:
-                    d = torch.cdist(cp[:, sc_i1, :], cp[:, sc_i2, :])
-                    min_d = d.reshape(B2, -1).min(-1).values
-                    L_sc += F.relu(0.015 - min_d) ** 2 + 2.0 * F.relu(0.015 - min_d)
-                # Adjacent fingertip spacing (same as Phase 1)
+                if sc_cp is not None:
+                    for sc_i1, sc_i2 in self._self_col_pairs:
+                        d = torch.cdist(sc_cp[:, sc_i1, :], sc_cp[:, sc_i2, :])
+                        min_d = d.reshape(B2, -1).min(-1).values
+                        L_sc += F.relu(0.015 - min_d) ** 2 + 2.0 * F.relu(0.015 - min_d)
+                # Adjacent fingertip spacing
                 for ti, tj in [(0, 1), (1, 2)]:
                     if ti < tp.shape[1] and tj < tp.shape[1]:
                         td = torch.norm(tp[:, ti] - tp[:, tj], dim=-1)
@@ -1697,7 +1743,15 @@ class BatchedGraspOptimizer:
                     pw = (wT_p @ palm_grid_h.T)[:, :3, :].transpose(1, 2)
                     ps = self.sdf.query(pw)
                     L_palm = F.relu(ps - 0.003).mean(-1)
-                total = 1500 * L_surf + 1000 * L_col + 800 * L_sc + 200 * L_palm
+                # Routing in Phase 2: keep thumb on opposite side from palm
+                tip_dirs_p2 = tp - obj_c.unsqueeze(0).unsqueeze(0)
+                tip_dirs_xy_p2 = F.normalize(tip_dirs_p2[:, :, :2], dim=-1)
+                if self.palm_contact:
+                    palm_dir_p2 = F.normalize(tip_dirs_p2[:, 4:, :2].mean(dim=1), dim=-1)
+                else:
+                    palm_dir_p2 = F.normalize(tip_dirs_p2[:, :4, :2].mean(dim=1), dim=-1)
+                L_route_p2 = F.relu((tip_dirs_xy_p2[:, 3] * palm_dir_p2).sum(-1) + 0.1)
+                total = 1500 * L_surf + 1000 * L_col + 800 * L_sc + 200 * L_palm + 500 * L_route_p2
                 sigma_min = torch.zeros(B2, device=dev)  # not computed on constraint steps
             else:
                 # --- OBJECTIVE STEP: FC + actuation + spread ---
@@ -1750,12 +1804,14 @@ class BatchedGraspOptimizer:
                 se = ts_eval.abs().max(-1).values
                 mc = cs_eval.min(-1).values
 
-                # Check self-collision
+                # Check self-collision (box points)
+                sc_cp_eval = self._get_sc_points(fk, bT)
                 sc_min_d = torch.full((B2,), 1.0, device=dev)
-                for sc_i1, sc_i2 in self._self_col_pairs:
-                    d = torch.cdist(cp_eval[:, sc_i1, :], cp_eval[:, sc_i2, :])
-                    pair_min = d.reshape(B2, -1).min(-1).values
-                    sc_min_d = torch.minimum(sc_min_d, pair_min)
+                if sc_cp_eval is not None:
+                    for sc_i1, sc_i2 in self._self_col_pairs:
+                        d = torch.cdist(sc_cp_eval[:, sc_i1, :], sc_cp_eval[:, sc_i2, :])
+                        pair_min = d.reshape(B2, -1).min(-1).values
+                        sc_min_d = torch.minimum(sc_min_d, pair_min)
 
                 feas = (se < 0.002) & (mc > -0.002) & (sc_min_d > 0.008)
                 # Only update best on objective steps (odd) when sigma_min is computed
@@ -1838,10 +1894,15 @@ class BatchedGraspOptimizer:
             if n_act:
                 feasible = feasible & (act_dist < 0.008)
 
-            # Self-collision check for all candidates
+            # Self-collision check (box points)
+            qb_sc = self._u2q(best_u)
+            bT_sc = self._base_T(best_p, best_r)
+            fk_sc = self.chain.forward_kinematics(qb_sc)
+            sc_cp_all = self._get_sc_points(fk_sc, bT_sc)
             sc_min_d_all = torch.full((B2,), 1.0, device=dev)
-            for sc_i1, sc_i2 in self._self_col_pairs:
-                d = torch.cdist(cp_all[:, sc_i1, :], cp_all[:, sc_i2, :])
+            if sc_cp_all is not None:
+                for sc_i1, sc_i2 in self._self_col_pairs:
+                    d = torch.cdist(sc_cp_all[:, sc_i1, :], sc_cp_all[:, sc_i2, :])
                 pair_min = d.reshape(B2, -1).min(-1).values
                 sc_min_d_all = torch.minimum(sc_min_d_all, pair_min)
             feasible = feasible & (sc_min_d_all > 0.008)
@@ -1953,11 +2014,13 @@ class BatchedGraspOptimizer:
                 pair_tdists = tip_dists[triu_v]
                 min_tdist = pair_tdists.min().item()
 
-                # Self-collision
+                # Self-collision (box points)
+                sc_cp_v = self._get_sc_points(fk_v, bT_v) if hasattr(self, '_sc_data') else None
                 sc_md = 1.0
-                for sc_i1, sc_i2 in self._self_col_pairs:
-                    d_v = torch.cdist(cp_v[:, sc_i1, :], cp_v[:, sc_i2, :])
-                    sc_md = min(sc_md, d_v.reshape(-1).min().item())
+                if sc_cp_v is not None:
+                    for sc_i1, sc_i2 in self._self_col_pairs:
+                        d_v = torch.cdist(sc_cp_v[:, sc_i1, :], sc_cp_v[:, sc_i2, :])
+                        sc_md = min(sc_md, d_v.reshape(-1).min().item())
 
                 # Palm SDF
                 palm_sdf_str = "N/A"
