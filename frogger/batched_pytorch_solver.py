@@ -740,76 +740,79 @@ class BatchedGraspOptimizer:
         tip_set = set(self.tip_link_names)
 
         if self.hand_type == "leap":
-            # VOLUMETRIC BOX collision: fill each URDF box with a 3D grid.
-            # This catches volume overlap, not just surface contact.
-            # The boxes are from MuJoCo Menagerie — physical collision geometry.
-            _urdf_col = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}/leap.urdf")
-            _tree = ET.parse(_urdf_col)
-            _root = _tree.getroot()
-
-            # Parse ALL boxes for ALL links
-            _link_boxes = {}
-            for _le in _root.findall("link"):
-                _ln = _le.get("name")
-                if _ln not in self.collision_link_names:
-                    continue
-                boxes = []
-                for _col_e in _le.findall("collision"):
-                    _g = _col_e.find("geometry")
-                    if _g is None: continue
-                    _b = _g.find("box")
-                    if _b is None: continue
-                    _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
-                    _h = np.array([_sx/2, _sy/2, _sz/2])
-                    _o = _col_e.find("origin")
-                    _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
-                    _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
-                    _R = ScipyR.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
-                    boxes.append((_p, _R, _h))
-                if boxes:
-                    _link_boxes[_ln] = boxes
-
-            # Generate volumetric grid points inside each box
-            VOL_STEP = 0.005  # 5mm grid spacing inside boxes
-            N_MAX_PALM = 400
-            N_MAX_OTHER = 150
+            # Hand-object collision: visual mesh surface + volumetric interior.
+            # Surface catches the actual rendered geometry (what user sees).
+            # Volume catches interior overlap that surface-only misses.
+            # Self-collision uses separate box points (see _sc_data below).
+            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}")
+            vis = _visual_meshes(self.hand, self.hand_type)
+            N_SURF = 100  # surface vertices per link (FPS from visual mesh)
+            N_VOL = 50    # volumetric interior points per link
+            N_SURF_PALM = 300
+            N_VOL_PALM = 100
 
             col_data = []
             for nm in self.collision_link_names:
                 is_palm = "palm" in nm
-                is_tip = nm in tip_set
+                n_surf = N_SURF_PALM if is_palm else N_SURF
+                n_vol = N_VOL_PALM if is_palm else N_VOL
 
-                if nm in _link_boxes:
-                    all_pts = []
-                    for _p, _R, _h in _link_boxes[nm]:
-                        # 3D grid INSIDE the box (volumetric)
-                        nx = max(2, int(2*_h[0] / VOL_STEP) + 1)
-                        ny = max(2, int(2*_h[1] / VOL_STEP) + 1)
-                        nz = max(2, int(2*_h[2] / VOL_STEP) + 1)
-                        # Cap grid density to avoid too many points
-                        nx, ny, nz = min(nx, 6), min(ny, 6), min(nz, 6)
-                        gx = np.linspace(-_h[0], _h[0], nx)
-                        gy = np.linspace(-_h[1], _h[1], ny)
-                        gz = np.linspace(-_h[2], _h[2], nz)
-                        gxx, gyy, gzz = np.meshgrid(gx, gy, gz, indexing='ij')
-                        box_pts = np.stack([gxx.ravel(), gyy.ravel(), gzz.ravel()], axis=-1)
-                        # Transform to link frame
-                        pts_link = (_R @ box_pts.T).T + _p
-                        all_pts.append(pts_link)
-                    all_pts = np.vstack(all_pts)
-                    n_max = N_MAX_PALM if is_palm else N_MAX_OTHER
-                    if len(all_pts) > n_max:
-                        pts = self._fps(all_pts, n_max).astype(np.float32)
-                    else:
-                        pts = all_pts.astype(np.float32)
+                # 1) Surface points from visual mesh
+                surf_pts = np.array([[0, 0, 0]], dtype=np.float64)
+                if nm in vis:
+                    all_verts = []
+                    for mesh_file, vis_pose in vis[nm]:
+                        path = os.path.join(mesh_dir, mesh_file)
+                        if not os.path.exists(path):
+                            continue
+                        lm = trimesh.load(path, force="mesh")
+                        verts = np.asarray(lm.vertices, dtype=np.float64)
+                        if vis_pose is not None:
+                            vp = np.array(vis_pose, dtype=np.float64)
+                            Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
+                            verts = (Rv @ verts.T).T + vp[:3]
+                        all_verts.append(verts)
+                    if all_verts:
+                        all_verts = np.vstack(all_verts)
+                        # Palm: filter to contact face + back (z > -5mm).
+                        # Deep inner surface (z < -5mm) is structural, not contact.
+                        if is_palm:
+                            face_mask = all_verts[:, 2] > -0.005
+                            if face_mask.sum() >= n_surf:
+                                all_verts = all_verts[face_mask]
+                        if len(all_verts) > n_surf:
+                            surf_pts = self._fps(all_verts, n_surf)
+                        else:
+                            surf_pts = all_verts
+
+                # 2) Volumetric interior points (3D grid inside bounding box)
+                bb_min = surf_pts.min(axis=0)
+                bb_max = surf_pts.max(axis=0)
+                bb_extent = bb_max - bb_min
+                if bb_extent.max() > 0.001:
+                    step = 0.008  # 8mm grid
+                    nx = max(2, min(5, int(bb_extent[0] / step) + 1))
+                    ny = max(2, min(5, int(bb_extent[1] / step) + 1))
+                    nz = max(2, min(5, int(bb_extent[2] / step) + 1))
+                    gx = np.linspace(bb_min[0], bb_max[0], nx)
+                    gy = np.linspace(bb_min[1], bb_max[1], ny)
+                    gz = np.linspace(bb_min[2], bb_max[2], nz)
+                    gxx, gyy, gzz = np.meshgrid(gx, gy, gz, indexing='ij')
+                    vol_pts = np.stack([gxx.ravel(), gyy.ravel(), gzz.ravel()], axis=-1)
                 else:
-                    pts = np.array([[0, 0, 0]], dtype=np.float32)
+                    vol_pts = surf_pts[:1]
 
-                pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
+                # Combine surface + volume
+                combined = np.vstack([surf_pts, vol_pts]).astype(np.float32)
+                target = n_surf + n_vol
+                if len(combined) > target:
+                    combined = self._fps(combined, target).astype(np.float32)
+
+                pts_h = np.hstack([combined, np.ones((len(combined), 1), dtype=np.float32)])
                 col_data.append((nm, torch.tensor(pts_h, device=self.device)))
             self._col_data = col_data
             n_pts = sum(p.shape[0] for _, p in col_data)
-            print(f"  Volumetric box collision: {len(col_data)} links, {n_pts} points")
+            print(f"  Visual mesh + volumetric collision: {len(col_data)} links, {n_pts} points")
 
         else:
             # Allegro: original mesh-based collision points
