@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Before this conversation ends, verify the grasp quality checklist:\n\n(1) PREVIOUSLY RAISED ISSUES: Are ALL of these addressed? Self-collision between fingers, palm-object penetration, fingertips reaching surface, palm facing object, natural finger poses, force closure quality, actuation finger, generalization across objects.\n\n(2) VISUAL EXAMINATION: Have the projection images (XY, YZ, XZ) been examined? Do the grasps ACTUALLY look good - no visible penetration, no self-collision, natural hand pose, palm in contact?\n\n(3) CHECKS PASSING: Are diagnostic checks (diagnose_grasp.py) passing? Is the full mesh verification (pen%, sc) honest? Are the metrics actually effective at catching problems?\n\nIf ANY of these are not satisfied, output: {\"decision\": \"block\", \"reason\": \"Grasp quality verification incomplete. Must address: [list unverified items]\"}\n\nIf all are satisfied, output: {\"continue\": true}",
+            "statusMessage": "Verifying grasp quality checklist..."
+          }
+        ]
+      }
+    ]
+  }
+}
