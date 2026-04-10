@@ -149,6 +149,152 @@ class CapsuleModel:
 
 
 # ============================================================
+# Box collision model (from URDF primitives)
+# ============================================================
+class BoxCollisionModel:
+    """Load box collision primitives from URDF for fast exact collision.
+
+    Each link has 1-10 oriented boxes (from MuJoCo Menagerie).
+    For collision checking, sample the 8 corners of each box,
+    transform to world frame via FK, and query the object SDF.
+    """
+
+    def __init__(self, urdf_path=None, device="cpu"):
+        self.device = device
+        if urdf_path is None:
+            urdf_path = os.path.join(
+                os.path.dirname(__file__), "models/leap_rh/leap.urdf"
+            )
+            if not os.path.exists(urdf_path):
+                urdf_path = os.path.join(
+                    os.path.dirname(__file__), "../models/leap_rh/leap.urdf"
+                )
+
+        import xml.etree.ElementTree as ET
+
+        tree = ET.parse(urdf_path)
+        root = tree.getroot()
+
+        # Parse box collision elements per link
+        # Each box: origin (xyz, rpy) + size (full extents)
+        # We precompute the 8 corner points in link-local frame
+        self.link_points = {}  # link_name -> tensor [N, 3] in link frame
+        self.link_box_count = {}
+
+        for link_elem in root.findall("link"):
+            link_name = link_elem.get("name")
+            all_corners = []
+            n_boxes = 0
+            for col in link_elem.findall("collision"):
+                geom = col.find("geometry")
+                if geom is None:
+                    continue
+                box_elem = geom.find("box")
+                if box_elem is None:
+                    continue
+
+                size_str = box_elem.get("size", "0 0 0")
+                sx, sy, sz = [float(x) for x in size_str.split()]
+                half = np.array([sx / 2, sy / 2, sz / 2])
+
+                origin = col.find("origin")
+                if origin is not None:
+                    pos = np.array(
+                        [float(x) for x in origin.get("xyz", "0 0 0").split()]
+                    )
+                    rpy_str = origin.get("rpy", "0 0 0")
+                    rpy = np.array([float(x) for x in rpy_str.split()])
+                else:
+                    pos = np.zeros(3)
+                    rpy = np.zeros(3)
+
+                # Rotation matrix from RPY
+                if np.any(np.abs(rpy) > 1e-6):
+                    R_box = ScipyR.from_euler("xyz", rpy).as_matrix()
+                else:
+                    R_box = np.eye(3)
+
+                # 26 points per box: 8 corners + 12 edge midpoints + 6 face centers
+                pts_list = []
+                # Corners
+                for sx in [-1, 1]:
+                    for sy in [-1, 1]:
+                        for sz in [-1, 1]:
+                            pts_list.append([sx * half[0], sy * half[1], sz * half[2]])
+                # Edge midpoints (12 edges)
+                for sx in [-1, 1]:
+                    for sy in [-1, 1]:
+                        pts_list.append([sx * half[0], sy * half[1], 0])
+                        pts_list.append([sx * half[0], 0, sy * half[2]])
+                        pts_list.append([0, sx * half[1], sy * half[2]])
+                # Face centers (6 faces)
+                for dim in range(3):
+                    for sign in [-1, 1]:
+                        pt = [0, 0, 0]
+                        pt[dim] = sign * half[dim]
+                        pts_list.append(pt)
+                corners_box = np.array(pts_list)  # [26, 3]
+
+                # Transform to link frame
+                corners_link = (R_box @ corners_box.T).T + pos  # [8, 3]
+                all_corners.append(corners_link)
+                n_boxes += 1
+
+            if all_corners:
+                pts = np.concatenate(all_corners, axis=0)
+                self.link_points[link_name] = torch.tensor(
+                    pts, dtype=torch.float32, device=device
+                )
+                self.link_box_count[link_name] = n_boxes
+
+        total_pts = sum(p.shape[0] for p in self.link_points.values())
+        print(
+            f"  BoxCollisionModel: {len(self.link_points)} links, "
+            f"{sum(self.link_box_count.values())} boxes, {total_pts} points"
+        )
+
+    def query_collision(self, fk, base_T, sdf, exclude_links=None, margin=0.001):
+        """Check box-object collision for all links.
+
+        Returns:
+            violations: list of (link_name, min_sdf, pct_penetrating)
+            total_pen: differentiable scalar penalty
+        """
+        if exclude_links is None:
+            exclude_links = []
+        violations = []
+        all_pen = torch.tensor(0.0, device=self.device)
+
+        for link_name, pts_local in self.link_points.items():
+            if any(ex in link_name for ex in exclude_links):
+                continue
+            if link_name not in fk:
+                continue
+
+            link_T = fk[link_name].get_matrix()
+            wT = base_T @ link_T
+            # Transform corners to world frame
+            pts_world = (wT[0, :3, :3] @ pts_local.T).T + wT[0, :3, 3]
+
+            # Query SDF
+            sdf_vals = sdf.query(pts_world.unsqueeze(0).cuda()).cpu().squeeze(0)
+
+            # Penetration penalty
+            pen = F.relu(-sdf_vals - margin)
+            n_pts = pts_local.shape[0]
+            # Normalize by point count for consistent loss magnitude
+            all_pen = all_pen + (pen ** 2).sum() / n_pts + pen.sum() / n_pts
+
+            min_sdf = sdf_vals.min().item()
+            n_pen = (sdf_vals < -margin).sum().item()
+            pct = 100 * n_pen / n_pts
+            if min_sdf < -margin:
+                violations.append((link_name, min_sdf, pct))
+
+        return violations, all_pen
+
+
+# ============================================================
 # Contact projection
 # ============================================================
 def project_tips_to_surface(chain, u, base_T, sdf, q_lo, q_hi,
@@ -182,6 +328,124 @@ def project_tips_to_surface(chain, u, base_T, sdf, q_lo, q_hi,
         if u_proj.grad is not None:
             # Adaptive LR: larger when far from surface
             u.data -= lr * u_proj.grad
+
+
+# ============================================================
+# Direct mesh-vertex non-penetration projection
+# ============================================================
+# Finger prefix -> joint indices in LEAP's 16-DOF q vector
+_FINGER_JOINT_MAP = {
+    'if_': list(range(0, 4)),
+    'mf_': list(range(4, 8)),
+    'rf_': list(range(8, 12)),
+    'th_': list(range(12, 16)),
+}
+
+
+def _load_link_vertices(hand="rh", hand_type="leap", n_samples=500):
+    """Load and subsample mesh vertices for each link in link-local frame."""
+    import os
+    vis_meshes = _visual_meshes(hand, hand_type)
+    mesh_dir = os.path.join(os.path.dirname(__file__), f"models/leap_{hand}")
+    if not os.path.exists(mesh_dir):
+        mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{hand}")
+
+    link_verts = {}  # link_name -> tensor [N, 3] in link frame
+    _, col_names = _link_names(hand, hand_type)
+    for nm in col_names:
+        if nm not in vis_meshes:
+            continue
+        mesh_file, vis_pose = vis_meshes[nm][0]
+        full_path = os.path.join(mesh_dir, mesh_file)
+        if not os.path.exists(full_path):
+            continue
+        m = trimesh.load(full_path, force="mesh")
+        verts = np.asarray(m.vertices, dtype=np.float64)
+        if vis_pose is not None:
+            vp = np.array(vis_pose, dtype=np.float64)
+            Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
+            verts = (Rv @ verts.T).T + vp[:3]
+        # Subsample for speed
+        if len(verts) > n_samples:
+            idx = np.random.RandomState(42).choice(len(verts), n_samples, replace=False)
+            verts = verts[idx]
+        link_verts[nm] = torch.tensor(verts, dtype=torch.float32)
+    return link_verts
+
+
+# Module-level cache
+_link_verts_cache = {}
+
+
+def project_capsules_out(chain, u, base_T, sdf, q_lo, q_hi, capsule_model,
+                         exclude_fingers=None, n_iters=5, margin=0.001,
+                         lr=3.0):
+    """Push penetrating link mesh vertices out of object.
+
+    Uses actual mesh vertices for collision detection. Computes aggregate
+    penetration loss across ALL vertices of a finger's links, then takes
+    gradient steps on the finger's joints to push them out.
+
+    Each finger is handled independently since they are separate serial chains.
+    """
+    if exclude_fingers is None:
+        exclude_fingers = []
+
+    # Load mesh vertices (cached)
+    global _link_verts_cache
+    if not _link_verts_cache:
+        _link_verts_cache = _load_link_vertices("rh", "leap", n_samples=50)
+
+    for iteration in range(n_iters):
+        any_fixed = False
+        for finger_prefix, joint_indices in _FINGER_JOINT_MAP.items():
+            if finger_prefix in exclude_fingers:
+                continue
+
+            finger_links = [
+                nm for nm in _link_verts_cache if finger_prefix in nm
+            ]
+            if not finger_links:
+                continue
+
+            # Build computation graph through this finger's joints only
+            u_f = u.data[:, joint_indices].clone().requires_grad_(True)
+            u_full = u.data.clone()
+            u_full[:, joint_indices] = u_f
+            q = q_lo + torch.sigmoid(u_full) * (q_hi - q_lo)
+            fk = chain.forward_kinematics(q)
+
+            # Compute penetration loss across ALL vertices of ALL finger links
+            pen_loss = torch.tensor(0.0)
+            has_pen = False
+            for nm in finger_links:
+                if nm not in fk:
+                    continue
+                verts_local = _link_verts_cache[nm]
+                link_T = fk[nm].get_matrix()
+                wT = base_T @ link_T
+                verts_world = (wT[0, :3, :3] @ verts_local.T).T + wT[0, :3, 3]
+
+                # SDF query — need gradient flow, so don't detach
+                sv = sdf.query(verts_world.unsqueeze(0).cuda()).cpu().squeeze(0)
+
+                # Penetration: relu(-sdf - margin)
+                pen = F.relu(-sv - margin)
+                if pen.sum().item() > 0:
+                    has_pen = True
+                    # L2 + L1 for both smooth gradient near 0 and constant push far
+                    pen_loss = pen_loss + (pen ** 2).sum() + 5.0 * pen.sum()
+
+            if not has_pen:
+                continue
+
+            pen_loss.backward()
+            if u_f.grad is not None and u_f.grad.abs().max() > 1e-8:
+                u.data[:, joint_indices] -= lr * u_f.grad
+                any_fixed = True
+
+        if not any_fixed:
+            break
 
 
 # ============================================================

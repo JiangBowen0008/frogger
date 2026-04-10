@@ -11,7 +11,7 @@ sys.path.insert(0, ".")
 from frogger.batched_pytorch_solver import (
     _LEAP_JOINT_LOWER, _LEAP_JOINT_UPPER, BatchedSDF,
 )
-from constrained_grasp_solver import project_tips_to_surface
+from constrained_grasp_solver import project_tips_to_surface, BoxCollisionModel
 
 np.set_printoptions(precision=3, suppress=True)
 
@@ -60,6 +60,8 @@ def rot6d_to_matrix(r):
     return torch.stack([b1, b2, torch.cross(b1, b2, dim=-1)], dim=-1)
 
 
+box_model = BoxCollisionModel(device="cpu")
+
 results = []
 for trial in range(10):
     torch.manual_seed(trial * 7 + 1)
@@ -69,7 +71,7 @@ for trial in range(10):
         0.98, 0.3, 0.5, 0.5,  # IF: exact values for actuation reach
         0.3, 0.5, 0.6, 0.6,   # MF: moderate curl
         0.3, 0.5, 0.6, 0.6,   # RF: moderate curl
-        0.5, 0.5, 0.5, 0.4,   # TH: moderate
+        0.9, 0.5, 0.5, 0.4,   # TH: cmc high (keep th_mp away from object)
     ])
     u_start = torch.log(default_pcts / (1.0 - default_pcts))
     u = (u_start.unsqueeze(0) + 0.2 * torch.randn(1, 16)).requires_grad_(True)
@@ -78,8 +80,9 @@ for trial in range(10):
     ).requires_grad_(True)
     rot6d = (r6d_ws.unsqueeze(0) + 0.03 * torch.randn(1, 6)).requires_grad_(True)
 
-    # FREEZE base pose — only optimize joints
-    opt = torch.optim.Adam([u], lr=0.005)
+    # Optimize joints + base position (unfrozen to allow palm distance adjustment)
+    # Rotation stays frozen to keep palm orientation correct
+    opt = torch.optim.Adam([u, pos], lr=0.005)
 
     for s in range(1500):
         opt.zero_grad()
@@ -102,11 +105,11 @@ for trial in range(10):
         L = 200 * ((tips[0] - act_pos) ** 2).sum()
         L += 40 * (1 - (tip_x[0] * target_dir).sum()) ** 2
 
-        # Surface for MF/RF/TH (strong)
+        # Surface for MF/RF/TH: symmetric attraction + deep penetration penalty
         non_if = torch.stack(tips[1:]).unsqueeze(0)
         ts_noif = sdf.query(non_if.cuda()).cpu()
         L += 300 * (ts_noif ** 2).sum() + 100 * ts_noif.abs().sum()
-        L += 500 * ts_noif.abs().max()
+        L += 500 * torch.relu(-ts_noif - 0.003).sum()  # extra penalty >3mm inside
 
         # Palm contact at margin
         palm_R_np = np.array([[-0, 0, -1], [0, 1, 0], [1, 0, -0]])
@@ -120,7 +123,7 @@ for trial in range(10):
         )
         pw = (bT[0, :3, :3] @ pp_base.T).T + bT[0, :3, 3]
         ps = sdf.query(pw.unsqueeze(0).cuda()).cpu()
-        L += 60 * ((ps - 0.008) ** 2).sum()  # palm at 8mm margin (prevents deep pen)
+        L += 60 * ((ps - 0.005) ** 2).sum()  # palm at 5mm margin (box collision prevents pen)
 
         # Palm anti-penetration
         pp_dense_link = []
@@ -139,21 +142,42 @@ for trial in range(10):
         all_ts = sdf.query(torch.stack(tips).unsqueeze(0).cuda()).cpu()
         L += 50 * torch.relu(-all_ts - 0.001).sum()
 
-        # Link body collision (capsule model)
-        from constrained_grasp_solver import CapsuleModel
-        if not hasattr(project_tips_to_surface, '_cap') or trial == 0 and s == 0:
-            project_tips_to_surface._cap = CapsuleModel("rh", "leap", device="cpu")
-        # Exclude only IF links (must reach actuation on surface)
-        # Keep all other links including ds for collision — tips ARE projected
-        # to surface but the link bodies behind them shouldn't penetrate
-        _, cap_pen = project_tips_to_surface._cap.query_collision(
-            fk, bT, sdf, exclude_links=["if_"]
+        # Box primitive collision
+        # Exclude: IF (actuation), MF intermediate only (MF needs to wrap)
+        # Include: palm, all ds tips, ALL thumb, ALL RF (routing keeps it on correct side)
+        _, box_pen = box_model.query_collision(
+            fk, bT, sdf,
+            exclude_links=["if_", "mf_bs", "mf_px", "mf_md"],
+            margin=0.001,
         )
-        L += 100 * cap_pen
+        L += 150 * box_pen
 
-        # Position/rotation reg (STRONG to keep palm on correct side)
-        L += 80 * ((pos - torch.tensor(pos_ws)) ** 2).sum()
-        L += 50 * ((rot6d - r6d_ws) ** 2).sum()
+        # Position/rotation reg (preserves topology, allows palm approach)
+        L += 150 * ((pos - torch.tensor(pos_ws)) ** 2).sum()
+        L += 100 * ((rot6d - r6d_ws) ** 2).sum()
+
+        # === CONTACT ROUTING (architectural fix for finger placement) ===
+        # Each finger must contact from the correct side of the object:
+        # - MF/RF: same side as palm (wrap from palm side)
+        # - TH: opposite side (opposing thumb)
+        # Use angular constraint relative to bottle center
+        bottle_center_xy = torch.tensor([0.0, 0.0])
+        palm_approach_xy = (pw.mean(dim=0)[:2] - bottle_center_xy)
+        palm_dir = palm_approach_xy / (palm_approach_xy.norm() + 1e-8)
+
+        for i in range(1, 4):  # MF=1, RF=2, TH=3
+            tip_xy = tips[i][:2] - bottle_center_xy
+            tip_dir = tip_xy / (tip_xy.norm() + 1e-8)
+            dot = (tip_dir * palm_dir).sum()
+            if i < 3:  # MF, RF: same hemisphere as palm
+                L += 300 * torch.relu(-dot)
+            else:  # TH: opposite hemisphere
+                L += 300 * torch.relu(dot + 0.1)  # must be clearly opposite
+
+        # Height constraint: tips within 60mm of palm z-center
+        palm_z = pw.mean(dim=0)[2]
+        for i in range(1, 4):
+            L += 100 * torch.relu((tips[i][2] - palm_z).abs() - 0.06)
 
         L.backward()
         opt.step()
@@ -165,6 +189,8 @@ for trial in range(10):
                 tip_links, tip_offsets,
                 skip_indices=[0], n_steps=3, lr=2.0,
             )
+
+    # No separate projection step needed — box collision is in the loss
 
     with torch.no_grad():
         q_f = q_lo + torch.sigmoid(u) * (q_hi - q_lo)

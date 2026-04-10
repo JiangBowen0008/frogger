@@ -102,6 +102,7 @@ def main():
         opt = BatchedGraspOptimizer(
             sdf, num_envs=args.num_envs, device="cuda",
             hand=hand, hand_type=args.hand_type,
+            palm_contact=(args.hand_type == "leap"),
         )
         results = opt.optimize(
             actuation_targets=actuation_targets,
