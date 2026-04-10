@@ -877,6 +877,9 @@ class BatchedGraspOptimizer:
                         margins.append(0.000)  # body zone: just stay outside, no clearance
             elif "palm" in nm:
                 margins.extend([0.000] * pts.shape[0])  # palm: allow tangent contact
+            elif "th_bs" in nm or "th_px" in nm or "th_md" in nm:
+                # Thumb body: approaches from opposite side, must NOT cross through object
+                margins.extend([0.005] * pts.shape[0])  # 5mm clearance
             else:
                 margins.extend([0.002] * pts.shape[0])  # other: 2mm clearance
         self._col_margins = torch.tensor(margins, dtype=torch.float32,
