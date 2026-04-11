@@ -297,7 +297,9 @@ def run_numerical_checks(q_joints, base_pos, base_rot, link_verts, obj_mesh, X_W
     # Check 3: Thumb on opposite side of object from palm
     # Use direction from object center (xy-plane), not just y-coordinate.
     # This correctly detects opposition in any approach direction.
-    obj_center_xy = np.array([0.0, 0.0])  # object center in xy
+    # Compute actual object center from mesh vertices in world frame
+    obj_verts_W = (X_WO[:3, :3] @ np.asarray(obj_mesh.vertices, dtype=np.float64).T).T + X_WO[:3, 3]
+    obj_center_xy = obj_verts_W[:, :2].mean(axis=0)
     # Use the opposing normals result instead — if contacts have strong
     # opposition (min_dot < -0.3), the grasp has proper force closure topology.
     # The thumb-palm position check is unreliable because the palm mesh
