@@ -1460,7 +1460,8 @@ class BatchedGraspOptimizer:
 
         # -- Phase 1: Get fingertips onto surface -------------------------
         p1_steps = steps * 2 // 5
-        opt1 = torch.optim.Adam([self.u, self.pos], lr=lr)
+        # Include rotation — allows hand to tilt toward surface for reach
+        opt1 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr)
         sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, p1_steps, lr * 0.1)
         aB = torch.arange(B, device=dev)
 
@@ -1692,7 +1693,7 @@ class BatchedGraspOptimizer:
 
         p2_steps = steps - p1_steps
         # FREEZE rotation in Phase 2 as well — preserve palm-on-object orientation
-        opt2 = torch.optim.Adam([self.u, self.pos], lr=lr * 0.5)
+        opt2 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr * 0.5)
         sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, p2_steps, lr * 0.05)
         best_sigma = torch.full((B2,), -1.0, device=dev)
         best_u = self.u.clone().detach()
