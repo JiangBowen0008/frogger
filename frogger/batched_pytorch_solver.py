@@ -828,18 +828,17 @@ class BatchedGraspOptimizer:
             self._precompute_collision_points_mesh()
             return
 
-        # Collision margins matching Drake FroGGer:
-        # - _ds links (FROGGERCOL): margin = -d_pen (allow contact penetration)
-        # - All other links (palm, _bs, _px, _md, th_mp): margin = +d_min (stay clear)
-        # This matches robot_core.py default_coll_callback behavior.
+        # Collision margins:
+        # - _ds links: margin = -d_pen (allow contact penetration)
+        # - _px, _md links: margin = 0 (just don't penetrate)
+        # - _bs, palm, th_mp: margin = 0 (structural links near contact surface)
         d_pen = 0.003   # fingertip contact penetration allowance
-        d_min = 0.001   # minimum clearance for non-contact links
         margins = []
         for nm, pts in col_data:
-            if "_ds" in nm:  # fingertip distal = FROGGERCOL = contact allowed
+            if "_ds" in nm:  # fingertip distal = contact allowed
                 margins.extend([-d_pen] * pts.shape[0])
-            else:  # palm, _bs, _px, _md, th_mp = must stay clear
-                margins.extend([d_min] * pts.shape[0])
+            else:  # all other links: sdf >= 0 (no penetration, no clearance)
+                margins.extend([0.0] * pts.shape[0])
         self._col_margins = torch.tensor(margins, dtype=torch.float32,
                                          device=self.device)
 
