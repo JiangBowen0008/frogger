@@ -1269,6 +1269,7 @@ class BatchedGraspOptimizer:
         r6d = torch.cat([x_hat, y_hat], dim=-1)
         r6d = r6d + 0.05 * torch.randn_like(r6d)  # small noise to preserve palm orientation
         self.rot6d = r6d.detach().requires_grad_(True)
+        self._rot6d_init = self.rot6d.detach().clone()  # for rotation regularization
 
         # Actuation-finger assignment
         self.amap = np.zeros((B, max(n_act, 1)), dtype=np.int64)
@@ -1651,7 +1652,8 @@ class BatchedGraspOptimizer:
             total = (100 * La_p1
                      + 800 * Ls + Lp + 500 * L_sc  # Lp weighted by per-link λ+ρ (AL)
                      + 60 * Lat + 3 * Ld + 100 * L_wrap + 500 * L_route
-                     + 50 * L_link_wrap)  # reduced to allow fingers to extend for reach
+                     + 50 * L_link_wrap
+                     + 200 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))  # rotation reg: prevent cavity tilt
             total.mean().backward()
             opt1.step(); sch1.step()
 
