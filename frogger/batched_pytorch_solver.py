@@ -1182,12 +1182,14 @@ class BatchedGraspOptimizer:
         B, dev = self.num_envs, self.device
 
         if self.hand_type == "leap":
-            # Light curl — fingers extended for reach with collision-aware base.
+            # Init with CMC spread + moderate curl.
+            # CMC > 0 spreads fingers outward from palm → helps wrapping.
+            # PIP/DIP at 0.7 for moderate curl reach.
             dq = torch.tensor(
-                [0.0, 0.0, 0.2, 0.2,
-                 0.0, 0.0, 0.2, 0.2,
-                 0.0, 0.0, 0.2, 0.2,
-                 1.0, 0.3, 0.3, 0.2],
+                [1.0, 0.0, 0.7, 0.7,   # IF: CMC=1.0 spreads outward
+                 1.0, 0.0, 0.7, 0.7,   # MF: same
+                 1.0, 0.0, 0.7, 0.7,   # RF: same
+                 1.0, 0.4, 0.7, 0.7],  # TH
                 device=dev,
             )
         else:
