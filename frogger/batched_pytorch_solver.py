@@ -1491,7 +1491,24 @@ class BatchedGraspOptimizer:
             loss0.mean().backward()
             opt0a.step()
 
-        # Stage B: REMOVED — base position frozen for collision safety.
+        # Stage B: base approach with collision
+        opt0b = torch.optim.Adam([self.pos], lr=lr * 2.0)
+        for s in range(p0b):
+            opt0b.zero_grad()
+            q = self._u2q(self.u.detach())
+            bT = self._base_T(self.pos, self.rot6d.detach())
+            fk = self.chain.forward_kinematics(q)
+            tp, cp, _ = self._get_points(fk, bT)
+            ts = self.sdf.query(tp)
+            cs = self.sdf.query(cp)
+            ts_abs = ts.abs()
+            loss0 = 500 * ((ts ** 2).sum(-1) + 5 * ts_abs.sum(-1)
+                           + 20 * ts_abs.max(dim=-1).values ** 2
+                           + 10 * ts_abs.max(dim=-1).values)
+            pen0 = F.relu(self._col_margins - cs)
+            loss0 += 2000 * pen0.max(-1).values + 500 * pen0.mean(-1)
+            loss0.mean().backward()
+            opt0b.step()
 
         with torch.no_grad():
             q0 = self._u2q(self.u)
@@ -1503,9 +1520,9 @@ class BatchedGraspOptimizer:
 
         # -- Phase 1: Get fingertips onto surface -------------------------
         p1_steps = steps * 2 // 5
-        # Joints + rotation only — base position FROZEN to maintain collision clearance.
-        # Rotation allows tilt toward surface for reach.
-        opt1 = torch.optim.Adam([self.u, self.rot6d], lr=lr)
+        # All DOF: joints + position + rotation. The routing fix should
+        # prevent the palm from going through the middle now.
+        opt1 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr)
         sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, p1_steps, lr * 0.1)
         aB = torch.arange(B, device=dev)
 
@@ -1622,12 +1639,12 @@ class BatchedGraspOptimizer:
                 palm_dir_xy = F.normalize(tip_dirs[:, :4, :2].mean(dim=1), dim=-1)
 
             L_route = torch.zeros(B, device=dev)
-            for fi in [0, 1, 2]:  # IF, MF, RF: same side as palm
+            for fi in [0, 1, 2]:  # IF, MF, RF: OPPOSITE side from palm (wrapping)
                 dot_palm = (tip_dirs_xy[:, fi] * palm_dir_xy).sum(-1)
-                L_route += F.relu(-dot_palm)  # penalize opposite side
-            # TH: opposite side from palm
+                L_route += F.relu(dot_palm + 0.3)  # penalize same side (dot > -0.3)
+            # TH: same side as palm (thumb supports from palm side)
             dot_th = (tip_dirs_xy[:, 3] * palm_dir_xy).sum(-1)
-            L_route += F.relu(dot_th + 0.1)  # must be clearly opposite
+            L_route += F.relu(-dot_th)  # penalize opposite side from palm
 
             # Also keep generic wrapping balance (gentler)
             wrap_dirs = F.normalize(tip_dirs, dim=-1)
@@ -1654,7 +1671,7 @@ class BatchedGraspOptimizer:
 
             total = (100 * La_p1
                      + 800 * Ls + Lp + 500 * L_sc  # Lp weighted by per-link λ+ρ (AL)
-                     + 60 * Lat + 3 * Ld + 100 * L_wrap + 500 * L_route
+                     + 60 * Lat + 3 * Ld + 100 * L_wrap + 2000 * L_route
                      + 50 * L_link_wrap
                      + 100 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))  # light rotation reg
             total.mean().backward()
@@ -1738,7 +1755,7 @@ class BatchedGraspOptimizer:
 
         p2_steps = steps - p1_steps
         # FREEZE rotation in Phase 2 as well — preserve palm-on-object orientation
-        opt2 = torch.optim.Adam([self.u, self.rot6d], lr=lr * 0.5)
+        opt2 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr * 0.5)
         sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, p2_steps, lr * 0.05)
         best_sigma = torch.full((B2,), -1.0, device=dev)
         best_u = self.u.clone().detach()
@@ -1846,7 +1863,11 @@ class BatchedGraspOptimizer:
                     palm_dir_p2 = F.normalize(tip_dirs_p2[:, 4:, :2].mean(dim=1), dim=-1)
                 else:
                     palm_dir_p2 = F.normalize(tip_dirs_p2[:, :4, :2].mean(dim=1), dim=-1)
-                L_route_p2 = F.relu((tip_dirs_xy_p2[:, 3] * palm_dir_p2).sum(-1) + 0.1)
+                # Fingers must wrap to opposite side from palm
+                L_route_p2 = torch.zeros(B2, device=dev)
+                for fi in [0, 1, 2]:  # IF, MF, RF opposite from palm
+                    dot_p2 = (tip_dirs_xy_p2[:, fi] * palm_dir_p2).sum(-1)
+                    L_route_p2 += F.relu(dot_p2 + 0.3)
                 # Link wrapping in Phase 2 (maintain wrapping during FC opt)
                 L_lw_p2 = torch.zeros(B2, device=dev)
                 if self.hand_type == "leap":
@@ -1862,7 +1883,7 @@ class BatchedGraspOptimizer:
                             _s2 = self.sdf.query(_p2.unsqueeze(1)).squeeze(1)
                             _d2 = F.relu(_s2 - 0.010)
                             L_lw_p2 += _d2 ** 2 + 5.0 * _d2
-                total = 1500 * L_surf + L_col + 800 * L_sc + 200 * L_palm + 500 * L_route_p2 + 150 * L_lw_p2
+                total = 1500 * L_surf + L_col + 800 * L_sc + 200 * L_palm + 2000 * L_route_p2 + 150 * L_lw_p2
                 sigma_min = torch.zeros(B2, device=dev)  # not computed on constraint steps
             else:
                 # --- OBJECTIVE STEP: FC + actuation + spread ---
