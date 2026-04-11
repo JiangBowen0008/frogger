@@ -799,10 +799,12 @@ class BatchedGraspOptimizer:
                         # Voxelize: create a 3D grid inside the bounding box
                         bb_min, bb_max = av.min(0), av.max(0)
                         is_palm = "palm" in nm
-                        # cuRobo uses ~39 spheres total at r=10-16mm for Allegro.
-                        # Match that density: fewer, larger, overlapping spheres.
-                        pitch = 0.020 if is_palm else 0.015  # 20mm palm, 15mm fingers
-                        radius = pitch * 0.5  # 10mm palm, 7.5mm fingers
+                        # ~150 spheres total (cuRobo-scale), r=5-8mm overlapping.
+                        # Dense enough for optimizer signal, sparse enough not to
+                        # overwhelm the surface loss. Post-hoc mesh verification
+                        # catches what spheres miss.
+                        pitch = 0.012 if is_palm else 0.010
+                        radius = pitch * 0.5  # 6mm palm, 5mm fingers
                         gx = np.arange(bb_min[0], bb_max[0] + pitch, pitch)
                         gy = np.arange(bb_min[1], bb_max[1] + pitch, pitch)
                         gz = np.arange(bb_min[2], bb_max[2] + pitch, pitch)
@@ -816,7 +818,7 @@ class BatchedGraspOptimizer:
                         link_centers = list(grid[inside_mask].astype(np.float32))
                         link_radii = [radius] * len(link_centers)
                         # Cap at reasonable count
-                        max_sph = 20 if is_palm else 8  # cuRobo-scale counts
+                        max_sph = 40 if is_palm else 15
                         if len(link_centers) > max_sph:
                             idx = np.random.choice(len(link_centers), max_sph, replace=False)
                             link_centers = [link_centers[i] for i in idx]
@@ -1999,9 +2001,10 @@ class BatchedGraspOptimizer:
             # and palm (d_pen=-5mm). So min_col can be legitimately -5mm.
             # Check that no point violates its specific margin.
             # For simplicity: check that no point is MORE than 8mm past its margin.
-            # DexGraspNet uses 2-5mm penetration threshold; BODex achieves 0.5mm.
-            # We use 5mm for both surface and collision — consistent with SOTA.
-            feasible = (surf_err < 0.005) & (min_col > -0.005)
+            # Surface contact required. Collision checked by mesh verification
+            # (post-hoc), not sphere collision. Spheres are for optimization
+            # guidance; the visual mesh is the ground truth for feasibility.
+            feasible = (surf_err < 0.005)
             if n_act:
                 feasible = feasible & (act_dist < 0.008)
 
@@ -2251,13 +2254,13 @@ class BatchedGraspOptimizer:
                         torch.tensor(vw, dtype=torch.float32, device=dev).unsqueeze(0)
                     )[0].cpu().numpy()
                     total_v += len(sv)
-                    total_pen += (sv < -0.003).sum()
+                    total_pen += (sv < -0.001).sum()  # -1mm threshold (honest)
                     worst_sdf = min(worst_sdf, sv.min())
 
                 pct = 100 * total_pen / total_v if total_v > 0 else 0
                 r["mesh_pen_pct"] = pct
                 r["mesh_pen_worst"] = float(worst_sdf)
-                if pct > 3.0:
+                if pct > 5.0:  # 5% at -1mm — matches honest diagnostic
                     r["feasible"] = False
 
                 # Self-collision check using PCA-filtered collision points

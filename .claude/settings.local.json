@@ -1,11 +1,18 @@
 {
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:ar5iv.labs.arxiv.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:graspqp.github.io)"
+    ]
+  },
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "prompt",
-            "prompt": "Before this conversation ends, verify the grasp quality checklist:\n\n(1) PREVIOUSLY RAISED ISSUES: Are ALL of these addressed? Self-collision between fingers, palm-object penetration, fingertips reaching surface, palm facing object, natural finger poses, force closure quality, actuation finger, generalization across objects.\n\n(2) VISUAL EXAMINATION: Have the projection images (XY, YZ, XZ) been examined? Do the grasps ACTUALLY look good - no visible penetration, no self-collision, natural hand pose, palm in contact?\n\n(3) CHECKS PASSING: Are diagnostic checks (diagnose_grasp.py) passing? Is the full mesh verification (pen%, sc) honest? Are the metrics actually effective at catching problems?\n\nIf ANY of these are not satisfied, output: {\"decision\": \"block\", \"reason\": \"Grasp quality verification incomplete. Must address: [list unverified items]\"}\n\nIf all are satisfied, output: {\"continue\": true}",
+            "prompt": "Before this conversation ends, verify TWO things:\n\n=== PART A: GRASP QUALITY CHECKLIST ===\n(1) PREVIOUSLY RAISED ISSUES: Are ALL of these addressed? Self-collision between fingers, palm-object penetration, fingertips reaching surface, palm facing object, natural finger poses, force closure quality, actuation finger, generalization across objects.\n(2) VISUAL EXAMINATION: Have the projection images (XY, YZ, XZ) been examined? Do the grasps ACTUALLY look good - no visible penetration, no self-collision, natural hand pose, palm in contact?\n(3) CHECKS PASSING: Are diagnostic checks (diagnose_grasp.py) passing? Is the full mesh verification (pen%, sc) honest? Are the metrics actually effective at catching problems?\n\n=== PART B: EXHAUSTED ALL INFORMATION SOURCES ===\nIf the assistant is stuck or asking the user for guidance, verify that ALL of these were attempted BEFORE asking:\n(a) SELF-REASONING: Did the assistant think through the problem systematically on their own?\n(b) FROGGER CODEBASE: Did the assistant check the existing FroGGer/Drake implementation for how it handles the issue?\n(c) ONLINE LITERATURE: Did the assistant search academic papers or documentation for solutions?\n(d) ONLINE CODEBASES: Did the assistant search GitHub/repos for how others solve this problem?\nThe user is NOT a grasp synthesis expert — the assistant should exhaust these sources before asking for guidance.\n\n=== DECISION ===\nIf the assistant is CLAIMING SUCCESS but Part A items are unverified or checks were weakened: {\"decision\": \"block\", \"reason\": \"Must address: [list items]\"}\nIf the assistant is asking for user guidance but has NOT exhausted Part B sources: {\"decision\": \"block\", \"reason\": \"Must first check: [list unchecked sources from Part B]\"}\nIf Part A all passes with honest metrics: {\"continue\": true}\nIf Part B all exhausted and assistant genuinely needs user input: {\"continue\": true}",
             "statusMessage": "Verifying grasp quality checklist..."
           }
         ]
