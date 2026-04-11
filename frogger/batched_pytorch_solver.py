@@ -1671,11 +1671,17 @@ class BatchedGraspOptimizer:
                         _wd = F.relu(_ws - 0.015)  # excess beyond 15mm
                         L_link_wrap += _wd ** 2 + 3.0 * _wd
 
+            # Two-phase surface ramp: routing established first (no surface),
+            # then surface added while maintaining wrapping topology.
+            surf_frac = max(0.0, (s - p1_steps * 0.4) / (p1_steps * 0.6))
+            surf_w = 800 * surf_frac  # ramps from 0 to 800 over second 60%
+            route_w = 2000 + 1000 * (1.0 - surf_frac)  # stronger early, lighter late
+
             total = (100 * La_p1
-                     + 800 * Ls + Lp + 500 * L_sc
-                     + 60 * Lat + 3 * Ld + 100 * L_wrap + 2000 * L_route
+                     + surf_w * Ls + Lp + 500 * L_sc
+                     + 60 * Lat + 3 * Ld + 100 * L_wrap + route_w * L_route
                      + 50 * L_link_wrap
-                     + 100 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))  # light rotation reg
+                     + 100 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))
             total.mean().backward()
             opt1.step(); sch1.step()
 
