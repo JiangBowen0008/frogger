@@ -1670,7 +1670,7 @@ class BatchedGraspOptimizer:
                         L_link_wrap += _wd ** 2 + 3.0 * _wd
 
             total = (100 * La_p1
-                     + 800 * Ls + Lp + 500 * L_sc  # Lp weighted by per-link λ+ρ (AL)
+                     + 800 * Ls + Lp + 500 * L_sc
                      + 60 * Lat + 3 * Ld + 100 * L_wrap + 2000 * L_route
                      + 50 * L_link_wrap
                      + 100 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))  # light rotation reg
