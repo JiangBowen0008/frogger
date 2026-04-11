@@ -1487,24 +1487,7 @@ class BatchedGraspOptimizer:
             loss0.mean().backward()
             opt0a.step()
 
-        # Stage B: base position + collision
-        opt0b = torch.optim.Adam([self.pos], lr=lr * 2.0)
-        for s in range(p0b):
-            opt0b.zero_grad()
-            q = self._u2q(self.u.detach())
-            bT = self._base_T(self.pos, self.rot6d.detach())
-            fk = self.chain.forward_kinematics(q)
-            tp, cp, _ = self._get_points(fk, bT)
-            ts = self.sdf.query(tp)
-            cs = self.sdf.query(cp)
-            ts_abs = ts.abs()
-            loss0 = 500 * ((ts ** 2).sum(-1) + 5 * ts_abs.sum(-1)
-                           + 20 * ts_abs.max(dim=-1).values ** 2
-                           + 10 * ts_abs.max(dim=-1).values)
-            pen0 = F.relu(self._col_margins - cs)
-            loss0 += 5000 * pen0.max(-1).values + 1000 * pen0.mean(-1)
-            loss0.mean().backward()
-            opt0b.step()
+        # Stage B: REMOVED — base position frozen for collision safety.
 
         with torch.no_grad():
             q0 = self._u2q(self.u)
@@ -1516,8 +1499,9 @@ class BatchedGraspOptimizer:
 
         # -- Phase 1: Get fingertips onto surface -------------------------
         p1_steps = steps * 2 // 5
-        # Include rotation — allows hand to tilt toward surface for reach
-        opt1 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr)
+        # Joints + rotation only — base position FROZEN to maintain collision clearance.
+        # Rotation allows tilt toward surface for reach.
+        opt1 = torch.optim.Adam([self.u, self.rot6d], lr=lr)
         sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, p1_steps, lr * 0.1)
         aB = torch.arange(B, device=dev)
 
@@ -1668,7 +1652,7 @@ class BatchedGraspOptimizer:
                      + 800 * Ls + Lp + 500 * L_sc  # Lp weighted by per-link λ+ρ (AL)
                      + 60 * Lat + 3 * Ld + 100 * L_wrap + 500 * L_route
                      + 50 * L_link_wrap
-                     + 200 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))  # rotation reg: prevent cavity tilt
+                     + 350 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))  # rotation reg
             total.mean().backward()
             opt1.step(); sch1.step()
 
@@ -1750,7 +1734,7 @@ class BatchedGraspOptimizer:
 
         p2_steps = steps - p1_steps
         # FREEZE rotation in Phase 2 as well — preserve palm-on-object orientation
-        opt2 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr * 0.5)
+        opt2 = torch.optim.Adam([self.u, self.rot6d], lr=lr * 0.5)
         sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, p2_steps, lr * 0.05)
         best_sigma = torch.full((B2,), -1.0, device=dev)
         best_u = self.u.clone().detach()
