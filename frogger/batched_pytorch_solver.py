@@ -799,8 +799,10 @@ class BatchedGraspOptimizer:
                         # Voxelize: create a 3D grid inside the bounding box
                         bb_min, bb_max = av.min(0), av.max(0)
                         is_palm = "palm" in nm
-                        pitch = 0.008 if is_palm else 0.006  # 8mm palm, 6mm fingers
-                        radius = pitch * 0.6  # overlapping spheres (4.8mm palm, 3.6mm fingers)
+                        # cuRobo uses ~39 spheres total at r=10-16mm for Allegro.
+                        # Match that density: fewer, larger, overlapping spheres.
+                        pitch = 0.020 if is_palm else 0.015  # 20mm palm, 15mm fingers
+                        radius = pitch * 0.5  # 10mm palm, 7.5mm fingers
                         gx = np.arange(bb_min[0], bb_max[0] + pitch, pitch)
                         gy = np.arange(bb_min[1], bb_max[1] + pitch, pitch)
                         gz = np.arange(bb_min[2], bb_max[2] + pitch, pitch)
@@ -814,7 +816,7 @@ class BatchedGraspOptimizer:
                         link_centers = list(grid[inside_mask].astype(np.float32))
                         link_radii = [radius] * len(link_centers)
                         # Cap at reasonable count
-                        max_sph = 120 if is_palm else 50
+                        max_sph = 20 if is_palm else 8  # cuRobo-scale counts
                         if len(link_centers) > max_sph:
                             idx = np.random.choice(len(link_centers), max_sph, replace=False)
                             link_centers = [link_centers[i] for i in idx]
@@ -1652,7 +1654,7 @@ class BatchedGraspOptimizer:
                      + 800 * Ls + Lp + 500 * L_sc  # Lp weighted by per-link λ+ρ (AL)
                      + 60 * Lat + 3 * Ld + 100 * L_wrap + 500 * L_route
                      + 50 * L_link_wrap
-                     + 350 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))  # rotation reg
+                     + 100 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))  # light rotation reg
             total.mean().backward()
             opt1.step(); sch1.step()
 
