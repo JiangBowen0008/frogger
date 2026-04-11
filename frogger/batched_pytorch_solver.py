@@ -754,42 +754,27 @@ class BatchedGraspOptimizer:
             _offset = 0
 
             # ALL links checked for collision.
-            # Palm: use MESH vertices instead of boxes. The Menagerie boxes
-            # are flat primitives that can't conform to curved objects (6.7mm
-            # gap on a 50mm bottle). Mesh vertices follow the actual palm
-            # surface curvature, giving accurate collision on any object shape.
+            # Palm: use a grid of points on the flat contact face instead of
+            # boxes or full mesh. The Menagerie boxes are too large for curved
+            # surfaces. The full mesh has motor housing protrusions. A contact
+            # face grid represents the actual surface that would touch objects.
             _col_link_names = list(self.collision_link_names)
-            _palm_use_mesh = True  # mesh collision for palm, boxes for fingers
-
-            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}")
-            vis = _visual_meshes(self.hand, self.hand_type)
+            _palm_use_grid = True
 
             for nm in _col_link_names:
-                # Palm: use FPS-sampled mesh vertices (follows curvature)
-                if "palm" in nm and _palm_use_mesh and nm in vis:
-                    all_verts = []
-                    for mesh_file, vis_pose in vis[nm]:
-                        path = os.path.join(mesh_dir, mesh_file)
-                        if not os.path.exists(path):
-                            continue
-                        lm = trimesh.load(path, force="mesh")
-                        verts = np.asarray(lm.vertices, dtype=np.float64)
-                        if vis_pose is not None:
-                            vp = np.array(vis_pose, dtype=np.float64)
-                            Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
-                            verts = (Rv @ verts.T).T + vp[:3]
-                        all_verts.append(verts)
-                    if all_verts:
-                        all_verts = np.vstack(all_verts)
-                        # Filter to outer surface: z > -5mm in palm frame.
-                        # The deep inner cavity (z < -5mm) is structural,
-                        # not the surface that faces outward toward objects.
-                        face_mask = all_verts[:, 2] > -0.005
-                        if face_mask.sum() >= 100:
-                            all_verts = all_verts[face_mask]
-                        _ap = self._fps(all_verts, 200).astype(np.float32)
-                    else:
-                        _ap = np.array([[0, 0, 0]], dtype=np.float32)
+                # Palm: use a flat grid on the contact face.
+                # The palm contact surface faces +z in palm frame.
+                # Grid covers the central area where contact actually happens.
+                # In palm frame: x=[-0.05, 0.0], y=[-0.08, 0.02], z=0.0
+                if "palm" in nm and _palm_use_grid:
+                    # Small central grid: 30x30mm covers the contact patch
+                    # that can physically touch objects ≥ 50mm diameter.
+                    _gx = np.linspace(-0.035, -0.010, 4)
+                    _gy = np.linspace(-0.040, -0.010, 4)
+                    _gxx, _gyy = np.meshgrid(_gx, _gy, indexing='ij')
+                    _grid = np.stack([_gxx.ravel(), _gyy.ravel(),
+                                      np.full(_gxx.size, 0.003)], axis=-1)
+                    _ap = _grid.astype(np.float32)
                 else:
                     # Non-palm links: use URDF box surface sampling
                     _le = None
