@@ -371,18 +371,52 @@ def run_numerical_checks(q_joints, base_pos, base_rot, link_verts, obj_mesh, X_W
     else:
         results.append(("Wrapping topology (≥2 fingers opposite palm)", False, "missing data"))
 
-    # Also report penetration for information (but wrapping topology is the primary check)
-    pen_info = []
+    # Check 5b: Volumetric penetration — sample points inside each link's
+    # bounding volume and check how many are DEEP inside the object.
+    # This catches "hand going through the middle" which surface checks miss.
+    # A hand on the side has few deep volume points; a hand through the
+    # middle has many.
+    all_ok_pen = True
+    pen_details = []
+    total_vol_pts = 0
+    total_deep = 0
     for link_name, verts in link_verts.items():
-        pts = torch.tensor(verts, dtype=torch.float32, device="cuda").unsqueeze(0)
-        sdf_vals = sdf.query(pts).cpu().numpy()[0]
-        n_inside = (sdf_vals < -0.001).sum()
-        pct = n_inside / len(sdf_vals)
-        if pct > 0.02:  # report links with >2% inside
-            short = link_name.replace("leap_rh_", "")
-            pen_info.append(f"{short}: {pct*100:.1f}%")
-    if pen_info:
-        print(f"  [INFO] Penetration: {', '.join(pen_info)}")
+        # Bounding box of this link's world-frame vertices
+        bb_min = verts.min(axis=0)
+        bb_max = verts.max(axis=0)
+        extent = bb_max - bb_min
+        if extent.max() < 0.005:
+            continue
+        # Sample volume points inside bounding box (5mm grid)
+        step = 0.005
+        gx = np.arange(bb_min[0], bb_max[0] + step, step)
+        gy = np.arange(bb_min[1], bb_max[1] + step, step)
+        gz = np.arange(bb_min[2], bb_max[2] + step, step)
+        if len(gx) * len(gy) * len(gz) > 50000:
+            step = 0.008  # coarser for large links
+            gx = np.arange(bb_min[0], bb_max[0] + step, step)
+            gy = np.arange(bb_min[1], bb_max[1] + step, step)
+            gz = np.arange(bb_min[2], bb_max[2] + step, step)
+        grid = np.array(np.meshgrid(gx, gy, gz, indexing='ij')).reshape(3, -1).T
+        # Only keep points near the mesh (within ~10mm of any vertex)
+        from scipy.spatial import cKDTree
+        tree = cKDTree(verts[::10])  # subsample for speed
+        dists, _ = tree.query(grid, k=1)
+        near_mask = dists < 0.010
+        vol_pts = grid[near_mask]
+        if len(vol_pts) < 10:
+            continue
+        sv = sdf.query(torch.tensor(vol_pts, dtype=torch.float32, device="cuda").unsqueeze(0))[0].cpu().numpy()
+        n_deep = (sv < -0.005).sum()  # 5mm deep = truly inside object
+        total_vol_pts += len(vol_pts)
+        total_deep += n_deep
+    if total_vol_pts > 0:
+        deep_pct = 100 * total_deep / total_vol_pts
+        passed = deep_pct < 2.0  # <2% of volume points deeply inside
+        results.append(("No deep volumetric penetration (<2% at -5mm)",
+                        passed, f"{deep_pct:.1f}% ({total_deep}/{total_vol_pts} pts)"))
+    else:
+        results.append(("No deep volumetric penetration (<2% at -5mm)", True, "no volume pts"))
 
     # Check 6: At least one pair of opposing contact normals (dot < -0.3)
     # Project tips to nearest surface point first (gradient descent on SDF²),
