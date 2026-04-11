@@ -753,50 +753,77 @@ class BatchedGraspOptimizer:
             col_link_ranges = []  # (start, end) per link for per-link AL
             _offset = 0
 
-            # Exclude palm and _bs (base) links from collision:
-            # - Palm box: structural mounting plate behind contact surface
-            # - _bs boxes: motor housings at finger base, attached to palm.
-            #   When palm contacts curved objects, these 40mm boxes always
-            #   enter the surface. They're structural, not finger body.
-            # Collision only checks _px, _md, _ds links + thumb MP.
-            _col_link_names = [nm for nm in self.collision_link_names
-                               if "palm" not in nm and "_bs" not in nm]
+            # ALL links checked for collision.
+            # Palm: use MESH vertices instead of boxes. The Menagerie boxes
+            # are flat primitives that can't conform to curved objects (6.7mm
+            # gap on a 50mm bottle). Mesh vertices follow the actual palm
+            # surface curvature, giving accurate collision on any object shape.
+            _col_link_names = list(self.collision_link_names)
+            _palm_use_mesh = True  # mesh collision for palm, boxes for fingers
+
+            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}")
+            vis = _visual_meshes(self.hand, self.hand_type)
 
             for nm in _col_link_names:
-                _le = None
-                for _e in _tree_col.getroot().findall("link"):
-                    if _e.get("name") == nm:
-                        _le = _e
-                        break
-                box_pts = []
-                if _le is not None:
-                    for _cel in _le.findall("collision"):
-                        _g = _cel.find("geometry")
-                        if _g is None: continue
-                        _b = _g.find("box")
-                        if _b is None: continue
-                        _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
-                        _hx, _hy, _hz = _sx/2, _sy/2, _sz/2
-                        _o = _cel.find("origin")
-                        _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
-                        _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
-                        _R = (ScipyR.from_euler("xyz", _rpy).as_matrix()
-                              if np.any(np.abs(_rpy) > 1e-6) else np.eye(3))
-                        # 26-point box surface: 8 corners + 12 edge mids + 6 face centers
-                        _samples = []
-                        for sx in [-1, 0, 1]:
-                            for sy in [-1, 0, 1]:
-                                for sz in [-1, 0, 1]:
-                                    if sx == 0 and sy == 0 and sz == 0:
-                                        continue
-                                    _samples.append([sx*_hx, sy*_hy, sz*_hz])
-                        lp = np.array(_samples)
-                        box_pts.append((_R @ lp.T).T + _p)
-
-                if box_pts:
-                    _ap = np.vstack(box_pts).astype(np.float32)
+                # Palm: use FPS-sampled mesh vertices (follows curvature)
+                if "palm" in nm and _palm_use_mesh and nm in vis:
+                    all_verts = []
+                    for mesh_file, vis_pose in vis[nm]:
+                        path = os.path.join(mesh_dir, mesh_file)
+                        if not os.path.exists(path):
+                            continue
+                        lm = trimesh.load(path, force="mesh")
+                        verts = np.asarray(lm.vertices, dtype=np.float64)
+                        if vis_pose is not None:
+                            vp = np.array(vis_pose, dtype=np.float64)
+                            Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
+                            verts = (Rv @ verts.T).T + vp[:3]
+                        all_verts.append(verts)
+                    if all_verts:
+                        all_verts = np.vstack(all_verts)
+                        # Filter to outer surface: z > -5mm in palm frame.
+                        # The deep inner cavity (z < -5mm) is structural,
+                        # not the surface that faces outward toward objects.
+                        face_mask = all_verts[:, 2] > -0.005
+                        if face_mask.sum() >= 100:
+                            all_verts = all_verts[face_mask]
+                        _ap = self._fps(all_verts, 200).astype(np.float32)
+                    else:
+                        _ap = np.array([[0, 0, 0]], dtype=np.float32)
                 else:
-                    _ap = np.array([[0, 0, 0]], dtype=np.float32)
+                    # Non-palm links: use URDF box surface sampling
+                    _le = None
+                    for _e in _tree_col.getroot().findall("link"):
+                        if _e.get("name") == nm:
+                            _le = _e
+                            break
+                    box_pts = []
+                    if _le is not None:
+                        for _cel in _le.findall("collision"):
+                            _g = _cel.find("geometry")
+                            if _g is None: continue
+                            _b = _g.find("box")
+                            if _b is None: continue
+                            _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
+                            _hx, _hy, _hz = _sx/2, _sy/2, _sz/2
+                            _o = _cel.find("origin")
+                            _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
+                            _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
+                            _R = (ScipyR.from_euler("xyz", _rpy).as_matrix()
+                                  if np.any(np.abs(_rpy) > 1e-6) else np.eye(3))
+                            _samples = []
+                            for sx in [-1, 0, 1]:
+                                for sy in [-1, 0, 1]:
+                                    for sz in [-1, 0, 1]:
+                                        if sx == 0 and sy == 0 and sz == 0:
+                                            continue
+                                        _samples.append([sx*_hx, sy*_hy, sz*_hz])
+                            lp = np.array(_samples)
+                            box_pts.append((_R @ lp.T).T + _p)
+                    if box_pts:
+                        _ap = np.vstack(box_pts).astype(np.float32)
+                    else:
+                        _ap = np.array([[0, 0, 0]], dtype=np.float32)
 
                 pts_h = np.hstack([_ap, np.ones((len(_ap), 1), dtype=np.float32)])
                 col_data.append((nm, torch.tensor(pts_h, device=self.device)))
@@ -816,12 +843,20 @@ class BatchedGraspOptimizer:
             self._precompute_collision_points_mesh()
             return
 
-        # Uniform zero margin: URDF boxes are the physical collision geometry.
-        # They must stay outside the object (sdf >= 0). No per-point heuristics
-        # needed — boxes structurally don't cover fingertip pads (25mm gap).
-        n_col_total = sum(p.shape[0] for _, p in col_data)
-        self._col_margins = torch.zeros(n_col_total, dtype=torch.float32,
-                                        device=self.device)
+        # Collision margins matching Drake FroGGer:
+        # - _ds links (FROGGERCOL): margin = -d_pen (allow contact penetration)
+        # - All other links (palm, _bs, _px, _md, th_mp): margin = +d_min (stay clear)
+        # This matches robot_core.py default_coll_callback behavior.
+        d_pen = 0.003   # fingertip contact penetration allowance
+        d_min = 0.001   # minimum clearance for non-contact links
+        margins = []
+        for nm, pts in col_data:
+            if "_ds" in nm:  # fingertip distal = FROGGERCOL = contact allowed
+                margins.extend([-d_pen] * pts.shape[0])
+            else:  # palm, _bs, _px, _md, th_mp = must stay clear
+                margins.extend([d_min] * pts.shape[0])
+        self._col_margins = torch.tensor(margins, dtype=torch.float32,
+                                         device=self.device)
 
         # Self-collision uses URDF BOX points (physical collision geometry),
         # NOT visual mesh. Visual meshes have motor housing protrusions that
@@ -1197,7 +1232,7 @@ class BatchedGraspOptimizer:
 
             # Place base so that palm INNER SURFACE contact point is at the surface:
             # contact_world = R_base @ palm_contact_base + base_pos = surf_pt + margin * outward
-            margin = 0.002 + 0.008 * torch.rand(B, device=dev)  # 2-10mm outside surface
+            margin = 0.005 + 0.010 * torch.rand(B, device=dev)  # 5-15mm outside surface
             palm_target = surf_pts + margin.unsqueeze(-1) * outward_normals
             contact_in_world = (R_base @ palm_contact_base.unsqueeze(-1)).squeeze(-1)
             base_pos = palm_target - contact_in_world
@@ -1427,7 +1462,7 @@ class BatchedGraspOptimizer:
                            + 20 * ts_abs.max(dim=-1).values ** 2
                            + 10 * ts_abs.max(dim=-1).values)
             # Collision on finger links (palm excluded from _col_data)
-            pen0 = F.relu(-cs)
+            pen0 = F.relu(self._col_margins - cs)
             loss0 += 2000 * pen0.max(-1).values + 500 * pen0.mean(-1)
             loss0.mean().backward()
             opt0b.step()
@@ -1475,7 +1510,7 @@ class BatchedGraspOptimizer:
                   + 10.0 * ts_abs_p1.max(dim=-1).values)
             # (Approach direction handled by routing constraint L_route)
             # Per-link collision via Augmented Lagrangian
-            pen = F.relu(-cs)  # [B, N_col] penetration depth at box points
+            pen = F.relu(self._col_margins - cs)  # [B, N_col] margin violation
             pen_per_link = torch.zeros(B, n_col_links, device=dev)
             for _li, (_si, _ei) in enumerate(col_link_ranges):
                 if _si < _ei:
@@ -1731,7 +1766,7 @@ class BatchedGraspOptimizer:
                           + 5.0 * ts_abs.sum(-1)
                           + 20.0 * ts_abs.max(-1).values ** 2
                           + 10.0 * ts_abs.max(-1).values)
-                pen = F.relu(-cs)  # [B2, N_col]
+                pen = F.relu(self._col_margins - cs)  # [B2, N_col]
                 pen_per_link_p2 = torch.zeros(B2, n_col_links, device=dev)
                 for _li, (_si, _ei) in enumerate(col_link_ranges):
                     if _si < _ei:
