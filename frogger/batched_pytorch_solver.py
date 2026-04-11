@@ -1276,7 +1276,7 @@ class BatchedGraspOptimizer:
 
             # Place base so that palm INNER SURFACE contact point is at the surface:
             # contact_world = R_base @ palm_contact_base + base_pos = surf_pt + margin * outward
-            margin = 0.002 + 0.005 * torch.rand(B, device=dev)  # 2-7mm outside surface
+            margin = 0.000 + 0.003 * torch.rand(B, device=dev)  # 0-3mm outside surface
             palm_target = surf_pts + margin.unsqueeze(-1) * outward_normals
             contact_in_world = (R_base @ palm_contact_base.unsqueeze(-1)).squeeze(-1)
             base_pos = palm_target - contact_in_world
