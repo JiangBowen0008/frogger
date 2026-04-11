@@ -786,7 +786,7 @@ class BatchedGraspOptimizer:
                               if np.any(np.abs(_rpy) > 1e-6) else np.eye(3))
                         # Sphere radius = half the middle dimension, capped at 10mm.
                         # Large radii force the hand too far from the object.
-                        radius = min(dims[1] / 2.0, 0.005)
+                        radius = min(dims[1] / 2.0, 0.003)  # 3mm — best collision/surface balance
                         # Place spheres along the longest axis of the box
                         longest_idx = [float(x) for x in _b.get("size").split()]
                         longest_ax = np.argmax(np.abs(longest_idx))
@@ -1197,7 +1197,7 @@ class BatchedGraspOptimizer:
             # The object rests where fingers can reach around it.
             # In base frame at q=0: finger bases are at z≈0.09, palm inner at z≈0.05.
             # Contact should be between them, closer to finger bases.
-            palm_contact_base = torch.tensor([0.0, 0.005, 0.085], device=dev)
+            palm_contact_base = torch.tensor([0.0, 0.005, 0.095], device=dev)
 
             # Orientation: base z = outward normal (so palm inner face = -z faces object)
             z_hat = outward_normals  # [B, 3]
@@ -1472,7 +1472,7 @@ class BatchedGraspOptimizer:
         n_col_links = self._n_col_links
         col_link_ranges = self._col_link_ranges
         col_lambda = torch.full((B, n_col_links), 5000.0, device=dev)
-        col_rho = 20000.0  # very high ρ for immediate collision enforcement
+        col_rho = 20000.0
         AL_UPDATE_EVERY = 25
 
         t0 = time.time()
@@ -1610,7 +1610,7 @@ class BatchedGraspOptimizer:
             total = (100 * La_p1
                      + 800 * Ls + Lp + 500 * L_sc  # Lp weighted by per-link λ+ρ (AL)
                      + 60 * Lat + 3 * Ld + 100 * L_wrap + 500 * L_route
-                     + 150 * L_link_wrap)
+                     + 50 * L_link_wrap)  # reduced to allow fingers to extend for reach
             total.mean().backward()
             opt1.step(); sch1.step()
 

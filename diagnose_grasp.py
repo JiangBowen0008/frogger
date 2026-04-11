@@ -385,7 +385,7 @@ def run_numerical_checks(q_joints, base_pos, base_rot, link_verts, obj_mesh, X_W
         _, normals = sdf.query_with_normals(tp_proj)
         normals = normals[0].cpu().numpy()  # [nc, 3]
         # Also include palm contacts if available
-        if self.palm_contact if hasattr(self, 'palm_contact') else False:
+        if False:  # palm normals handled via tip_positions
             pass  # palm normals already included via tip_positions
         min_dot = 1.0
         has_opposing = False
