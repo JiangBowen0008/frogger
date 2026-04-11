@@ -1493,8 +1493,14 @@ class BatchedGraspOptimizer:
                   + 20.0 * ts_abs_p1.max(dim=-1).values ** 2
                   + 10.0 * ts_abs_p1.max(dim=-1).values)
             # (Approach direction handled by routing constraint L_route)
-            # Per-link collision via Augmented Lagrangian
-            pen = F.relu(self._col_margins - cs)  # [B, N_col] margin violation
+            # Per-link collision via Augmented Lagrangian with smooth hinge
+            # (cuRobo-style: quadratic region near boundary for gradient before contact)
+            _eta = 0.005  # 5mm buffer zone
+            _d = self._col_margins - cs  # positive = violation
+            pen = torch.where(
+                _d > 0, _d,  # inside: linear
+                torch.where(_d > -_eta, 0.5 / _eta * (_d + _eta) ** 2, torch.zeros_like(_d))  # buffer: quadratic
+            )  # [B, N_col]
             pen_per_link = torch.zeros(B, n_col_links, device=dev)
             for _li, (_si, _ei) in enumerate(col_link_ranges):
                 if _si < _ei:
@@ -1712,6 +1718,7 @@ class BatchedGraspOptimizer:
                 pp = torch.stack([torch.full_like(yy, 0.005), yy, zz], dim=-1).reshape(-1, 3)
             palm_grid_h = torch.cat([pp, torch.ones(pp.shape[0], 1, device=dev)], -1)
 
+        _eta = 0.005  # smooth hinge buffer (same as Phase 1)
         triu_mask = torch.triu(torch.ones(nc, nc, device=dev), diagonal=1).bool()
         eps_fd = 5e-4
         fd_offsets = torch.zeros(3, 3, device=dev)
@@ -1750,7 +1757,11 @@ class BatchedGraspOptimizer:
                           + 5.0 * ts_abs.sum(-1)
                           + 20.0 * ts_abs.max(-1).values ** 2
                           + 10.0 * ts_abs.max(-1).values)
-                pen = F.relu(self._col_margins - cs)  # [B2, N_col]
+                _d2 = self._col_margins - cs
+                pen = torch.where(
+                    _d2 > 0, _d2,
+                    torch.where(_d2 > -_eta, 0.5 / _eta * (_d2 + _eta) ** 2, torch.zeros_like(_d2))
+                )
                 pen_per_link_p2 = torch.zeros(B2, n_col_links, device=dev)
                 for _li, (_si, _ei) in enumerate(col_link_ranges):
                     if _si < _ei:
