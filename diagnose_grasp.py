@@ -340,26 +340,18 @@ def run_numerical_checks(q_joints, base_pos, base_rot, link_verts, obj_mesh, X_W
     # The palm inner cavity (z < -5mm in palm frame) is structural — it always
     # enters curved objects when the palm is in contact. Only the contact face
     # (z > -5mm) matters for penetration checking.
+    # Check FULL visual mesh — no filtering, no cavity exclusion.
+    # Every vertex that is inside the object is penetration, period.
     all_ok = True
     pen_details = []
     for link_name, verts in link_verts.items():
-        check_verts = verts
-        if "palm" in link_name:
-            # Transform verts back to palm frame to filter cavity
-            palm_T = T_base @ fk_result[link_name].get_matrix()[0].numpy() if link_name in fk_result else None
-            if palm_T is not None:
-                R_inv = palm_T[:3, :3].T
-                t_inv = -R_inv @ palm_T[:3, 3]
-                verts_palm = (R_inv @ verts.T).T + t_inv
-                face_mask = verts_palm[:, 2] > -0.005  # contact face only
-                if face_mask.sum() > 100:
-                    check_verts = verts[face_mask]
-        pts = torch.tensor(check_verts, dtype=torch.float32, device="cuda").unsqueeze(0)
+        pts = torch.tensor(verts, dtype=torch.float32, device="cuda").unsqueeze(0)
         sdf_vals = sdf.query(pts).cpu().numpy()[0]
-        deep_pen = (sdf_vals < -0.003).sum() / len(sdf_vals)
-        if deep_pen > 0.10:
+        n_inside = (sdf_vals < -0.001).sum()  # -1mm threshold (honest)
+        pct = n_inside / len(sdf_vals)
+        if pct > 0.05:  # 5% threshold per link
             all_ok = False
-            pen_details.append(f"{link_name}: {deep_pen*100:.1f}% deep")
+            pen_details.append(f"{link_name}: {pct*100:.1f}% at -1mm (worst={sdf_vals.min()*1000:.0f}mm)")
     detail = "OK" if all_ok else "; ".join(pen_details)
     results.append(("No significant penetration (<10% at -3mm)", all_ok, detail))
 

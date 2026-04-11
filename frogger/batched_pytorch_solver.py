@@ -772,38 +772,53 @@ class BatchedGraspOptimizer:
                 link_centers = []
                 link_radii = []
 
-                # Visual mesh spheres: FPS-sample the actual mesh surface for
-                # collision. This protects the geometry the user sees, not just
-                # URDF box centers that may be deep inside the link body.
-                # Apply to palm and any link with large visual mesh extent.
-                _use_mesh_spheres = ("palm" in nm or "th_mp" in nm)
-                if _use_mesh_spheres and nm in vis:
+                # Volume-filling spheres from visual mesh (cuRobo-style).
+                # Voxelize the link mesh and place overlapping spheres at voxel
+                # centers. This fills the link INTERIOR, not just the surface.
+                if nm in vis:
                     all_verts = []
+                    all_faces = []
+                    face_offset = 0
                     for mesh_file, vis_pose in vis[nm]:
                         path = os.path.join(mesh_dir, mesh_file)
                         if not os.path.exists(path):
                             continue
                         lm = trimesh.load(path, force="mesh")
-                        verts = np.asarray(lm.vertices, dtype=np.float64)
+                        v = np.asarray(lm.vertices, dtype=np.float64)
+                        f = np.asarray(lm.faces)
                         if vis_pose is not None:
                             vp = np.array(vis_pose, dtype=np.float64)
                             Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
-                            verts = (Rv @ verts.T).T + vp[:3]
-                        all_verts.append(verts)
+                            v = (Rv @ v.T).T + vp[:3]
+                        all_verts.append(v)
+                        all_faces.append(f + face_offset)
+                        face_offset += len(v)
                     if all_verts:
-                        all_verts = np.vstack(all_verts)
-                        # Outer surface (z > -5mm): 6mm radius covers protrusions
-                        outer = all_verts[all_verts[:, 2] > -0.005]
-                        if len(outer) >= 30:
-                            outer_centers = self._fps(outer, 30).astype(np.float32)
-                            link_centers.extend(list(outer_centers))
-                            link_radii.extend([0.006] * len(outer_centers))
-                        # Inner cavity (z < -5mm): 10mm radius prevents deep embedding
-                        inner = all_verts[all_verts[:, 2] <= -0.005]
-                        if len(inner) >= 10:
-                            inner_centers = self._fps(inner, 10).astype(np.float32)
-                            link_centers.extend(list(inner_centers))
-                            link_radii.extend([0.006] * len(inner_centers))
+                        av = np.vstack(all_verts)
+                        af = np.vstack(all_faces) if all_faces else None
+                        # Voxelize: create a 3D grid inside the bounding box
+                        bb_min, bb_max = av.min(0), av.max(0)
+                        is_palm = "palm" in nm
+                        pitch = 0.008 if is_palm else 0.006  # 8mm palm, 6mm fingers
+                        radius = pitch * 0.6  # overlapping spheres (4.8mm palm, 3.6mm fingers)
+                        gx = np.arange(bb_min[0], bb_max[0] + pitch, pitch)
+                        gy = np.arange(bb_min[1], bb_max[1] + pitch, pitch)
+                        gz = np.arange(bb_min[2], bb_max[2] + pitch, pitch)
+                        grid = np.array(np.meshgrid(gx, gy, gz, indexing='ij')).reshape(3, -1).T
+                        # Keep only voxels near or inside the mesh
+                        # Use simple distance-to-vertices heuristic
+                        from scipy.spatial import cKDTree
+                        tree = cKDTree(av)
+                        dists, _ = tree.query(grid, k=1)
+                        inside_mask = dists < radius * 1.5  # near the mesh surface
+                        link_centers = list(grid[inside_mask].astype(np.float32))
+                        link_radii = [radius] * len(link_centers)
+                        # Cap at reasonable count
+                        max_sph = 120 if is_palm else 50
+                        if len(link_centers) > max_sph:
+                            idx = np.random.choice(len(link_centers), max_sph, replace=False)
+                            link_centers = [link_centers[i] for i in idx]
+                            link_radii = [radius] * max_sph
 
                 # NON-PALM: use URDF box spheres as before
                 if not link_centers:
