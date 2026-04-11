@@ -764,15 +764,55 @@ class BatchedGraspOptimizer:
             _sphere_radii = []  # per-sphere radius
             _offset = 0
 
+            # Load palm visual mesh for outer-surface sphere placement
+            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}")
+            vis = _visual_meshes(self.hand, self.hand_type)
+
             for nm in _col_link_names:
-                _le = None
-                for _e in _tree_col.getroot().findall("link"):
-                    if _e.get("name") == nm:
-                        _le = _e
-                        break
                 link_centers = []
                 link_radii = []
-                if _le is not None:
+
+                # Visual mesh spheres: FPS-sample the actual mesh surface for
+                # collision. This protects the geometry the user sees, not just
+                # URDF box centers that may be deep inside the link body.
+                # Apply to palm and any link with large visual mesh extent.
+                _use_mesh_spheres = ("palm" in nm or "th_mp" in nm)
+                if _use_mesh_spheres and nm in vis:
+                    all_verts = []
+                    for mesh_file, vis_pose in vis[nm]:
+                        path = os.path.join(mesh_dir, mesh_file)
+                        if not os.path.exists(path):
+                            continue
+                        lm = trimesh.load(path, force="mesh")
+                        verts = np.asarray(lm.vertices, dtype=np.float64)
+                        if vis_pose is not None:
+                            vp = np.array(vis_pose, dtype=np.float64)
+                            Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
+                            verts = (Rv @ verts.T).T + vp[:3]
+                        all_verts.append(verts)
+                    if all_verts:
+                        all_verts = np.vstack(all_verts)
+                        # Outer surface (z > -5mm): 6mm radius covers protrusions
+                        outer = all_verts[all_verts[:, 2] > -0.005]
+                        if len(outer) >= 30:
+                            outer_centers = self._fps(outer, 30).astype(np.float32)
+                            link_centers.extend(list(outer_centers))
+                            link_radii.extend([0.006] * len(outer_centers))
+                        # Inner cavity (z < -5mm): 10mm radius prevents deep embedding
+                        inner = all_verts[all_verts[:, 2] <= -0.005]
+                        if len(inner) >= 10:
+                            inner_centers = self._fps(inner, 10).astype(np.float32)
+                            link_centers.extend(list(inner_centers))
+                            link_radii.extend([0.006] * len(inner_centers))
+
+                # NON-PALM: use URDF box spheres as before
+                if not link_centers:
+                    _le = None
+                    for _e in _tree_col.getroot().findall("link"):
+                        if _e.get("name") == nm:
+                            _le = _e
+                            break
+                if not link_centers and _le is not None:
                     for _cel in _le.findall("collision"):
                         _g = _cel.find("geometry")
                         if _g is None: continue
