@@ -753,92 +753,95 @@ class BatchedGraspOptimizer:
             col_link_ranges = []  # (start, end) per link for per-link AL
             _offset = 0
 
-            # ALL links checked for collision.
-            # Palm: use a grid of points on the flat contact face instead of
-            # boxes or full mesh. The Menagerie boxes are too large for curved
-            # surfaces. The full mesh has motor housing protrusions. A contact
-            # face grid represents the actual surface that would touch objects.
+            # Sphere-based collision (like DexGraspNet/SpringGrasp/cuRobo).
+            # Spheres conform to ANY surface curvature — unlike flat boxes,
+            # a sphere tangent to a cylinder has ALL surface points outside.
+            # Each URDF box becomes 1+ spheres along its longest axis.
+            # Collision check: sdf(sphere_center) >= sphere_radius.
             _col_link_names = list(self.collision_link_names)
-            _palm_use_grid = True
+            col_data = []       # [(link_name, centers_h)] — sphere centers as homogeneous pts
+            col_link_ranges = []
+            _sphere_radii = []  # per-sphere radius
+            _offset = 0
 
             for nm in _col_link_names:
-                # Palm: use a flat grid on the contact face.
-                # The palm contact surface faces +z in palm frame.
-                # Grid covers the central area where contact actually happens.
-                # In palm frame: x=[-0.05, 0.0], y=[-0.08, 0.02], z=0.0
-                if "palm" in nm and _palm_use_grid:
-                    # Small central grid: 30x30mm covers the contact patch
-                    # that can physically touch objects ≥ 50mm diameter.
-                    _gx = np.linspace(-0.035, -0.010, 4)
-                    _gy = np.linspace(-0.040, -0.010, 4)
-                    _gxx, _gyy = np.meshgrid(_gx, _gy, indexing='ij')
-                    _grid = np.stack([_gxx.ravel(), _gyy.ravel(),
-                                      np.full(_gxx.size, 0.003)], axis=-1)
-                    _ap = _grid.astype(np.float32)
-                else:
-                    # Non-palm links: use URDF box surface sampling
-                    _le = None
-                    for _e in _tree_col.getroot().findall("link"):
-                        if _e.get("name") == nm:
-                            _le = _e
-                            break
-                    box_pts = []
-                    if _le is not None:
-                        for _cel in _le.findall("collision"):
-                            _g = _cel.find("geometry")
-                            if _g is None: continue
-                            _b = _g.find("box")
-                            if _b is None: continue
-                            _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
-                            _hx, _hy, _hz = _sx/2, _sy/2, _sz/2
-                            _o = _cel.find("origin")
-                            _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
-                            _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
-                            _R = (ScipyR.from_euler("xyz", _rpy).as_matrix()
-                                  if np.any(np.abs(_rpy) > 1e-6) else np.eye(3))
-                            _samples = []
-                            for sx in [-1, 0, 1]:
-                                for sy in [-1, 0, 1]:
-                                    for sz in [-1, 0, 1]:
-                                        if sx == 0 and sy == 0 and sz == 0:
-                                            continue
-                                        _samples.append([sx*_hx, sy*_hy, sz*_hz])
-                            lp = np.array(_samples)
-                            box_pts.append((_R @ lp.T).T + _p)
-                    if box_pts:
-                        _ap = np.vstack(box_pts).astype(np.float32)
-                    else:
-                        _ap = np.array([[0, 0, 0]], dtype=np.float32)
+                _le = None
+                for _e in _tree_col.getroot().findall("link"):
+                    if _e.get("name") == nm:
+                        _le = _e
+                        break
+                link_centers = []
+                link_radii = []
+                if _le is not None:
+                    for _cel in _le.findall("collision"):
+                        _g = _cel.find("geometry")
+                        if _g is None: continue
+                        _b = _g.find("box")
+                        if _b is None: continue
+                        dims = sorted([float(x) for x in _b.get("size").split()])
+                        _o = _cel.find("origin")
+                        _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
+                        _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
+                        _R = (ScipyR.from_euler("xyz", _rpy).as_matrix()
+                              if np.any(np.abs(_rpy) > 1e-6) else np.eye(3))
+                        # Sphere radius = half the middle dimension, capped at 10mm.
+                        # Large radii force the hand too far from the object.
+                        radius = min(dims[1] / 2.0, 0.005)
+                        # Place spheres along the longest axis of the box
+                        longest_idx = [float(x) for x in _b.get("size").split()]
+                        longest_ax = np.argmax(np.abs(longest_idx))
+                        n_sph = max(1, int(dims[2] / (2 * radius)))
+                        if n_sph == 1:
+                            link_centers.append(_R @ np.array([0, 0, 0]) + _p)
+                            link_radii.append(radius)
+                        else:
+                            half = [float(x)/2 for x in _b.get("size").split()]
+                            for k in range(n_sph):
+                                t = -1.0 + 2.0 * k / (n_sph - 1) if n_sph > 1 else 0.0
+                                local = np.zeros(3)
+                                local[longest_ax] = t * half[longest_ax]
+                                link_centers.append(_R @ local + _p)
+                                link_radii.append(radius)
 
-                pts_h = np.hstack([_ap, np.ones((len(_ap), 1), dtype=np.float32)])
+                if link_centers:
+                    centers = np.array(link_centers, dtype=np.float32)
+                else:
+                    centers = np.array([[0, 0, 0]], dtype=np.float32)
+                    link_radii = [0.005]  # dummy
+
+                pts_h = np.hstack([centers, np.ones((len(centers), 1), dtype=np.float32)])
                 col_data.append((nm, torch.tensor(pts_h, device=self.device)))
-                n_pts = _ap.shape[0]
+                n_pts = centers.shape[0]
                 col_link_ranges.append((_offset, _offset + n_pts))
+                _sphere_radii.extend(link_radii)
                 _offset += n_pts
 
             self._col_data = col_data
             self._col_link_ranges = col_link_ranges
             self._n_col_links = len(col_link_ranges)
+            self._sphere_radii = torch.tensor(_sphere_radii, dtype=torch.float32,
+                                              device=self.device)
             n_total = sum(p.shape[0] for _, p in col_data)
-            print(f"  URDF box surface collision: {len(col_data)} links, "
-                  f"{n_total} pts (26/box)")
+            print(f"  Sphere collision: {len(col_data)} links, "
+                  f"{n_total} spheres (r={self._sphere_radii.min()*1000:.0f}-{self._sphere_radii.max()*1000:.0f}mm)")
 
         else:
             # Allegro: original mesh-based collision points
             self._precompute_collision_points_mesh()
             return
 
-        # Collision margins:
-        # - _ds links: margin = -d_pen (allow contact penetration)
-        # - _px, _md links: margin = 0 (just don't penetrate)
-        # - _bs, palm, th_mp: margin = 0 (structural links near contact surface)
-        d_pen = 0.003   # fingertip contact penetration allowance
+        # Sphere collision margins: sdf(center) >= radius.
+        # For _ds links (fingertips), reduce radius to allow contact.
+        d_pen = 0.003  # fingertip contact penetration allowance
         margins = []
-        for nm, pts in col_data:
-            if "_ds" in nm:  # fingertip distal = contact allowed
-                margins.extend([-d_pen] * pts.shape[0])
-            else:  # all other links: sdf >= 0 (no penetration, no clearance)
-                margins.extend([0.0] * pts.shape[0])
+        for li, (nm, pts) in enumerate(col_data):
+            si, ei = col_link_ranges[li]
+            for i in range(si, ei):
+                r = self._sphere_radii[i].item()
+                if "_ds" in nm:
+                    margins.append(r - d_pen)  # allow tips closer
+                else:
+                    margins.append(r)  # full sphere radius
         self._col_margins = torch.tensor(margins, dtype=torch.float32,
                                          device=self.device)
 
@@ -1120,13 +1123,12 @@ class BatchedGraspOptimizer:
         B, dev = self.num_envs, self.device
 
         if self.hand_type == "leap":
-            # Fingers strongly curled for wrapping — PIP/DIP at ~50-60°.
-            # This starts fingers in a wrapping position so the optimizer
-            # maintains the wrap instead of fanning fingers outward.
+            # Moderate curl — enough to wrap but not so much that tips can't reach.
+            # With frozen base, the fingers must reach the surface by extending.
             dq = torch.tensor(
-                [0.0, 0.0, 0.9, 0.9,
-                 0.0, 0.0, 0.9, 0.9,
-                 0.0, 0.0, 0.9, 0.9,
+                [0.0, 0.0, 0.5, 0.5,
+                 0.0, 0.0, 0.5, 0.5,
+                 0.0, 0.0, 0.5, 0.5,
                  1.0, 0.5, 0.5, 0.3],
                 device=dev,
             )
@@ -1216,7 +1218,7 @@ class BatchedGraspOptimizer:
 
             # Place base so that palm INNER SURFACE contact point is at the surface:
             # contact_world = R_base @ palm_contact_base + base_pos = surf_pt + margin * outward
-            margin = 0.005 + 0.010 * torch.rand(B, device=dev)  # 5-15mm outside surface
+            margin = 0.002 + 0.005 * torch.rand(B, device=dev)  # 2-7mm outside surface
             palm_target = surf_pts + margin.unsqueeze(-1) * outward_normals
             contact_in_world = (R_base @ palm_contact_base.unsqueeze(-1)).squeeze(-1)
             base_pos = palm_target - contact_in_world
@@ -1430,8 +1432,7 @@ class BatchedGraspOptimizer:
             loss0.mean().backward()
             opt0a.step()
 
-        # Stage B: base position only (keep joints and rotation frozen)
-        # Palm excluded from collision, so base can approach freely.
+        # Stage B: base position + collision
         opt0b = torch.optim.Adam([self.pos], lr=lr * 2.0)
         for s in range(p0b):
             opt0b.zero_grad()
@@ -1445,9 +1446,8 @@ class BatchedGraspOptimizer:
             loss0 = 500 * ((ts ** 2).sum(-1) + 5 * ts_abs.sum(-1)
                            + 20 * ts_abs.max(dim=-1).values ** 2
                            + 10 * ts_abs.max(dim=-1).values)
-            # Collision on finger links (palm excluded from _col_data)
             pen0 = F.relu(self._col_margins - cs)
-            loss0 += 2000 * pen0.max(-1).values + 500 * pen0.mean(-1)
+            loss0 += 5000 * pen0.max(-1).values + 1000 * pen0.mean(-1)
             loss0.mean().backward()
             opt0b.step()
 
@@ -1472,8 +1472,8 @@ class BatchedGraspOptimizer:
         # but link bodies penetrate.
         n_col_links = self._n_col_links
         col_link_ranges = self._col_link_ranges
-        col_lambda = torch.full((B, n_col_links), 1000.0, device=dev)
-        col_rho = 5000.0  # high ρ for fast λ adaptation
+        col_lambda = torch.full((B, n_col_links), 5000.0, device=dev)
+        col_rho = 20000.0  # very high ρ for immediate collision enforcement
         AL_UPDATE_EVERY = 25
 
         t0 = time.time()
@@ -1694,8 +1694,8 @@ class BatchedGraspOptimizer:
         best_score = torch.full((B2,), -float("inf"), device=dev)
 
         # Per-link Augmented Lagrangian for Phase 2 collision
-        col_lambda_p2 = torch.full((B2, n_col_links), 2000.0, device=dev)
-        col_rho_p2 = 5000.0
+        col_lambda_p2 = torch.full((B2, n_col_links), 10000.0, device=dev)
+        col_rho_p2 = 20000.0
 
         # Palm grid for proximity
         palm_grid_h = None
@@ -1776,12 +1776,11 @@ class BatchedGraspOptimizer:
                         td = torch.norm(tp[:, ti] - tp[:, tj], dim=-1)
                         L_sc += F.relu(0.025 - td) ** 2 + 2.0 * F.relu(0.025 - td)
                 # Palm proximity
+                # Palm proximity REMOVED — it fights collision constraint.
+                # The palm position is determined by collision (stay clear)
+                # and the base position from init. Fingertip contacts provide
+                # the grasp; palm doesn't need to touch the object.
                 L_palm = torch.zeros(B2, device=dev)
-                if palm_grid_h is not None and self.palm_link in fk:
-                    wT_p = bT @ fk[self.palm_link].get_matrix()
-                    pw = (wT_p @ palm_grid_h.T)[:, :3, :].transpose(1, 2)
-                    ps = self.sdf.query(pw)
-                    L_palm = F.relu(ps - 0.003).mean(-1)
                 # Routing in Phase 2: keep thumb on opposite side from palm
                 tip_dirs_p2 = tp - obj_c.unsqueeze(0).unsqueeze(0)
                 tip_dirs_xy_p2 = F.normalize(tip_dirs_p2[:, :, :2], dim=-1)
