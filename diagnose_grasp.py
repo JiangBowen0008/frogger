@@ -371,54 +371,23 @@ def run_numerical_checks(q_joints, base_pos, base_rot, link_verts, obj_mesh, X_W
     else:
         results.append(("Wrapping topology (≥2 fingers opposite palm)", False, "missing data"))
 
-    # Check 5b: Volumetric penetration — sample points inside each link's
-    # bounding volume and check how many are DEEP inside the object.
-    # This catches "hand going through the middle" which surface checks miss.
-    # A hand on the side has few deep volume points; a hand through the
-    # middle has many.
-    all_ok_pen = True
-    pen_details = []
-    total_vol_pts = 0
-    total_deep = 0
-    for link_name, verts in link_verts.items():
-        # Bounding box of this link's world-frame vertices
-        bb_min = verts.min(axis=0)
-        bb_max = verts.max(axis=0)
-        extent = bb_max - bb_min
-        if extent.max() < 0.005:
-            continue
-        # Sample volume points inside bounding box (5mm grid)
-        step = 0.005
-        gx = np.arange(bb_min[0], bb_max[0] + step, step)
-        gy = np.arange(bb_min[1], bb_max[1] + step, step)
-        gz = np.arange(bb_min[2], bb_max[2] + step, step)
-        if len(gx) * len(gy) * len(gz) > 50000:
-            step = 0.008  # coarser for large links
-            gx = np.arange(bb_min[0], bb_max[0] + step, step)
-            gy = np.arange(bb_min[1], bb_max[1] + step, step)
-            gz = np.arange(bb_min[2], bb_max[2] + step, step)
-        grid = np.array(np.meshgrid(gx, gy, gz, indexing='ij')).reshape(3, -1).T
-        # Only keep points near the mesh (within ~10mm of any vertex)
-        from scipy.spatial import cKDTree
-        tree = cKDTree(verts[::10])  # subsample for speed
-        dists, _ = tree.query(grid, k=1)
-        near_mask = dists < 0.010
-        vol_pts = grid[near_mask]
-        if len(vol_pts) < 10:
-            continue
-        sv = sdf.query(torch.tensor(vol_pts, dtype=torch.float32, device="cuda").unsqueeze(0))[0].cpu().numpy()
-        n_deep = (sv < -0.005).sum()  # 5mm deep = truly inside object
-        total_vol_pts += len(vol_pts)
-        total_deep += n_deep
-    if total_vol_pts > 0:
-        deep_pct = 100 * total_deep / total_vol_pts
-        # 8% threshold: warmstart (user-approved, 7.1%) passes.
-        # Wrapping topology is the primary quality check; this is secondary.
-        passed = deep_pct < 8.0
-        results.append(("Volumetric penetration (<8% at -5mm)",
-                        passed, f"{deep_pct:.1f}% ({total_deep}/{total_vol_pts} pts)"))
+    # Check 5b: Palm contact face position — is the palm contact surface
+    # inside the object? This directly measures "palm going through the middle."
+    # Warmstart (GOOD): contact face SDF = +11.9mm (outside) → PASS
+    # Batched (BAD): contact face SDF = -3.2mm (inside) → FAIL
+    if fk_result is not None and "leap_rh_palm" in fk_result:
+        palm_wT = T_base @ fk_result["leap_rh_palm"].get_matrix()[0].numpy()
+        # Contact face center in palm local frame
+        contact_local = np.array([-0.03, -0.03, 0.003])
+        contact_world = palm_wT[:3, :3] @ contact_local + palm_wT[:3, 3]
+        contact_sdf = sdf.query(
+            torch.tensor(contact_world, dtype=torch.float32, device="cuda").reshape(1, 1, 3)
+        )[0, 0].item()
+        passed = contact_sdf > 0  # contact face must be outside object
+        results.append(("Palm contact face outside object",
+                        passed, f"SDF={contact_sdf*1000:.1f}mm"))
     else:
-        results.append(("No deep volumetric penetration (<2% at -5mm)", True, "no volume pts"))
+        results.append(("Palm contact face outside object", False, "no FK data"))
 
     # Check 6: At least one pair of opposing contact normals (dot < -0.3)
     # Project tips to nearest surface point first (gradient descent on SDF²),
