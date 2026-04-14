@@ -93,12 +93,17 @@ def load_grasp(path):
     return g
 
 
-def compute_hand_world_vertices(q_joints, base_pos, base_rot):
-    """Compute world-frame vertices for all hand links.
+def compute_hand_box_points(q_joints, base_pos, base_rot, pitch=0.005):
+    """Compute world-frame URDF box-grid points for all hand links.
 
-    Returns dict: chain_name -> np.array (N, 3) of world vertices.
+    Uses uniform grids inside URDF collision boxes — NOT mesh vertices.
+    Vertices are non-uniformly distributed and give misleading results.
+
+    Returns dict: chain_name -> np.array (N, 3) of world points,
+            dict: link_name -> np.array (N, 3) of world points.
     """
-    # Build FK chain
+    import xml.etree.ElementTree as _ET
+
     with open(URDF_PATH) as f:
         chain = pk.build_chain_from_urdf(f.read())
 
@@ -109,51 +114,63 @@ def compute_hand_world_vertices(q_joints, base_pos, base_rot):
     T_base[:3, :3] = base_rot
     T_base[:3, 3] = base_pos
 
-    vis_meshes = _visual_meshes("rh", "leap")
+    tree = _ET.parse(URDF_PATH)
 
-    chain_verts = {}
-    link_verts = {}  # per-link for penetration analysis
+    chain_pts = {}
+    link_pts = {}
 
     for chain_name, link_list in FINGER_CHAINS.items():
-        all_verts = []
+        all_pts = []
         for link_name in link_list:
-            if link_name not in vis_meshes or link_name not in fk:
+            if link_name not in fk:
                 continue
-            for mesh_file, vis_pose in vis_meshes[link_name]:
-                full_path = os.path.join(MESH_DIR, mesh_file)
-                if not os.path.exists(full_path):
-                    continue
-                lm = trimesh.load(full_path, force="mesh")
-                verts = np.asarray(lm.vertices, dtype=np.float64)
+            le = None
+            for e in tree.getroot().findall("link"):
+                if e.get("name") == link_name:
+                    le = e
+                    break
+            if le is None:
+                continue
 
-                # Apply visual origin transform
-                link_T = fk[link_name].get_matrix()[0].numpy().astype(np.float64)
-                world_T = T_base @ link_T
-                if vis_pose is not None:
-                    vp = np.array(vis_pose, dtype=np.float64)
-                    Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
-                    Tv = np.eye(4)
-                    Tv[:3, :3] = Rv
-                    Tv[:3, 3] = vp[:3]
-                    world_T = world_T @ Tv
+            is_palm = "palm" in link_name
+            boxes = []
+            for col in le.findall("collision"):
+                g = col.find("geometry")
+                if g is None: continue
+                b = g.find("box")
+                if b is None: continue
+                sz = [float(x) for x in b.get("size").split()]
+                o = col.find("origin")
+                xyz = np.array([float(x) for x in o.get("xyz", "0 0 0").split()])
+                rpy = np.array([float(x) for x in o.get("rpy", "0 0 0").split()])
+                R = (ScipyR.from_euler("xyz", rpy).as_matrix()
+                     if np.any(np.abs(rpy) > 1e-6) else np.eye(3))
+                # All palm boxes checked — large boxes ARE the palm plate
+                hx, hy, hz = sz[0]/2, sz[1]/2, sz[2]/2
+                gx = np.arange(-hx, hx + pitch/2, pitch)
+                gy = np.arange(-hy, hy + pitch/2, pitch)
+                gz = np.arange(-hz, hz + pitch/2, pitch)
+                grid = np.stack(np.meshgrid(gx, gy, gz, indexing='ij'),
+                                axis=-1).reshape(-1, 3)
+                grid = ((R @ grid.T).T + xyz).astype(np.float32)
+                boxes.append(grid)
 
-                verts_w = (world_T[:3, :3] @ verts.T).T + world_T[:3, 3]
-                all_verts.append(verts_w)
+            if not boxes:
+                continue
+            pts_local = np.vstack(boxes)
+            pts_h = np.hstack([pts_local, np.ones((len(pts_local), 1), dtype=np.float32)])
 
-                # Store per-link for penetration
-                key = link_name
-                if key not in link_verts:
-                    link_verts[key] = []
-                link_verts[key].append(verts_w)
+            link_T = fk[link_name].get_matrix()[0].numpy().astype(np.float64)
+            world_T = T_base @ link_T
+            pts_w = (world_T[:3, :3] @ pts_local.T).T + world_T[:3, 3]
 
-        if all_verts:
-            chain_verts[chain_name] = np.vstack(all_verts)
+            all_pts.append(pts_w)
+            link_pts[link_name] = pts_w
 
-    # Merge per-link verts
-    for k in link_verts:
-        link_verts[k] = np.vstack(link_verts[k])
+        if all_pts:
+            chain_pts[chain_name] = np.vstack(all_pts)
 
-    return chain_verts, link_verts
+    return chain_pts, link_pts
 
 
 def compute_tip_positions(q_joints, base_pos, base_rot):
@@ -450,18 +467,82 @@ def run_numerical_checks(q_joints, base_pos, base_rot, link_verts, obj_mesh, X_W
 # ---------------------------------------------------------------------------
 # Penetration analysis
 # ---------------------------------------------------------------------------
-def penetration_analysis(link_verts, obj_mesh, X_WO):
-    """For each link, compute % of vertices inside object (SDF < 0)."""
+def penetration_analysis(q_joints, base_pos, base_rot, obj_mesh, X_WO):
+    """For each link, compute collision using uniform grid inside URDF boxes.
+
+    NOT vertex-based — vertices are non-uniformly distributed and give
+    misleading results. Uses 5mm uniform grid inside URDF collision boxes.
+    """
+    import xml.etree.ElementTree as ET
+    from scipy.spatial.transform import Rotation as ScipyR2
+
     sdf = BatchedSDF(obj_mesh, X_WO, resolution=128, device="cuda")
+
+    # FK
+    with open(URDF_PATH) as f:
+        chain = pk.build_chain_from_urdf(f.read())
+    q = torch.tensor(q_joints, dtype=torch.float32).unsqueeze(0)
+    fk = chain.forward_kinematics(q)
+    T_base = np.eye(4)
+    T_base[:3, :3] = base_rot
+    T_base[:3, 3] = base_pos
+    bT = torch.tensor(T_base, dtype=torch.float32, device="cuda").unsqueeze(0)
+
+    # Parse URDF boxes and build grid per link
+    tree = ET.parse(URDF_PATH)
+    pitch = 0.005  # 5mm grid for diagnostic (finer than optimizer's 8mm)
+
     results = []
-    for link_name, verts in link_verts.items():
-        pts = torch.tensor(verts, dtype=torch.float32, device="cuda").unsqueeze(0)
-        sdf_vals = sdf.query(pts).cpu().numpy()[0]
-        inside = (sdf_vals < 0).sum()
-        pct = inside / len(sdf_vals) * 100
-        flag = "FLAG" if pct > 20 else "OK"
+    for le in tree.getroot().findall("link"):
+        ln = le.get("name")
+        if ln not in fk:
+            continue
+        boxes = le.findall("collision")
+        if not boxes:
+            continue
+
+        all_pts = []
+        for col in boxes:
+            g = col.find("geometry")
+            if g is None: continue
+            b = g.find("box")
+            if b is None: continue
+            sz = [float(x) for x in b.get("size").split()]
+            o = col.find("origin")
+            xyz = np.array([float(x) for x in o.get("xyz", "0 0 0").split()])
+            rpy = np.array([float(x) for x in o.get("rpy", "0 0 0").split()])
+            R = (ScipyR2.from_euler("xyz", rpy).as_matrix()
+                 if np.any(np.abs(rpy) > 1e-6) else np.eye(3))
+            # All palm boxes checked — large boxes ARE the palm plate
+            hx, hy, hz = sz[0]/2, sz[1]/2, sz[2]/2
+            gx = np.arange(-hx, hx + pitch/2, pitch)
+            gy = np.arange(-hy, hy + pitch/2, pitch)
+            gz = np.arange(-hz, hz + pitch/2, pitch)
+            grid = np.stack(np.meshgrid(gx, gy, gz, indexing='ij'),
+                            axis=-1).reshape(-1, 3)
+            grid = ((R @ grid.T).T + xyz).astype(np.float32)
+            all_pts.append(grid)
+
+        if not all_pts:
+            continue
+        pts = np.vstack(all_pts)
+        pts_h = torch.tensor(
+            np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)]),
+            device="cuda")
+
+        # Transform to world frame
+        link_T = fk[ln].get_matrix().to("cuda")
+        world_T = bT @ link_T
+        pts_w = (world_T[0] @ pts_h.T).T[:, :3]
+
+        # Query object SDF
+        sdf_vals = sdf.query(pts_w.unsqueeze(0)).squeeze(0).cpu().numpy()
+        n_inside = (sdf_vals < 0).sum()
+        pct = n_inside / len(sdf_vals) * 100
         min_sdf = sdf_vals.min()
-        results.append((link_name, pct, min_sdf, flag))
+        flag = "FLAG" if min_sdf < -0.005 else "OK"
+        results.append((ln, pct, min_sdf, flag, len(sdf_vals)))
+
     return results
 
 
@@ -494,11 +575,11 @@ def diagnose(grasp_path, output_dir=None, tag=""):
     print(f"  Offset: {offset}")
     print(f"  Object verts in world: z=[{obj_verts_W[:,2].min():.4f}, {obj_verts_W[:,2].max():.4f}]")
 
-    # Compute hand vertices
-    print("\n[2] Computing hand FK...")
-    chain_verts, link_verts = compute_hand_world_vertices(q_joints, base_pos, base_rot)
+    # Compute hand box-grid points (NOT vertices — vertices are non-uniform)
+    print("\n[2] Computing hand FK (URDF box grid, 5mm)...")
+    chain_verts, link_verts = compute_hand_box_points(q_joints, base_pos, base_rot, pitch=0.005)
     for name, verts in chain_verts.items():
-        print(f"  {name}: {len(verts)} vertices, "
+        print(f"  {name}: {len(verts)} box-grid pts, "
               f"center={verts.mean(axis=0)}, "
               f"z=[{verts[:,2].min():.4f}, {verts[:,2].max():.4f}]")
 
@@ -529,11 +610,12 @@ def diagnose(grasp_path, output_dir=None, tag=""):
             all_pass = False
         print(f"  [{status}] {name}: {detail}")
 
-    # Penetration analysis
-    print(f"\n[5] Penetration analysis:")
-    pen_results = penetration_analysis(link_verts, obj_mesh, X_WO)
-    for link_name, pct, min_sdf, flag in pen_results:
-        print(f"  [{flag}] {link_name}: {pct:.1f}% inside, min_SDF={min_sdf*1000:.1f}mm")
+    # Penetration analysis (box-grid, NOT vertex-based)
+    print(f"\n[5] Penetration analysis (URDF box grid, 5mm):")
+    pen_results = penetration_analysis(q_joints, base_pos, base_rot, obj_mesh, X_WO)
+    for link_name, pct, min_sdf, flag, n_pts in pen_results:
+        short = link_name.replace("leap_rh_", "")
+        print(f"  [{flag}] {short}: {pct:.1f}% inside ({n_pts} pts), min_SDF={min_sdf*1000:.1f}mm")
 
     print(f"\n{'=' * 70}")
     if all_pass:

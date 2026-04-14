@@ -11,26 +11,19 @@ from scipy.spatial.transform import Rotation
 
 from frogger.batched_pytorch_solver import _visual_meshes, _link_names
 
+MESHES_DIR = "/home/bowenj/Projects/DexFun/output/meshes/mesh_raw_ahg"
 ASSETS = "/home/bowenj/Projects/DexFun/assets"
-MESH_PATH = f"{ASSETS}/mesh_obj/black_spray_bottle_single/object.obj"
 
+# Default mesh for old versions
+DEFAULT_MESH = f"{ASSETS}/mesh_obj/black_spray_bottle_single/object.obj"
+
+# (grasp_path, mesh_path_or_None_for_default)
 VERSIONS = {
-    "01_warmstart_good": "output/grasps/compare_warmstart_good.pt",
-    "02_warmstart_best": "output/grasps/compare_warmstart_best.pt",
-    "03_warmstart_single": "output/grasps/compare_warmstart_single.pt",
-    "04_contact_zones": "output/grasps/compare_contact_zones.pt",
-    "05_multipoint_palm": "output/grasps/compare_multipoint_palm.pt",
-    "06_iterative_batch": "output/grasps/compare_iterative_batch.pt",
-    "07_3obj_first": "output/grasps/compare_3obj_first.pt",
-    "08_box_sc_routing": "output/grasps/compare_box_sc_routing.pt",
-    "09_thumb_5mm": "output/grasps/compare_thumb_5mm.pt",
-    "10_3obj_tested": "output/grasps/compare_3obj_tested.pt",
-    "11_batched_curated": "output/grasps/compare_batched_curated.pt",
-    "12_augmented_lagrangian": "output/grasps/compare_augmented_lagrangian.pt",
-    "13_volumetric_box": "output/grasps/compare_volumetric_box.pt",
-    "14_visual_mesh": "output/grasps/compare_visual_mesh.pt",
-    "15_urdf_box": "output/grasps/compare_urdf_box.pt",
-    "16_current_spheres": "output/grasps/compare_current.pt",
+    "glue_00_init": ("output/grasps/stage_after_init.pt", f"{MESHES_DIR}/hot_glue_gun/object.obj"),
+    "glue_01_after_P0": ("output/grasps/stage_after_P0.pt", f"{MESHES_DIR}/hot_glue_gun/object.obj"),
+    "glue_02_after_P1": ("output/grasps/stage_after_P1.pt", f"{MESHES_DIR}/hot_glue_gun/object.obj"),
+    "glue_03_final": ("output/grasps/stage_final.pt", f"{MESHES_DIR}/hot_glue_gun/object.obj"),
+    "spray_warmstart": ("output/grasps/compare_warmstart_single.pt", None),
 }
 
 
@@ -42,13 +35,16 @@ def main():
     server = viser.ViserServer(host="0.0.0.0", port=args.port)
     print(f"Comparison visualizer -> http://localhost:{args.port}")
 
-    # Load object
-    mesh = trimesh.load(MESH_PATH, force="mesh")
-    bounds = mesh.bounds
-    offset = np.array([0.0, 0.0, -bounds[0, 2]])
-    X_WO = np.eye(4); X_WO[:3, 3] = offset
-    obj_verts = (X_WO[:3, :3] @ np.asarray(mesh.vertices, dtype=np.float64).T).T + X_WO[:3, 3]
-    obj_faces = np.asarray(mesh.faces, dtype=np.int32)
+    # Pre-load all unique meshes
+    mesh_cache = {}  # mesh_path -> (obj_verts, obj_faces)
+    for name, (grasp_path, mesh_path) in VERSIONS.items():
+        mp = mesh_path or DEFAULT_MESH
+        if mp not in mesh_cache and os.path.exists(mp):
+            m = trimesh.load(mp, force="mesh")
+            off = np.array([0.0, 0.0, -m.bounds[0, 2]])
+            xwo = np.eye(4); xwo[:3, 3] = off
+            verts = (xwo[:3, :3] @ np.asarray(m.vertices, dtype=np.float64).T).T + xwo[:3, 3]
+            mesh_cache[mp] = (verts.astype(np.float32), np.asarray(m.faces, dtype=np.int32))
 
     # FK chain
     hand, hand_type = "rh", "leap"
@@ -73,11 +69,14 @@ def main():
 
     # Load all versions
     versions = {}
-    for name, path in VERSIONS.items():
-        if os.path.exists(path):
-            results = torch.load(path, weights_only=False)
+    version_meshes = {}  # name -> mesh_path
+    for name, (grasp_path, mesh_path) in VERSIONS.items():
+        mp = mesh_path or DEFAULT_MESH
+        if os.path.exists(grasp_path) and mp in mesh_cache:
+            results = torch.load(grasp_path, weights_only=False)
             versions[name] = results
-            print(f"  {name}: {len(results)} grasps")
+            version_meshes[name] = mp
+            print(f"  {name}: {len(results)} grasps ({os.path.basename(os.path.dirname(mp))})")
 
     version_names = list(versions.keys())
     current_version = [version_names[0]]
@@ -89,9 +88,11 @@ def main():
             grasp_idx = 0
         g = data[grasp_idx]
 
-        # Object
+        # Object (per-version mesh)
+        mp = version_meshes[ver_name]
+        ov, of = mesh_cache[mp]
         server.scene.add_mesh_simple(
-            "/object", vertices=obj_verts.astype(np.float32), faces=obj_faces,
+            "/object", vertices=ov, faces=of,
             color=(180, 180, 180), opacity=0.7,
         )
 
