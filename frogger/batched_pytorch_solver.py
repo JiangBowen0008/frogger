@@ -99,64 +99,6 @@ class BatchedSDF:
         )
         self.obj_center = (self.obj_bbox_min + self.obj_bbox_max) / 2
 
-    def add_clearance_volume(self, center, direction, radius=0.015, height=0.05):
-        """Add a cylindrical no-go zone to the SDF.
-
-        Any SDF grid point inside the cylinder gets set to a negative value
-        (as if inside a solid object). This makes all collision checks
-        automatically avoid this region.
-
-        Args:
-            center: [3] world-frame position (start of cylinder)
-            direction: [3] world-frame direction (cylinder axis, normalized)
-            radius: cylinder radius in meters (default 1.5cm)
-            height: cylinder height in meters (default 5cm)
-        """
-        center = np.asarray(center, dtype=np.float64)
-        direction = np.asarray(direction, dtype=np.float64)
-        direction = direction / np.linalg.norm(direction)
-
-        res = self.sdf_tensor.shape[2]
-        lin = [np.linspace(self.bbox_min[i], self.bbox_max[i], res) for i in range(3)]
-        gx, gy, gz = np.meshgrid(*lin, indexing="ij")
-        pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
-
-        # Project onto cylinder axis
-        delta = pts - center
-        proj_along = delta @ direction  # signed distance along axis
-        proj_perp = delta - np.outer(proj_along, direction).reshape(-1, 3)
-        perp_dist = np.linalg.norm(proj_perp, axis=-1)
-
-        # Inside cylinder: 0 <= proj_along <= height AND perp_dist <= radius
-        inside = (proj_along >= 0) & (proj_along <= height) & (perp_dist <= radius)
-
-        if inside.any():
-            sdf_np = self.sdf_tensor[0, 0].cpu().numpy().ravel()
-            # Set SDF to negative where inside cylinder (min with existing)
-            sdf_np[inside] = np.minimum(sdf_np[inside], -0.01)
-            self.sdf_tensor = (
-                torch.tensor(sdf_np.reshape(res, res, res),
-                             dtype=torch.float32, device=self.sdf_tensor.device)
-                .unsqueeze(0).unsqueeze(0)
-            )
-            n_modified = inside.sum()
-            print(f"  Actuation clearance: {n_modified} grid points set to SDF<0 "
-                  f"(r={radius*1000:.0f}mm h={height*1000:.0f}mm)")
-
-    def add_floor(self, z_min):
-        """Set SDF to negative below z_min (object bottom = table surface)."""
-        res = self.sdf_tensor.shape[2]
-        lin_z = np.linspace(self.bbox_min[2], self.bbox_max[2], res)
-        sdf_np = self.sdf_tensor[0, 0].cpu().numpy()
-        for zi, z in enumerate(lin_z):
-            if z < z_min:
-                sdf_np[:, :, zi] = np.minimum(sdf_np[:, :, zi], -0.01)
-        self.sdf_tensor = (
-            torch.tensor(sdf_np, dtype=torch.float32, device=self.sdf_tensor.device)
-            .unsqueeze(0).unsqueeze(0)
-        )
-        print(f"  Floor added at z={z_min*1000:.0f}mm")
-
     def query(self, points: torch.Tensor) -> torch.Tensor:
         """Differentiable SDF look-up.  points [B,N,3] -> [B,N]."""
         B, N, _ = points.shape
@@ -833,10 +775,6 @@ class BatchedGraspOptimizer:
     # -- parameterisation -------------------------------------------------
     def _u2q(self, u):
         return self.q_lo + torch.sigmoid(u) * self.q_range
-
-    def _directq(self, q):
-        """Direct-q parameterization: q IS the variable, clamped to limits."""
-        return q.clamp(self.q_lo, self.q_hi)
 
     def _q2u(self, q):
         n = ((q - self.q_lo) / self.q_range).clamp(0.01, 0.99)
@@ -1984,43 +1922,27 @@ class BatchedGraspOptimizer:
                         act_cmc = self._u2q(self.u[b:b+1])[0, act_fi * 4].item()
                         sup_fingers = [fi for fi in range(4) if fi != act_fi]
                         # Place support fingers far from actuation CMC.
-                        # Compute available CMC range excluding 1 rad around actuation.
-                        # Then distribute 3 support fingers evenly in the safe zone.
-                        excl_lo = act_cmc - 0.8
-                        excl_hi = act_cmc + 0.8
-                        # Build list of safe CMC values
-                        safe_vals = []
-                        for test_cmc in np.arange(cmc_min, cmc_max + 0.1, 0.1):
-                            if test_cmc < excl_lo or test_cmc > excl_hi:
-                                safe_vals.append(float(test_cmc))
-                        if len(safe_vals) < 3:
-                            # Fallback: just space evenly across full range
-                            safe_vals = [cmc_min, (cmc_min+cmc_max)/2, cmc_max]
-                        # Pick 3 evenly-spaced values from safe zone
-                        step = max(1, len(safe_vals) // 3)
-                        sup_cmcs = [safe_vals[min(i * step, len(safe_vals)-1)] for i in range(3)]
+                        # Use 3 evenly-spaced CMC values that avoid act_cmc.
+                        # Offset by ~0.8 rad from actuation, then space 0.8 apart.
+                        base_offset = 1.0  # minimum 1 radian from actuation
+                        sup_cmcs = []
+                        for si in range(3):
+                            target_cmc = act_cmc + base_offset + si * 0.7
+                            # Wrap to valid range
+                            if target_cmc > cmc_max:
+                                target_cmc = cmc_min + (target_cmc - cmc_max)
+                            target_cmc = max(cmc_min, min(cmc_max, target_cmc))
+                            sup_cmcs.append(target_cmc)
                         for si, fi in enumerate(sup_fingers):
                             j0 = fi * 4
                             cmc_val = sup_cmcs[si] + 0.1 * (torch.rand(1, device=dev).item() - 0.5)
                             cmc_val = max(cmc_min, min(cmc_max, cmc_val))
-                            if opt_variant == "CA":
-                                # Contact-aware init: start nearly straight
-                                # Fingers start extended so IK can curl them
-                                # onto the surface from outside, avoiding
-                                # deep penetration from curled starts.
-                                ranges = [
-                                    (cmc_val, cmc_val),     # CMC: specific spread
-                                    (-0.2, 0.3),            # MCP: nearly straight
-                                    (0.0, 0.3),             # PIP: nearly straight
-                                    (0.0, 0.2),             # DIP: nearly straight
-                                ]
-                            else:
-                                ranges = [
-                                    (cmc_val, cmc_val),                # CMC: specific value
-                                    (-0.3, 0.6),                       # MCP: slight flex
-                                    (0.2, 1.3),                        # PIP: moderate curl
-                                    (0.1, 1.0),                        # DIP: moderate curl
-                                ]
+                            ranges = [
+                                (cmc_val, cmc_val),                # CMC: specific value
+                                (-0.3, 0.6),                       # MCP: slight flex
+                                (0.2, 1.3),                        # PIP: moderate curl
+                                (0.1, 1.0),                        # DIP: moderate curl
+                            ]
                             for ji, (lo, hi) in enumerate(ranges):
                                 if lo == hi:
                                     q_val = torch.tensor(lo, device=dev)
@@ -2146,36 +2068,10 @@ class BatchedGraspOptimizer:
                         tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                         tp_sdf = self.sdf.query(tp.unsqueeze(1)).squeeze(1)
 
-                        # Surface seeking: ALWAYS active
+                        # Surface seeking: ALWAYS active (never replaced by repulsion)
                         sdf_loss = tp_sdf ** 2
                         below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
                         loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
-
-                        # CA variant: extra anti-penetration loss during IK
-                        # Penalize SDF < -2mm heavily to prevent fingers from
-                        # reaching surface from inside the object
-                        if opt_variant == "CA":
-                            pen_loss = F.relu(-tp_sdf - 0.002) ** 2
-                            loss_sup += sup_finger_mask[:, fi].float() * 2000 * pen_loss
-                            # Also penalize high curl (PIP+DIP) to keep fingers extended
-                            q_cur = self._u2q(u_sup)
-                            pip_val = q_cur[:, fi * 4 + 2]  # PIP joint
-                            dip_val = q_cur[:, fi * 4 + 3]  # DIP joint
-                            # Penalize curl > 0.5 rad
-                            curl_pen = F.relu(pip_val - 0.5) ** 2 + F.relu(dip_val - 0.5) ** 2
-                            # Fade curl penalty: strong early, gone by step 200
-                            curl_w = 50 * max(0, 1 - ik_step / 200)
-                            loss_sup += sup_finger_mask[:, fi].float() * curl_w * curl_pen
-
-                        # Pad alignment: pad direction (-X of tip link) should face the surface
-                        # (align with inward normal at contact point)
-                        pad_dir = -wT[:, :3, 0]  # [B, 3] — pad push direction
-                        _, inward_n = self.sdf.query_with_normals(tp.unsqueeze(1))
-                        inward_n = inward_n[:, 0]  # [B, 3]
-                        # Want dot(pad_dir, inward_normal) > 0 (pad faces toward surface)
-                        align = (pad_dir * inward_n).sum(-1)  # [B]
-                        # Penalize when pad faces away (align < 0.3)
-                        loss_sup += sup_finger_mask[:, fi].float() * 100 * F.relu(0.3 - align) ** 2
 
                         # Actuation repulsion: ADDED on top of surface loss (not replacing)
                         dist_to_act_tip = torch.norm(tp - act_tip_pos, dim=-1)
@@ -2183,17 +2079,6 @@ class BatchedGraspOptimizer:
                         dist_to_act = torch.minimum(dist_to_act_tip, dist_to_act_target)
                         too_close = (dist_to_act < 0.040) & sup_finger_mask[:, fi]
                         loss_sup += too_close.float() * 500 * F.relu(0.040 - dist_to_act) ** 2
-
-                        # CMC separation: keep support CMC away from actuation CMC
-                        # This prevents IK from moving fingers back toward actuation
-                        q_current = self._u2q(u_sup)
-                        for act_fi_ik in range(4):
-                            amask_ik = (self.amap_t[:, 0] == act_fi_ik) & sup_finger_mask[:, fi]
-                            if not amask_ik.any(): continue
-                            act_cmc_ik = q_current[:, act_fi_ik * 4]
-                            sup_cmc_ik = q_current[:, fi * 4]
-                            cmc_diff_ik = (sup_cmc_ik - act_cmc_ik).abs()
-                            loss_sup += amask_ik.float() * 300 * F.relu(0.8 - cmc_diff_ik) ** 2
 
                         # Guide support fingers toward spread target positions
                         # Strong for first half of IK (guidance), fade for second half (surface takes over)
@@ -2418,7 +2303,7 @@ class BatchedGraspOptimizer:
                 sfx_all = [['bs', 'px', 'md', 'ds']] * 3 + [['mp', 'bs', 'px', 'ds']]
 
                 u_opt = self.u.detach().clone().requires_grad_(True)
-                opt_adam = torch.optim.Adam([u_opt], lr=0.008)
+                opt_adam = torch.optim.Adam([u_opt], lr=0.005)
 
                 # Pre-compute support finger collision link names
                 prefixes_opt = ['if', 'mf', 'rf', 'th']
@@ -2441,7 +2326,7 @@ class BatchedGraspOptimizer:
                 # "B"   = min-k unified surface/collision
                 # "C"   = min-k with adaptive FC contacts
                 # ============================================================
-                opt_steps = min(steps, 500)
+                opt_steps = min(steps, 300)
                 eps_fd = 5e-4
                 fd_ofst = torch.zeros(3, 3, device=dev)
                 for d3 in range(3): fd_ofst[d3, d3] = eps_fd
@@ -2457,47 +2342,24 @@ class BatchedGraspOptimizer:
                         if cnm == cnm_ds:
                             sup_col_idx_ds[fi].append((ci, cnm))
 
-                # Flags for new variants (default off for PGD)
-                use_direct_q = (opt_variant == "DA")
-                use_side_aware_ds = (opt_variant == "SA")
-
-                if opt_variant in ("A", "B", "C", "DA", "SA", "CA"):
-                    # ── Simple Adam loop (all variants A/B/C/DA/SA) ──
-                    # DA = Direct-q parameterization (no sigmoid)
-                    # SA = Side-aware ds collision (pad-hemisphere only)
-                    base_variant = "A"  # DA/SA both use variant A's loss structure
-
-                    if use_direct_q:
-                        # Convert u_opt from sigmoid-space to q-space
-                        with torch.no_grad():
-                            q_init = self._u2q(u_opt)
-                        u_opt = q_init.detach().clone().requires_grad_(True)
-
-                    opt_adam = torch.optim.Adam([u_opt], lr=0.008)
+                if opt_variant in ("A", "B", "C"):
+                    # ── Simple Adam loop (all variants A/B/C) ──
+                    opt_adam = torch.optim.Adam([u_opt], lr=0.005)
                     fc_start_step = 100
                     fc_weight = 1.0
                     mink_k = 10  # number of lowest SDF points for variants B/C
-                    print(f"  Variant {opt_variant} Adam optimization ({opt_steps} steps)"
-                          f"{' [direct-q]' if use_direct_q else ''}"
-                          f"{' [side-aware ds]' if use_side_aware_ds else ''}")
-
-                    # For direct-q: also need reference in q-space for freeze reg
-                    if use_direct_q:
-                        u_ref_q = u_opt.detach().clone()  # q-space reference
+                    print(f"  Variant {opt_variant} Adam optimization ({opt_steps} steps)")
 
                     for opt_step in range(opt_steps):
                         opt_adam.zero_grad()
-                        if use_direct_q:
-                            q_o = self._directq(u_opt)
-                        else:
-                            q_o = self._u2q(u_opt)
+                        q_o = self._u2q(u_opt)
                         bT_o = self._base_T(self.pos.detach(), self.rot6d.detach())
                         fk_o = self.chain.forward_kinematics(q_o)
 
                         total_loss = torch.zeros(B, device=dev)
 
                         # ── Section A: Surface loss ──
-                        if opt_variant in ("A", "DA", "SA", "CA"):
+                        if opt_variant == "A":
                             # Original: SDF(tip_offset)^2 for each support finger
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
@@ -2532,7 +2394,7 @@ class BatchedGraspOptimizer:
                                     total_loss += sup_finger_mask_opt[:, fi].float() * 200 * (topk_sdf ** 2).sum(dim=1)
 
                         # ── Section B: Collision loss ──
-                        if opt_variant in ("A", "DA", "SA", "CA"):
+                        if opt_variant == "A":
                             # B1: relu(-SDF) for non-ds links
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
@@ -2545,6 +2407,8 @@ class BatchedGraspOptimizer:
                                         total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
 
                             # B2: Fingertip ds collision (worst penetration², allow 1mm contact)
+                            # Match surface loss scaling: surface = 1000 * sdf²,
+                            # so B2 = 1000 * max_pen² — same order of magnitude.
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 for ci, cnm in sup_col_idx_ds[fi]:
@@ -2553,35 +2417,8 @@ class BatchedGraspOptimizer:
                                         lwT = bT_o @ fk_o[cnm].get_matrix()
                                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
-
-                                        if use_side_aware_ds:
-                                            # Side-aware: only check pad-facing hemisphere
-                                            # Pad direction = -X of tip link frame
-                                            pad_dir = -lwT[:, :3, 0]  # [B, 3]
-                                            # Link center (origin of ds frame)
-                                            link_center = lwT[:, :3, 3]  # [B, 3]
-                                            # Direction from link center to each point
-                                            pt_dir = lwp - link_center.unsqueeze(1)  # [B, N, 3]
-                                            pt_dir_n = F.normalize(pt_dir, dim=-1)
-                                            # Dot with pad direction
-                                            dot_val = (pt_dir_n * pad_dir.unsqueeze(1)).sum(-1)  # [B, N]
-                                            # Only include points where dot > -0.3
-                                            # (forward/sideways, not back of fingertip)
-                                            pad_mask = (dot_val > -0.3)  # [B, N]
-                                            # Mask out back-facing points (set SDF to large positive)
-                                            lsdf_masked = torch.where(pad_mask, lsdf, torch.ones_like(lsdf))
-                                            worst_pen = F.relu(-lsdf_masked - 0.001).max(-1).values
-                                        else:
-                                            worst_pen = F.relu(-lsdf - 0.001).max(-1).values
-
-                                        if use_direct_q:
-                                            # Direct-q: no sigmoid attenuation, uniform weight
-                                            b2_w = 1000.0
-                                        else:
-                                            # Higher weight for severe penetration to overcome sigmoid attenuation
-                                            # Joints near limits have ~14x gradient compression
-                                            b2_w = torch.where(worst_pen > 0.005, 5000.0, 1000.0)
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * b2_w * worst_pen ** 2
+                                        worst_pen = F.relu(-lsdf - 0.001).max(-1).values
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * worst_pen ** 2
 
                         elif opt_variant in ("B", "C"):
                             # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
@@ -2693,28 +2530,17 @@ class BatchedGraspOptimizer:
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(0.035 - dist_to_act) ** 2
 
                         # Freeze non-support joints
-                        if use_direct_q:
-                            total_loss += 100 * ((u_opt - u_ref_q) ** 2 * (~opt_joint_mask).float()).sum(-1)
-                        else:
-                            total_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
+                        total_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
 
                         total_loss.mean().backward()
                         with torch.no_grad():
                             u_opt.grad[~opt_joint_mask] = 0.0
                         opt_adam.step()
 
-                        # Direct-q: clamp to joint limits after each step
-                        if use_direct_q:
-                            with torch.no_grad():
-                                u_opt.data.clamp_(self.q_lo, self.q_hi)
-
                         # ── Logging + trajectory ──
                         if opt_step % 50 == 0:
                             with torch.no_grad():
-                                if use_direct_q:
-                                    q_e = self._directq(u_opt)
-                                else:
-                                    q_e = self._u2q(u_opt)
+                                q_e = self._u2q(u_opt)
                                 bT_e = self._base_T(self.pos, self.rot6d)
                                 fk_e = self.chain.forward_kinematics(q_e)
                                 sup_sdf = []
@@ -2890,12 +2716,7 @@ class BatchedGraspOptimizer:
                                     })
 
                 with torch.no_grad():
-                    if use_direct_q:
-                        # Convert back from q-space to sigmoid-space for downstream code
-                        q_final_opt = self._directq(u_opt)
-                        self.u = self._q2u(q_final_opt).detach().requires_grad_(True)
-                    else:
-                        self.u = u_opt.detach().requires_grad_(True)
+                    self.u = u_opt.detach().requires_grad_(True)
 
                 # Rank by combined quality: low surface SDF + low collision + high σ_min
                 with torch.no_grad():
@@ -3027,34 +2848,10 @@ class BatchedGraspOptimizer:
                         fi = self.amap_t[:, j]
                         act_dist = torch.norm(tp_final[torch.arange(B, device=dev), fi] - ap[j], dim=-1)
 
-                # ds link deep penetration: worst SDF across ds collision points
-                ds_worst = torch.zeros(B, device=dev)
-                for li, (nm, _) in enumerate(self._col_data):
-                    if "_ds" not in nm: continue
-                    si, ei = self._col_link_ranges[li]
-                    if use_side_aware_ds and nm in fk_final:
-                        # Side-aware: only check pad-facing points
-                        lp = self._col_data[li][1]
-                        lwT_ds = bT_final @ fk_final[nm].get_matrix()
-                        lwp_ds = (lwT_ds @ lp.T)[:, :3, :].transpose(1, 2)  # [B, N, 3]
-                        pad_dir_ds = -lwT_ds[:, :3, 0]  # [B, 3]
-                        link_center_ds = lwT_ds[:, :3, 3]  # [B, 3]
-                        pt_dir_ds = lwp_ds - link_center_ds.unsqueeze(1)  # [B, N, 3]
-                        pt_dir_n_ds = F.normalize(pt_dir_ds, dim=-1)
-                        dot_val_ds = (pt_dir_n_ds * pad_dir_ds.unsqueeze(1)).sum(-1)  # [B, N]
-                        ds_sdf_all = cs_final[:, si:ei]
-                        # Mask out back points (set to large positive)
-                        ds_sdf_masked = torch.where(dot_val_ds > -0.3, ds_sdf_all, torch.ones_like(ds_sdf_all))
-                        ds_sdf = ds_sdf_masked.min(-1).values
-                    else:
-                        ds_sdf = cs_final[:, si:ei].min(-1).values  # worst point per link
-                    ds_worst = torch.minimum(ds_worst, ds_sdf)
-
                 # Feasibility: only candidates that passed opt_mask + quality checks
                 feasible = (opt_mask
-                            & (surf_err < 0.008)  # 8mm surface
-                            & (max_col_viol < 0.003)  # 3mm non-ds collision margin
-                            & (ds_worst > -0.012)  # 12mm max ds penetration (fingertip wraps around curved surfaces)
+                            & (surf_err < 0.008)  # 8mm surface (ds collision push-out makes 5mm too strict)
+                            & (max_col_viol < 0.003)  # 3mm collision margin
                             & (sc_min_d > 0.001)  # 1mm self-collision
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
@@ -3222,7 +3019,7 @@ class BatchedGraspOptimizer:
                             if _md < worst_sc: worst_sc = _md
                             if _md < 0.003: sc_bad.append(f"{_ni}-{_nj}")
                     r["sc_worst"] = float(worst_sc)
-                    if worst_sc < 0.002:  # 2mm — catch link overlap
+                    if worst_sc < 0.0005:
                         r["feasible"] = False
 
                     f_tag = "FEAS" if r["feasible"] else "FAIL"

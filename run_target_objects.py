@@ -61,11 +61,6 @@ def run_object(name):
 
     try:
         sdf = BatchedSDF(mesh, X_WO, bounds_padding=0.15, resolution=128, device="cuda")
-        # Add actuation clearance cylinder (3cm dia × 5cm tall along actuation direction)
-        sdf.add_clearance_volume(actuation_targets[0][0], actuation_targets[0][1],
-                                 radius=0.015, height=0.05)
-        # Add floor at object bottom (z=0 after offset)
-        sdf.add_floor(0.0)
         opt = BatchedGraspOptimizer(
             sdf, num_envs=NUM_ENVS, device="cuda",
             hand="rh", hand_type="leap", palm_contact=True,
@@ -77,7 +72,7 @@ def run_object(name):
             steps=300, lr=0.005,
             save_path=save_file,
             opt_sections="ABCD",
-            opt_variant="SA",
+            opt_variant="A",
         )
         elapsed = time.time() - t0
 
