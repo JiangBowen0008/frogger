@@ -2152,6 +2152,17 @@ class BatchedGraspOptimizer:
                         too_close = (dist_to_act < 0.040) & sup_finger_mask[:, fi]
                         loss_sup += too_close.float() * 500 * F.relu(0.040 - dist_to_act) ** 2
 
+                        # CMC separation: keep support CMC away from actuation CMC
+                        # This prevents IK from moving fingers back toward actuation
+                        q_current = self._u2q(u_sup)
+                        for act_fi_ik in range(4):
+                            amask_ik = (self.amap_t[:, 0] == act_fi_ik) & sup_finger_mask[:, fi]
+                            if not amask_ik.any(): continue
+                            act_cmc_ik = q_current[:, act_fi_ik * 4]
+                            sup_cmc_ik = q_current[:, fi * 4]
+                            cmc_diff_ik = (sup_cmc_ik - act_cmc_ik).abs()
+                            loss_sup += amask_ik.float() * 300 * F.relu(0.8 - cmc_diff_ik) ** 2
+
                         # Guide support fingers toward spread target positions
                         # Strong for first half of IK (guidance), fade for second half (surface takes over)
                         if fi in finger_targets:
