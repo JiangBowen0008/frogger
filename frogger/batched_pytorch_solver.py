@@ -2486,7 +2486,10 @@ class BatchedGraspOptimizer:
                                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
                                         worst_pen = F.relu(-lsdf - 0.001).max(-1).values
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * worst_pen ** 2
+                                        # Higher weight for severe penetration to overcome sigmoid attenuation
+                                        # Joints near limits have ~14x gradient compression
+                                        b2_w = torch.where(worst_pen > 0.005, 5000.0, 1000.0)
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * b2_w * worst_pen ** 2
 
                         elif opt_variant in ("B", "C"):
                             # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
