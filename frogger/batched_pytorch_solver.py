@@ -1980,17 +1980,21 @@ class BatchedGraspOptimizer:
                         act_cmc = self._u2q(self.u[b:b+1])[0, act_fi * 4].item()
                         sup_fingers = [fi for fi in range(4) if fi != act_fi]
                         # Place support fingers far from actuation CMC.
-                        # Use 3 evenly-spaced CMC values that avoid act_cmc.
-                        # Offset by ~0.8 rad from actuation, then space 0.8 apart.
-                        base_offset = 1.0  # minimum 1 radian from actuation
-                        sup_cmcs = []
-                        for si in range(3):
-                            target_cmc = act_cmc + base_offset + si * 0.7
-                            # Wrap to valid range
-                            if target_cmc > cmc_max:
-                                target_cmc = cmc_min + (target_cmc - cmc_max)
-                            target_cmc = max(cmc_min, min(cmc_max, target_cmc))
-                            sup_cmcs.append(target_cmc)
+                        # Compute available CMC range excluding 1 rad around actuation.
+                        # Then distribute 3 support fingers evenly in the safe zone.
+                        excl_lo = act_cmc - 0.8
+                        excl_hi = act_cmc + 0.8
+                        # Build list of safe CMC values
+                        safe_vals = []
+                        for test_cmc in np.arange(cmc_min, cmc_max + 0.1, 0.1):
+                            if test_cmc < excl_lo or test_cmc > excl_hi:
+                                safe_vals.append(float(test_cmc))
+                        if len(safe_vals) < 3:
+                            # Fallback: just space evenly across full range
+                            safe_vals = [cmc_min, (cmc_min+cmc_max)/2, cmc_max]
+                        # Pick 3 evenly-spaced values from safe zone
+                        step = max(1, len(safe_vals) // 3)
+                        sup_cmcs = [safe_vals[min(i * step, len(safe_vals)-1)] for i in range(3)]
                         for si, fi in enumerate(sup_fingers):
                             j0 = fi * 4
                             cmc_val = sup_cmcs[si] + 0.1 * (torch.rand(1, device=dev).item() - 0.5)
