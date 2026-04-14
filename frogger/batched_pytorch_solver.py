@@ -1899,31 +1899,46 @@ class BatchedGraspOptimizer:
                 print(f"  Actuation filter: {n_good}/{B} passed (<10mm)")
 
             if n_good > 0:
-                # Diversify support finger CMC (abduction) to spread them apart.
-                # Each support finger gets a different angular sector.
+                # Diversify support finger CMC to avoid the actuation finger.
+                # Adjacent fingers at same CMC overlap (45mm fixed distance).
+                # Need at least ~1 radian CMC difference for separation.
                 jl = torch.tensor(_LEAP_JOINT_LOWER, device=dev)
                 jh = torch.tensor(_LEAP_JOINT_UPPER, device=dev)
+                cmc_min, cmc_max = -0.3, 2.2  # full usable CMC range
                 with torch.no_grad():
                     for b in range(B):
                         if not good[b]: continue
                         act_fi = self.amap[b, 0]
+                        # Read actuation finger's actual CMC after IK
+                        act_cmc = self._u2q(self.u[b:b+1])[0, act_fi * 4].item()
                         sup_fingers = [fi for fi in range(4) if fi != act_fi]
-                        # Divide CMC range into 3 sectors for 3 support fingers
-                        cmc_full = (0.0, 1.5)  # full CMC range we use
-                        sector_size = (cmc_full[1] - cmc_full[0]) / 3
+                        # Place support fingers far from actuation CMC.
+                        # Use 3 evenly-spaced CMC values that avoid act_cmc.
+                        # Offset by ~0.8 rad from actuation, then space 0.8 apart.
+                        base_offset = 1.0  # minimum 1 radian from actuation
+                        sup_cmcs = []
+                        for si in range(3):
+                            target_cmc = act_cmc + base_offset + si * 0.7
+                            # Wrap to valid range
+                            if target_cmc > cmc_max:
+                                target_cmc = cmc_min + (target_cmc - cmc_max)
+                            target_cmc = max(cmc_min, min(cmc_max, target_cmc))
+                            sup_cmcs.append(target_cmc)
                         for si, fi in enumerate(sup_fingers):
                             j0 = fi * 4
-                            # CMC: each finger gets its own sector + small noise
-                            cmc_lo = cmc_full[0] + si * sector_size
-                            cmc_hi = cmc_lo + sector_size
+                            cmc_val = sup_cmcs[si] + 0.1 * (torch.rand(1, device=dev).item() - 0.5)
+                            cmc_val = max(cmc_min, min(cmc_max, cmc_val))
                             ranges = [
-                                (cmc_lo, cmc_hi),                  # CMC: dedicated sector
+                                (cmc_val, cmc_val),                # CMC: specific value
                                 (-0.3, 0.6),                       # MCP: slight flex
                                 (0.2, 1.3),                        # PIP: moderate curl
                                 (0.1, 1.0),                        # DIP: moderate curl
                             ]
                             for ji, (lo, hi) in enumerate(ranges):
-                                q_val = lo + (hi - lo) * torch.rand(1, device=dev)
+                                if lo == hi:
+                                    q_val = torch.tensor(lo, device=dev)
+                                else:
+                                    q_val = lo + (hi - lo) * torch.rand(1, device=dev)
                                 u_val = (q_val - jl[j0+ji]) / (jh[j0+ji] - jl[j0+ji])
                                 u_val = torch.log(u_val.clamp(1e-6, 1-1e-6) / (1 - u_val.clamp(1e-6, 1-1e-6)))
                                 self.u.data[b, j0+ji] = u_val.item()
