@@ -1445,12 +1445,27 @@ class BatchedGraspOptimizer:
             z_range = pool_pts[:, 2].max() - pool_pts[:, 2].min()
             z_min = pool_pts[:, 2].min()
 
-            # Uniform sampling, excluding the bottom 15% of the object
-            # (palm at the bottom is useless — object sits on table there).
+            # Sampling: 50% uniform on body, 50% biased near actuation target.
+            # Biasing toward actuation ensures enough palm positions can reach the button.
             z_cutoff = z_min + 0.15 * z_range
             valid_mask = pool_pts[:, 2] > z_cutoff
             valid_pts = pool_pts[valid_mask] if valid_mask.sum() >= B else pool_pts
-            idx = torch.randint(0, valid_pts.shape[0], (B,), device=dev)
+
+            n_uniform = B // 2
+            n_biased = B - n_uniform
+            # Uniform half
+            idx_uniform = torch.randint(0, valid_pts.shape[0], (n_uniform,), device=dev)
+            # Biased half: prefer points near the actuation target
+            if act_positions is not None and len(act_positions) > 0:
+                act_pt = torch.tensor(act_positions[0], dtype=torch.float32, device=dev)
+                dists_to_act = torch.norm(valid_pts - act_pt.unsqueeze(0), dim=-1)
+                # Weight inversely with distance (closer = more likely)
+                weights = 1.0 / (dists_to_act + 0.01)
+                weights = weights / weights.sum()
+                idx_biased = torch.multinomial(weights, n_biased, replacement=True)
+            else:
+                idx_biased = torch.randint(0, valid_pts.shape[0], (n_biased,), device=dev)
+            idx = torch.cat([idx_uniform, idx_biased])
             surf_pts = valid_pts[idx]
 
             # Get outward normals via SDF gradient (uniform points, not vertices)
