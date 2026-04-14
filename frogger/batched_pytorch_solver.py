@@ -1984,6 +1984,14 @@ class BatchedGraspOptimizer:
 
                     # 4 targets (one per finger slot), angles spread around object
                     angles_tgt = [1.57, 2.62, 3.14, -1.57]  # 90, 150, 180, -90 deg
+                    # Compute object z-range for vertical spread
+                    verts_z = torch.tensor(self.sdf._verts_W[:, 2], device=dev)
+                    z_range_obj = verts_z.max() - verts_z.min()
+                    z_center = obj_c[2]
+                    # Vertical offsets: spread support targets across object height
+                    # Avoids all fingers competing for the same circumference band
+                    z_offsets = [-0.2 * z_range_obj, 0.0, 0.15 * z_range_obj, -0.1 * z_range_obj]
+
                     finger_targets_all = {}  # fi -> [B, 3] target on surface
                     for fi in range(4):
                         angle = angles_tgt[fi]
@@ -1993,7 +2001,8 @@ class BatchedGraspOptimizer:
                         target_dir_y = palm_inward_xy[:, 0] * sin_a + palm_inward_xy[:, 1] * cos_a
                         target_dir = torch.stack([target_dir_x, target_dir_y], dim=-1)
                         search_pt = obj_c[:2].unsqueeze(0) + 0.05 * target_dir
-                        search_3d = torch.cat([search_pt, obj_c[2:].unsqueeze(0).expand(B, -1)], -1)
+                        target_z = (z_center + z_offsets[fi]).unsqueeze(0).expand(B, -1)
+                        search_3d = torch.cat([search_pt, target_z], -1)
                         tgt_sdf = self.sdf.query(search_3d.unsqueeze(1)).squeeze(1)
                         _, tgt_normals = self.sdf.query_with_normals(search_3d.unsqueeze(1))
                         tgt_pts = search_3d - tgt_sdf.unsqueeze(-1) * tgt_normals[:, 0]
