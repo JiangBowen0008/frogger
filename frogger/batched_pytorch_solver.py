@@ -2360,7 +2360,7 @@ class BatchedGraspOptimizer:
                                         lsdf = self.sdf.query(lwp)
                                         total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
 
-                            # B2: Fingertip ds collision (push out worst point, allow 1mm contact)
+                            # B2: Fingertip ds collision (mean penetration, allow 1mm contact)
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 for ci, cnm in sup_col_idx_ds[fi]:
@@ -2369,9 +2369,9 @@ class BatchedGraspOptimizer:
                                         lwT = bT_o @ fk_o[cnm].get_matrix()
                                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
-                                        # Max penetration only (not sum — sum over 200+ pts overwhelms surface loss)
-                                        worst_pen = F.relu(-lsdf - 0.001).max(-1).values
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * worst_pen ** 2
+                                        # Mean over penetrating pts: balanced signal across the fingertip
+                                        pen = F.relu(-lsdf - 0.001)
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 2000 * pen.mean(-1)
 
                         elif opt_variant in ("B", "C"):
                             # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
