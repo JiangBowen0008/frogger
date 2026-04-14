@@ -2048,14 +2048,15 @@ class BatchedGraspOptimizer:
                         tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                         tp_sdf = self.sdf.query(tp.unsqueeze(1)).squeeze(1)
 
-                        # If support tip is near actuation tip, INCREASE its SDF target
-                        # so it seeks a different surface point further away
+                        # Push support fingers away from actuation finger AND target area
                         dist_to_act_tip = torch.norm(tp - act_tip_pos, dim=-1)
-                        too_close = (dist_to_act_tip < 0.030) & sup_finger_mask[:, fi]
-                        # For too-close fingers: penalize being near act, not SDF
+                        dist_to_act_target = torch.norm(tp - ap[0], dim=-1) if ap is not None else dist_to_act_tip
+                        dist_to_act = torch.minimum(dist_to_act_tip, dist_to_act_target)
+                        too_close = (dist_to_act < 0.040) & sup_finger_mask[:, fi]
+                        # Strong repulsion from actuation area (comparable to SDF loss)
                         sdf_loss = torch.where(too_close,
-                            F.relu(0.030 - dist_to_act_tip) ** 2 * 5.0,  # push away from act
-                            tp_sdf ** 2)  # normal SDF loss
+                            F.relu(0.040 - dist_to_act) ** 2 * 500.0,  # same weight as SDF
+                            tp_sdf ** 2)
 
                         below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
                         loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
