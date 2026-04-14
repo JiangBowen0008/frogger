@@ -1985,6 +1985,37 @@ class BatchedGraspOptimizer:
                             sup_joint_mask[b, fi*4:fi*4+4] = True
                             sup_finger_mask[b, fi] = True
 
+                # Compute spread target positions for support fingers
+                # Each finger gets a target on the object surface at a specific
+                # angle from the palm approach direction (recycled from Phase 0)
+                with torch.no_grad():
+                    R_init = self._rot6d_to_matrix(self.rot6d)
+                    palm_inward = R_init[:, :, 0]  # base +X = toward object
+                    palm_inward_xy = F.normalize(palm_inward[:, :2], dim=-1)
+
+                    # 4 targets (one per finger slot), angles spread around object
+                    angles_tgt = [1.57, 2.62, 3.14, -1.57]  # 90, 150, 180, -90 deg
+                    finger_targets_all = {}  # fi -> [B, 3] target on surface
+                    for fi in range(4):
+                        angle = angles_tgt[fi]
+                        cos_a = torch.cos(torch.tensor(angle, device=dev))
+                        sin_a = torch.sin(torch.tensor(angle, device=dev))
+                        target_dir_x = palm_inward_xy[:, 0] * cos_a - palm_inward_xy[:, 1] * sin_a
+                        target_dir_y = palm_inward_xy[:, 0] * sin_a + palm_inward_xy[:, 1] * cos_a
+                        target_dir = torch.stack([target_dir_x, target_dir_y], dim=-1)
+                        search_pt = obj_c[:2].unsqueeze(0) + 0.05 * target_dir
+                        search_3d = torch.cat([search_pt, obj_c[2:].unsqueeze(0).expand(B, -1)], -1)
+                        tgt_sdf = self.sdf.query(search_3d.unsqueeze(1)).squeeze(1)
+                        _, tgt_normals = self.sdf.query_with_normals(search_3d.unsqueeze(1))
+                        tgt_pts = search_3d - tgt_sdf.unsqueeze(-1) * tgt_normals[:, 0]
+                        finger_targets_all[fi] = tgt_pts
+
+                    # Build per-env finger targets: skip the actuation finger
+                    # and assign the other 3 targets to support fingers
+                    finger_targets = {}  # fi -> [B, 3]
+                    for fi in range(4):
+                        finger_targets[fi] = finger_targets_all[fi]
+
                 for ik_step in range(200):
                     opt_sup.zero_grad()
                     q_ik = self._u2q(u_sup)
@@ -2056,6 +2087,11 @@ class BatchedGraspOptimizer:
 
                         below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
                         loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
+
+                        # Guide support fingers toward spread target positions (light)
+                        if fi in finger_targets:
+                            target = finger_targets[fi]
+                            loss_sup += sup_finger_mask[:, fi].float() * 30 * ((tp - target) ** 2).sum(-1)
 
                     # Support finger link collision + below-object penalty
                     prefixes = ['if', 'mf', 'rf', 'th']
@@ -2356,7 +2392,7 @@ class BatchedGraspOptimizer:
 
                         # ── Section B: Collision loss ──
                         if opt_variant == "A":
-                            # Original: relu(-SDF) for non-ds links
+                            # B1: relu(-SDF) for non-ds links
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 for ci, cnm in sup_col_idx[fi]:
@@ -2366,6 +2402,19 @@ class BatchedGraspOptimizer:
                                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
                                         total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
+
+                            # B2: Fingertip ds collision (push out worst point, allow 1mm contact)
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                for ci, cnm in sup_col_idx_ds[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm in fk_o:
+                                        lwT = bT_o @ fk_o[cnm].get_matrix()
+                                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                        lsdf = self.sdf.query(lwp)
+                                        # Max penetration only (not sum — sum over 200+ pts overwhelms surface loss)
+                                        worst_pen = F.relu(-lsdf - 0.001).max(-1).values
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * worst_pen ** 2
 
                         elif opt_variant in ("B", "C"):
                             # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
@@ -2444,6 +2493,18 @@ class BatchedGraspOptimizer:
                                 d = torch.cdist(sc_pts[:, sc_i1], sc_pts[:, sc_i2])
                                 min_d = d.min(-1).values.min(-1).values
                                 total_loss += opt_mask.float() * 200 * F.relu(0.005 - min_d) ** 2
+
+                        # ── Section E: Actuation area exclusion ──
+                        # Support tips within 35mm of actuation target get pushed away
+                        if n_act and ap is not None:
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                nm = self.tip_link_names[fi]
+                                wT = bT_o @ fk_o[nm].get_matrix()
+                                off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                                tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                dist_to_act = torch.norm(tip - ap[0], dim=-1)
+                                total_loss += sup_finger_mask_opt[:, fi].float() * 100 * F.relu(0.035 - dist_to_act) ** 2
 
                         # Freeze non-support joints
                         total_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
@@ -2580,6 +2641,18 @@ class BatchedGraspOptimizer:
                                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
                                         proj_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(-lsdf).max(-1).values ** 2
+
+                            # PGD Phase B: Fingertip ds collision (push out, allow 1mm)
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                for ci, cnm in sup_col_idx_ds[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm in fk_p:
+                                        lwT = bT_p @ fk_p[cnm].get_matrix()
+                                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                        lsdf = self.sdf.query(lwp)
+                                        deep_pen = F.relu(-lsdf - 0.001)
+                                        proj_loss += sup_finger_mask_opt[:, fi].float() * 500 * deep_pen.sum(-1)
 
                             sc_pts = self._get_sc_points(fk_p, bT_p)
                             if sc_pts is not None:
