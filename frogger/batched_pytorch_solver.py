@@ -2327,7 +2327,7 @@ class BatchedGraspOptimizer:
                                 off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
                                 tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                                 tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
-                                total_loss += sup_finger_mask_opt[:, fi].float() * 500 * tip_sdf ** 2
+                                total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * tip_sdf ** 2
 
                         elif opt_variant in ("B", "C"):
                             # Min-k unified: for ds links, query ALL collision points,
@@ -2777,8 +2777,8 @@ class BatchedGraspOptimizer:
 
                 # Feasibility: only candidates that passed opt_mask + quality checks
                 feasible = (opt_mask
-                            & (surf_err < 0.005)  # 5mm surface tolerance
-                            & (max_col_viol < 0.002)  # 2mm collision margin
+                            & (surf_err < 0.008)  # 8mm surface (ds collision push-out makes 5mm too strict)
+                            & (max_col_viol < 0.003)  # 3mm collision margin
                             & (sc_min_d > 0.001)  # 1mm self-collision
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
