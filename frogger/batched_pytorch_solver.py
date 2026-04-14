@@ -2126,10 +2126,20 @@ class BatchedGraspOptimizer:
                         tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                         tp_sdf = self.sdf.query(tp.unsqueeze(1)).squeeze(1)
 
-                        # Surface seeking: ALWAYS active (never replaced by repulsion)
+                        # Surface seeking: ALWAYS active
                         sdf_loss = tp_sdf ** 2
                         below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
                         loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
+
+                        # Pad alignment: pad direction (-X of tip link) should face the surface
+                        # (align with inward normal at contact point)
+                        pad_dir = -wT[:, :3, 0]  # [B, 3] — pad push direction
+                        _, inward_n = self.sdf.query_with_normals(tp.unsqueeze(1))
+                        inward_n = inward_n[:, 0]  # [B, 3]
+                        # Want dot(pad_dir, inward_normal) > 0 (pad faces toward surface)
+                        align = (pad_dir * inward_n).sum(-1)  # [B]
+                        # Penalize when pad faces away (align < 0.3)
+                        loss_sup += sup_finger_mask[:, fi].float() * 100 * F.relu(0.3 - align) ** 2
 
                         # Actuation repulsion: ADDED on top of surface loss (not replacing)
                         dist_to_act_tip = torch.norm(tp - act_tip_pos, dim=-1)
@@ -2906,10 +2916,19 @@ class BatchedGraspOptimizer:
                         fi = self.amap_t[:, j]
                         act_dist = torch.norm(tp_final[torch.arange(B, device=dev), fi] - ap[j], dim=-1)
 
+                # ds link deep penetration: worst SDF across ds collision points
+                ds_worst = torch.zeros(B, device=dev)
+                for li, (nm, _) in enumerate(self._col_data):
+                    if "_ds" not in nm: continue
+                    si, ei = self._col_link_ranges[li]
+                    ds_sdf = cs_final[:, si:ei].min(-1).values  # worst point per link
+                    ds_worst = torch.minimum(ds_worst, ds_sdf)
+
                 # Feasibility: only candidates that passed opt_mask + quality checks
                 feasible = (opt_mask
-                            & (surf_err < 0.008)  # 8mm surface (ds collision push-out makes 5mm too strict)
-                            & (max_col_viol < 0.003)  # 3mm collision margin
+                            & (surf_err < 0.008)  # 8mm surface
+                            & (max_col_viol < 0.003)  # 3mm non-ds collision margin
+                            & (ds_worst > -0.005)  # 5mm max ds penetration
                             & (sc_min_d > 0.001)  # 1mm self-collision
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
