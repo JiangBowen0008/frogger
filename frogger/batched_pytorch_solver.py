@@ -2005,7 +2005,7 @@ class BatchedGraspOptimizer:
                     for fi in range(4):
                         finger_targets[fi] = finger_targets_all[fi]
 
-                for ik_step in range(200):
+                for ik_step in range(400):
                     opt_sup.zero_grad()
                     q_ik = self._u2q(u_sup)
                     bT_ik = self._base_T(self.pos.detach(), self.rot6d.detach())
@@ -2078,10 +2078,13 @@ class BatchedGraspOptimizer:
                         below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
                         loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
 
-                        # Guide support fingers toward spread target positions (light)
+                        # Guide support fingers toward spread target positions
+                        # Strong for first half of IK (guidance), fade for second half (surface takes over)
                         if fi in finger_targets:
                             target = finger_targets[fi]
-                            loss_sup += sup_finger_mask[:, fi].float() * 30 * ((tp - target) ** 2).sum(-1)
+                            target_w = 100 * max(0, 1 - ik_step / 200)  # 100 → 0 over 200 steps
+                            if target_w > 1:
+                                loss_sup += sup_finger_mask[:, fi].float() * target_w * ((tp - target) ** 2).sum(-1)
 
                     # Support finger link collision + below-object penalty
                     prefixes = ['if', 'mf', 'rf', 'th']
