@@ -1985,7 +1985,7 @@ class BatchedGraspOptimizer:
                     # 4 targets (one per finger slot), angles spread around object
                     angles_tgt = [1.57, 2.62, 3.14, -1.57]  # 90, 150, 180, -90 deg
                     # Compute object z-range for vertical spread
-                    verts_z = torch.tensor(self.sdf._verts_W[:, 2], device=dev)
+                    verts_z = torch.tensor(self.sdf._verts_W[:, 2], dtype=torch.float32, device=dev)
                     z_range_obj = verts_z.max() - verts_z.min()
                     z_center = obj_c[2]
                     # Vertical offsets: spread support targets across object height
