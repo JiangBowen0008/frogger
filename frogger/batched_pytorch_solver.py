@@ -2518,6 +2518,23 @@ class BatchedGraspOptimizer:
                                 dist_to_act = torch.norm(tip - act_tip_actual, dim=-1)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(0.035 - dist_to_act) ** 2
 
+                        # ── Section F: CMC separation from actuation ──
+                        # Prevent support finger CMC from drifting toward actuation CMC.
+                        # The init spreads them but optimization undoes it via surface loss.
+                        if n_act:
+                            q_current = self._u2q(u_opt)
+                            for act_fi_f in range(4):
+                                amask_f = (self.amap_t[:, 0] == act_fi_f)
+                                if not amask_f.any(): continue
+                                act_cmc = q_current[:, act_fi_f * 4]  # [B]
+                                for fi in range(4):
+                                    if fi == act_fi_f: continue
+                                    if not sup_finger_mask_opt[:, fi].any(): continue
+                                    sup_cmc = q_current[:, fi * 4]  # [B]
+                                    cmc_diff = (sup_cmc - act_cmc).abs()
+                                    # Penalize if CMC within 0.8 rad of actuation
+                                    total_loss += (amask_f & sup_finger_mask_opt[:, fi]).float() * 500 * F.relu(0.8 - cmc_diff) ** 2
+
                         # Freeze non-support joints
                         total_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
 
