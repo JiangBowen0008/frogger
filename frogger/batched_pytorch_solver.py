@@ -2386,7 +2386,7 @@ class BatchedGraspOptimizer:
                 sfx_all = [['bs', 'px', 'md', 'ds']] * 3 + [['mp', 'bs', 'px', 'ds']]
 
                 u_opt = self.u.detach().clone().requires_grad_(True)
-                opt_adam = torch.optim.Adam([u_opt], lr=0.005)
+                opt_adam = torch.optim.Adam([u_opt], lr=0.008)
 
                 # Pre-compute support finger collision link names
                 prefixes_opt = ['if', 'mf', 'rf', 'th']
@@ -2409,7 +2409,7 @@ class BatchedGraspOptimizer:
                 # "B"   = min-k unified surface/collision
                 # "C"   = min-k with adaptive FC contacts
                 # ============================================================
-                opt_steps = min(steps, 300)
+                opt_steps = min(steps, 500)
                 eps_fd = 5e-4
                 fd_ofst = torch.zeros(3, 3, device=dev)
                 for d3 in range(3): fd_ofst[d3, d3] = eps_fd
@@ -2427,7 +2427,7 @@ class BatchedGraspOptimizer:
 
                 if opt_variant in ("A", "B", "C"):
                     # ── Simple Adam loop (all variants A/B/C) ──
-                    opt_adam = torch.optim.Adam([u_opt], lr=0.005)
+                    opt_adam = torch.optim.Adam([u_opt], lr=0.008)
                     fc_start_step = 100
                     fc_weight = 1.0
                     mink_k = 10  # number of lowest SDF points for variants B/C
