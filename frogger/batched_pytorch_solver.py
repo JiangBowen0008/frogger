@@ -2444,12 +2444,23 @@ class BatchedGraspOptimizer:
                                 total_loss += group_mask.float() * fc_weight * (-s)
 
                         # ── Section D: Inter-finger self-collision ──
+                        # For each link pair, check how many SC points from link A
+                        # have their nearest neighbor in link B within 10mm.
+                        # This detects volumetric overlap (interleaved point clouds)
+                        # that min-distance misses.
                         sc_pts = self._get_sc_points(fk_o, bT_o)
                         if sc_pts is not None:
                             for sc_i1, sc_i2 in self._self_col_pairs:
                                 d = torch.cdist(sc_pts[:, sc_i1], sc_pts[:, sc_i2])
-                                min_d = d.min(-1).values.min(-1).values
-                                total_loss += opt_mask.float() * 200 * F.relu(0.005 - min_d) ** 2
+                                # For each point in A, distance to nearest point in B
+                                nn_d_A = d.min(dim=-1).values  # [B, n1]
+                                nn_d_B = d.min(dim=-2).values  # [B, n2]
+                                # Fraction of A's points that are "inside" B (nn < 10mm)
+                                frac_A = (nn_d_A < 0.010).float().mean(dim=-1)  # [B]
+                                frac_B = (nn_d_B < 0.010).float().mean(dim=-1)  # [B]
+                                overlap = torch.maximum(frac_A, frac_B)  # [B]
+                                # Penalize any overlap fraction > 0
+                                total_loss += opt_mask.float() * 2000 * overlap
 
                         # ── Section E: Actuation area exclusion ──
                         # Support tips within 35mm of actuation FINGER get pushed away
