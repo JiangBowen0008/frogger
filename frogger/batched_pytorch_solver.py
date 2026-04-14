@@ -46,6 +46,7 @@ class BatchedSDF:
         t_WO = X_WO_matrix[:3, 3].astype(np.float64)
         verts_W = (R_WO @ verts_O.astype(np.float64).T).T + t_WO
         self._verts_W = verts_W  # store for OBB computation
+        self._faces = np.asarray(mesh.faces)  # store for surface sampling
 
         self.bbox_min = np.min(verts_W, axis=0) - bounds_padding
         self.bbox_max = np.max(verts_W, axis=0) + bounds_padding
@@ -145,6 +146,89 @@ class BatchedSDF:
 # ---------------------------------------------------------------------------
 # Grasp wrench space helpers (FRoGGeR formulation)
 # ---------------------------------------------------------------------------
+
+def box_sdf_batch(query_pts, box_centers, box_rotations, box_half_extents):
+    """Signed distance from query points to oriented bounding boxes.
+
+    Uses the Quilez SDF formula: transform to box local frame, then
+    compute AABB distance analytically.
+
+    Args:
+        query_pts: [B, N, 3] points to query
+        box_centers: [B, 3] box centers in world frame
+        box_rotations: [B, 3, 3] box rotation matrices (world frame)
+        box_half_extents: [B, 3] half-extents (hx, hy, hz)
+
+    Returns:
+        sdf: [B, N] signed distance (negative = inside box)
+    """
+    # Transform query points to box local frame
+    # q = R^T @ (p - c)
+    local = query_pts - box_centers.unsqueeze(1)  # [B, N, 3]
+    # Batched matmul: [B, 3, 3]^T @ [B, N, 3]^T -> [B, 3, N] -> [B, N, 3]
+    q = torch.bmm(box_rotations.transpose(1, 2), local.transpose(1, 2)).transpose(1, 2)
+
+    # Quilez SDF for AABB: d = |q| - h; sdf = length(max(d,0)) + min(max(d.x,d.y,d.z),0)
+    d = q.abs() - box_half_extents.unsqueeze(1)  # [B, N, 3]
+    outside = torch.clamp(d, min=0)  # [B, N, 3]
+    outside_dist = outside.norm(dim=-1)  # [B, N]
+    inside_dist = d.max(dim=-1).values.clamp(max=0)  # [B, N] (negative)
+    return outside_dist + inside_dist  # [B, N]
+
+
+def box_box_sdf_batch(centers_A, rots_A, half_A, centers_B, rots_B, half_B):
+    """Signed distance between two OBBs using SAT-inspired approach.
+
+    Queries strategic points of each box (center, 8 corners, 6 face centers,
+    12 edge midpoints = 27 points) against the other box's SDF.
+    This catches vertex-face, edge-face, and edge-edge overlaps.
+
+    Args:
+        centers_A, centers_B: [B, 3]
+        rots_A, rots_B: [B, 3, 3]
+        half_A, half_B: [B, 3]
+
+    Returns:
+        sdf: [B] signed distance (negative = overlapping)
+    """
+    B = centers_A.shape[0]
+    dev = centers_A.device
+
+    def _make_sample_offsets():
+        """Center + 8 corners + 6 face centers + 12 edge midpoints = 27 points."""
+        pts = [[0, 0, 0]]  # center
+        # 8 corners
+        for sx in [-1, 1]:
+            for sy in [-1, 1]:
+                for sz in [-1, 1]:
+                    pts.append([sx, sy, sz])
+        # 6 face centers
+        for dim in range(3):
+            for s in [-1, 1]:
+                p = [0, 0, 0]; p[dim] = s; pts.append(p)
+        # 12 edge midpoints
+        for d1 in range(3):
+            for d2 in range(d1+1, 3):
+                for s1 in [-1, 1]:
+                    for s2 in [-1, 1]:
+                        p = [0, 0, 0]; p[d1] = s1; p[d2] = s2; pts.append(p)
+        return torch.tensor(pts, dtype=torch.float32, device=dev)  # [27, 3]
+
+    offsets = _make_sample_offsets()  # [27, 3]
+
+    def _query_pts_in_box(pts_offsets, pts_center, pts_rot, pts_half, tgt_center, tgt_rot, tgt_half):
+        """Generate sample points from source box, query against target box SDF."""
+        # World points: center + rot @ (offsets * half)
+        local = pts_offsets.unsqueeze(0) * pts_half.unsqueeze(1)  # [B, 27, 3]
+        world = pts_center.unsqueeze(1) + torch.bmm(pts_rot, local.transpose(1, 2)).transpose(1, 2)
+        return box_sdf_batch(world, tgt_center, tgt_rot, tgt_half)  # [B, 27]
+
+    sdf_B_in_A = _query_pts_in_box(offsets, centers_B, rots_B, half_B, centers_A, rots_A, half_A)
+    sdf_A_in_B = _query_pts_in_box(offsets, centers_A, rots_A, half_A, centers_B, rots_B, half_B)
+
+    all_sdf = torch.cat([sdf_B_in_A, sdf_A_in_B], dim=1)  # [B, 54]
+    return all_sdf.min(dim=1).values  # [B]
+
 
 def compute_primitive_forces_torch(ns: int, mu: float, device="cuda"):
     """Pyramidal friction cone approximation.  Returns F [3, ns]."""
@@ -608,10 +692,12 @@ class BatchedGraspOptimizer:
         self.palm_contact = palm_contact
         self.tip_link_names, self.collision_link_names = _link_names(hand, hand_type)
 
-        # Fingertip contact offsets in body frame
+        # Fingertip pad center in link frame: -X face center of the main
+        # pad box (the small box at the fingertip end, not the side walls).
+        # Pad faces -X in tip link frame.
         if hand_type == "leap":
-            f_off = [-0.0025, -0.0449, 0.0143]
-            t_off = [-0.0020, -0.0558, -0.0144]
+            f_off = [-0.010, -0.032, 0.015]   # IF/MF/RF: pad center, shifted toward fingertip
+            t_off = [-0.009, -0.035, -0.011]  # TH: pad center, shifted toward fingertip
             palm_off = [-0.030, -0.035, -0.010]  # inner palm surface center (from URDF boxes)
             self.palm_link = f"leap_{hand}_palm"
         else:
@@ -741,166 +827,149 @@ class BatchedGraspOptimizer:
 
         if self.hand_type == "leap":
             # URDF box volumetric collision: fill each Menagerie box primitive
-            # with a 3D grid. These boxes are the PHYSICAL collision geometry.
-            # Key: boxes DON'T cover fingertip pads (25mm gap to tip offset),
-            # so collision checking won't fight surface contact — the separation
-            # is structural, not a fragile margin heuristic.
+            # with a uniform 3mm 3D grid. These boxes are the PHYSICAL collision
+            # geometry — watertight, no inner cavity, no vertex bias.
+            # Collision check: object SDF at grid point >= 0 (no penetration).
             import xml.etree.ElementTree as _ET_col
             _urdf_col = os.path.join(os.path.dirname(__file__),
                                      f"../models/leap_{self.hand}/leap.urdf")
             _tree_col = _ET_col.parse(_urdf_col)
-            col_data = []
-            col_link_ranges = []  # (start, end) per link for per-link AL
-            _offset = 0
-
-            # Sphere-based collision (like DexGraspNet/SpringGrasp/cuRobo).
-            # Spheres conform to ANY surface curvature — unlike flat boxes,
-            # a sphere tangent to a cylinder has ALL surface points outside.
-            # Each URDF box becomes 1+ spheres along its longest axis.
-            # Collision check: sdf(sphere_center) >= sphere_radius.
             _col_link_names = list(self.collision_link_names)
-            col_data = []       # [(link_name, centers_h)] — sphere centers as homogeneous pts
+            col_data = []
             col_link_ranges = []
-            _sphere_radii = []  # per-sphere radius
             _offset = 0
-
-            # Load palm visual mesh for outer-surface sphere placement
-            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}")
-            vis = _visual_meshes(self.hand, self.hand_type)
+            _pitch = 0.005  # 5mm grid (all palm boxes included)
 
             for nm in _col_link_names:
-                link_centers = []
-                link_radii = []
-
-                # Volume-filling spheres from visual mesh (cuRobo-style).
-                # Voxelize the link mesh and place overlapping spheres at voxel
-                # centers. This fills the link INTERIOR, not just the surface.
-                if nm in vis:
-                    all_verts = []
-                    all_faces = []
-                    face_offset = 0
-                    for mesh_file, vis_pose in vis[nm]:
-                        path = os.path.join(mesh_dir, mesh_file)
-                        if not os.path.exists(path):
-                            continue
-                        lm = trimesh.load(path, force="mesh")
-                        v = np.asarray(lm.vertices, dtype=np.float64)
-                        f = np.asarray(lm.faces)
-                        if vis_pose is not None:
-                            vp = np.array(vis_pose, dtype=np.float64)
-                            Rv = ScipyR.from_euler("xyz", vp[3:]).as_matrix()
-                            v = (Rv @ v.T).T + vp[:3]
-                        all_verts.append(v)
-                        all_faces.append(f + face_offset)
-                        face_offset += len(v)
-                    if all_verts:
-                        av = np.vstack(all_verts)
-                        af = np.vstack(all_faces) if all_faces else None
-                        # Voxelize: create a 3D grid inside the bounding box
-                        bb_min, bb_max = av.min(0), av.max(0)
-                        is_palm = "palm" in nm
-                        # ~150 spheres total (cuRobo-scale), r=5-8mm overlapping.
-                        # Dense enough for optimizer signal, sparse enough not to
-                        # overwhelm the surface loss. Post-hoc mesh verification
-                        # catches what spheres miss.
-                        pitch = 0.012 if is_palm else 0.010
-                        radius = pitch * 0.5  # 6mm palm, 5mm fingers
-                        gx = np.arange(bb_min[0], bb_max[0] + pitch, pitch)
-                        gy = np.arange(bb_min[1], bb_max[1] + pitch, pitch)
-                        gz = np.arange(bb_min[2], bb_max[2] + pitch, pitch)
-                        grid = np.array(np.meshgrid(gx, gy, gz, indexing='ij')).reshape(3, -1).T
-                        # Keep only voxels near or inside the mesh
-                        # Use simple distance-to-vertices heuristic
-                        from scipy.spatial import cKDTree
-                        tree = cKDTree(av)
-                        dists, _ = tree.query(grid, k=1)
-                        inside_mask = dists < radius * 1.5  # near the mesh surface
-                        link_centers = list(grid[inside_mask].astype(np.float32))
-                        link_radii = [radius] * len(link_centers)
-                        # Cap at reasonable count
-                        max_sph = 40 if is_palm else 15
-                        if len(link_centers) > max_sph:
-                            idx = np.random.choice(len(link_centers), max_sph, replace=False)
-                            link_centers = [link_centers[i] for i in idx]
-                            link_radii = [radius] * max_sph
-
-                # NON-PALM: use URDF box spheres as before
-                if not link_centers:
-                    _le = None
-                    for _e in _tree_col.getroot().findall("link"):
-                        if _e.get("name") == nm:
-                            _le = _e
-                            break
-                if not link_centers and _le is not None:
+                link_pts = []
+                _is_palm = "palm" in nm
+                _le = None
+                for _e in _tree_col.getroot().findall("link"):
+                    if _e.get("name") == nm:
+                        _le = _e
+                        break
+                if _le is not None:
                     for _cel in _le.findall("collision"):
                         _g = _cel.find("geometry")
                         if _g is None: continue
                         _b = _g.find("box")
                         if _b is None: continue
-                        dims = sorted([float(x) for x in _b.get("size").split()])
+                        _sz = [float(x) for x in _b.get("size").split()]
                         _o = _cel.find("origin")
                         _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
                         _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
                         _R = (ScipyR.from_euler("xyz", _rpy).as_matrix()
                               if np.any(np.abs(_rpy) > 1e-6) else np.eye(3))
-                        # Sphere radius = half the middle dimension, capped at 10mm.
-                        # Large radii force the hand too far from the object.
-                        radius = min(dims[1] / 2.0, 0.003)  # 3mm — best collision/surface balance
-                        # Place spheres along the longest axis of the box
-                        longest_idx = [float(x) for x in _b.get("size").split()]
-                        longest_ax = np.argmax(np.abs(longest_idx))
-                        n_sph = max(1, int(dims[2] / (2 * radius)))
-                        if n_sph == 1:
-                            link_centers.append(_R @ np.array([0, 0, 0]) + _p)
-                            link_radii.append(radius)
-                        else:
-                            half = [float(x)/2 for x in _b.get("size").split()]
-                            for k in range(n_sph):
-                                t = -1.0 + 2.0 * k / (n_sph - 1) if n_sph > 1 else 0.0
-                                local = np.zeros(3)
-                                local[longest_ax] = t * half[longest_ax]
-                                link_centers.append(_R @ local + _p)
-                                link_radii.append(radius)
+                        # All palm boxes are checked — the large boxes
+                        # (x < -0.025) ARE the palm plate, not structural.
+                        hx, hy, hz = _sz[0]/2, _sz[1]/2, _sz[2]/2
+                        gx = np.arange(-hx, hx + _pitch/2, _pitch)
+                        gy = np.arange(-hy, hy + _pitch/2, _pitch)
+                        gz = np.arange(-hz, hz + _pitch/2, _pitch)
+                        grid = np.stack(np.meshgrid(gx, gy, gz, indexing='ij'),
+                                        axis=-1).reshape(-1, 3)
+                        grid = ((_R @ grid.T).T + _p).astype(np.float32)
+                        link_pts.append(grid)
 
-                if link_centers:
-                    centers = np.array(link_centers, dtype=np.float32)
+                if link_pts:
+                    pts = np.vstack(link_pts)
                 else:
-                    centers = np.array([[0, 0, 0]], dtype=np.float32)
-                    link_radii = [0.005]  # dummy
-
-                pts_h = np.hstack([centers, np.ones((len(centers), 1), dtype=np.float32)])
+                    pts = np.array([[0, 0, 0]], dtype=np.float32)
+                pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
                 col_data.append((nm, torch.tensor(pts_h, device=self.device)))
-                n_pts = centers.shape[0]
-                col_link_ranges.append((_offset, _offset + n_pts))
-                _sphere_radii.extend(link_radii)
-                _offset += n_pts
+                col_link_ranges.append((_offset, _offset + len(pts)))
+                _offset += len(pts)
+
+            # Add visual-mesh-surface-sampled points for ds (fingertip) links.
+            # The URDF boxes miss the rounded tip (~30mm uncovered).
+            # Sample uniformly on the visual mesh surface + interior fill.
+            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}")
+            vis_meshes = _visual_meshes(self.hand, self.hand_type)
+            n_tip_surface = 150  # surface samples per tip link
+            n_tip_interior = 50  # interior fill samples
+            tip_pts_added = 0
+            for ci, (nm, _) in enumerate(col_data):
+                if "_ds" not in nm:
+                    continue
+                if nm not in vis_meshes:
+                    continue
+                # Load and transform visual mesh to link frame
+                all_v = []
+                all_f = []
+                f_offset = 0
+                for mf, vp in vis_meshes[nm]:
+                    path = os.path.join(mesh_dir, mf)
+                    if not os.path.exists(path):
+                        continue
+                    lm = trimesh.load(path, force="mesh")
+                    v = np.asarray(lm.vertices, dtype=np.float64)
+                    faces = np.asarray(lm.faces)
+                    if vp is not None:
+                        vpa = np.array(vp, dtype=np.float64)
+                        Rv = ScipyR.from_euler("xyz", vpa[3:]).as_matrix()
+                        v = (Rv @ v.T).T + vpa[:3]
+                    all_v.append(v)
+                    all_f.append(faces + f_offset)
+                    f_offset += len(v)
+                if not all_v:
+                    continue
+                tip_mesh = trimesh.Trimesh(
+                    vertices=np.vstack(all_v), faces=np.vstack(all_f))
+                # Sample on surface (Poisson-disk-like even distribution)
+                try:
+                    surf_pts, _ = trimesh.sample.sample_surface_even(
+                        tip_mesh, n_tip_surface)
+                except Exception:
+                    surf_pts, _ = trimesh.sample.sample_surface(
+                        tip_mesh, n_tip_surface)
+                # Interior: concentric shells toward centroid for even fill
+                centroid = tip_mesh.centroid
+                int_pts = []
+                for shell in np.linspace(0.3, 0.85, 5):
+                    n_shell = n_tip_interior // 5
+                    idx = np.random.choice(len(surf_pts), n_shell, replace=False)
+                    int_pts.append(centroid + shell * (surf_pts[idx] - centroid))
+                int_pts = np.vstack(int_pts)
+                tip_pts = np.vstack([surf_pts, int_pts]).astype(np.float32)
+                # Append to this link's collision data
+                tip_h = np.hstack([tip_pts, np.ones((len(tip_pts), 1), dtype=np.float32)])
+                existing = col_data[ci][1]
+                combined = torch.cat([existing, torch.tensor(tip_h, device=self.device)], dim=0)
+                col_data[ci] = (nm, combined)
+                # Update range
+                old_start, old_end = col_link_ranges[ci]
+                col_link_ranges[ci] = (old_start, old_end + len(tip_pts))
+                # Shift subsequent ranges
+                for cj in range(ci + 1, len(col_link_ranges)):
+                    s, e = col_link_ranges[cj]
+                    col_link_ranges[cj] = (s + len(tip_pts), e + len(tip_pts))
+                _offset += len(tip_pts)
+                tip_pts_added += len(tip_pts)
 
             self._col_data = col_data
             self._col_link_ranges = col_link_ranges
             self._n_col_links = len(col_link_ranges)
-            self._sphere_radii = torch.tensor(_sphere_radii, dtype=torch.float32,
-                                              device=self.device)
             n_total = sum(p.shape[0] for _, p in col_data)
-            print(f"  Sphere collision: {len(col_data)} links, "
-                  f"{n_total} spheres (r={self._sphere_radii.min()*1000:.0f}-{self._sphere_radii.max()*1000:.0f}mm)")
+            print(f"  Box-grid collision: {len(col_data)} links, "
+                  f"{n_total} points ({_pitch*1000:.0f}mm grid + {tip_pts_added} tip surface pts)")
 
         else:
             # Allegro: original mesh-based collision points
             self._precompute_collision_points_mesh()
             return
 
-        # Sphere collision margins: sdf(center) >= radius.
-        # For _ds links (fingertips), reduce radius to allow contact.
-        d_pen = 0.003  # fingertip contact penetration allowance
+        # Box-grid collision margins: sdf(point) >= margin.
+        # Fingertips (_ds): -1mm (contact pads touch surface — tips
+        #   must get close enough for the surface loss to work)
+        # All other links (including palm): 0mm (no penetration)
         margins = []
         for li, (nm, pts) in enumerate(col_data):
             si, ei = col_link_ranges[li]
-            for i in range(si, ei):
-                r = self._sphere_radii[i].item()
-                if "_ds" in nm:
-                    margins.append(r - d_pen)  # allow tips closer
-                else:
-                    margins.append(r)  # full sphere radius
+            if "_ds" in nm:
+                m = -0.001  # fingertip contact pads
+            else:
+                m = 0.0
+            margins.extend([m] * (ei - si))
         self._col_margins = torch.tensor(margins, dtype=torch.float32,
                                          device=self.device)
 
@@ -921,31 +990,42 @@ class BatchedGraspOptimizer:
                 if _ln not in self.collision_link_names:
                     continue
                 _bpts = []
+                _sc_pitch = 0.005  # 5mm grid (same as collision)
                 for _col_elem in _le.findall("collision"):
                     _g = _col_elem.find("geometry")
                     if _g is None: continue
                     _b = _g.find("box")
                     if _b is None: continue
                     _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
-                    _h = np.array([_sx/2, _sy/2, _sz/2])
                     _o = _col_elem.find("origin")
                     _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
                     _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
                     _R = ScipyR.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
-                    for sx in [-1, 1]:
-                        for sy in [-1, 1]:
-                            for sz in [-1, 1]:
-                                _bpts.append(_R @ np.array([sx*_h[0], sy*_h[1], sz*_h[2]]) + _p)
+                    # Fill box with grid (not just corners) for accurate SC
+                    _hx, _hy, _hz = _sx/2, _sy/2, _sz/2
+                    _gx = np.arange(-_hx, _hx + _sc_pitch/2, _sc_pitch)
+                    _gy = np.arange(-_hy, _hy + _sc_pitch/2, _sc_pitch)
+                    _gz = np.arange(-_hz, _hz + _sc_pitch/2, _sc_pitch)
+                    _grid = np.stack(np.meshgrid(_gx, _gy, _gz, indexing='ij'), axis=-1).reshape(-1, 3)
+                    _grid = ((_R @ _grid.T).T + _p).astype(np.float32)
+                    _bpts.append(_grid)
                 if _bpts:
-                    _pts = np.array(_bpts, dtype=np.float32)
+                    _pts = np.vstack(_bpts)
                 else:
                     _pts = np.array([[0, 0, 0]], dtype=np.float32)
+                # Subsample: keep at most _SC_LINK_MAX points per link
+                # to avoid OOM on cdist. Use evenly-spaced indices.
+                _SC_LINK_MAX = 40
+                if len(_pts) > _SC_LINK_MAX:
+                    step = len(_pts) / _SC_LINK_MAX
+                    _keep = [int(k * step) for k in range(_SC_LINK_MAX)]
+                    _pts = _pts[_keep]
                 _pts_h = np.hstack([_pts, np.ones((len(_pts), 1), dtype=np.float32)])
                 sc_data.append((_ln, torch.tensor(_pts_h, device=self.device)))
         self._sc_data = sc_data
         n_sc_pts = sum(p.shape[0] for _, p in sc_data)
 
-        _SC_MAX = 60
+        _SC_MAX = 40  # max SC points per finger group for SC pair detection
         finger_keys = ['if', 'mf', 'rf', 'th']
         _fcol = {}
         offset = 0
@@ -966,23 +1046,100 @@ class BatchedGraspOptimizer:
                 return [idx_list[int(k * step)] for k in range(_SC_MAX)]
             return idx_list
 
+        # Build per-link index for adjacency-aware SC pairs
+        _link_sc_idx = {}  # link_name -> list of SC point indices
+        offset_sc = 0
+        for nm, pts in sc_data:
+            n = pts.shape[0]
+            _link_sc_idx[nm] = list(range(offset_sc, offset_sc + n))
+            offset_sc += n
+
+        # Adjacent link pairs (physically connected — should NOT be checked)
+        _adjacent = {
+            ('palm', 'if_bs'), ('palm', 'mf_bs'), ('palm', 'rf_bs'), ('palm', 'th_mp'),
+            ('if_bs', 'if_px'), ('if_px', 'if_md'), ('if_md', 'if_ds'),
+            ('mf_bs', 'mf_px'), ('mf_px', 'mf_md'), ('mf_md', 'mf_ds'),
+            ('rf_bs', 'rf_px'), ('rf_px', 'rf_md'), ('rf_md', 'rf_ds'),
+            ('th_mp', 'th_bs'), ('th_bs', 'th_px'), ('th_px', 'th_ds'),
+        }
+        _prefix = f"leap_{self.hand}_"
+
+        # Build LINK-LEVEL SC pairs (not finger-level).
+        # Every non-adjacent link pair from different fingers is checked.
+        # This catches if_md↔mf_md overlap that finger-level grouping misses.
         self._self_col_pairs = []
-        fk_list = [k for k in finger_keys if k in _fcol]
-        for i in range(len(fk_list)):
-            for j in range(i + 1, len(fk_list)):
-                self._self_col_pairs.append((
-                    torch.tensor(_subsample(_fcol[fk_list[i]]), dtype=torch.long, device=self.device),
-                    torch.tensor(_subsample(_fcol[fk_list[j]]), dtype=torch.long, device=self.device),
-                ))
-        if palm_idx:
-            for fk in fk_list:
-                self._self_col_pairs.append((
-                    torch.tensor(_subsample(palm_idx), dtype=torch.long, device=self.device),
-                    torch.tensor(_subsample(_fcol[fk]), dtype=torch.long, device=self.device),
-                ))
+        all_link_names = [nm for nm, _ in sc_data]
+        for i in range(len(all_link_names)):
+            for j in range(i + 1, len(all_link_names)):
+                nm_i = all_link_names[i]
+                nm_j = all_link_names[j]
+                short_i = nm_i.replace(_prefix, '')
+                short_j = nm_j.replace(_prefix, '')
+                # Skip adjacent pairs
+                if (short_i, short_j) in _adjacent or (short_j, short_i) in _adjacent:
+                    continue
+                # Skip same-finger pairs (non-adjacent within same finger)
+                fi = short_i.split('_')[0] if '_' in short_i else short_i
+                fj = short_j.split('_')[0] if '_' in short_j else short_j
+                if fi == fj and fi != 'palm':
+                    continue
+                # This is a valid inter-finger, non-adjacent pair
+                idx_i = _link_sc_idx[nm_i]
+                idx_j = _link_sc_idx[nm_j]
+                if idx_i and idx_j:
+                    self._self_col_pairs.append((
+                        torch.tensor(idx_i, dtype=torch.long, device=self.device),
+                        torch.tensor(idx_j, dtype=torch.long, device=self.device),
+                    ))
 
         print(f"  Self-collision: {len(self._self_col_pairs)} pairs, {n_sc_pts} box pts "
-              f"(separate from {sum(p.shape[0] for _, p in col_data)} visual mesh pts)")
+              f"(separate from {sum(p.shape[0] for _, p in col_data)} collision pts)")
+
+        # ── Box-level self-collision data (for analytical box-box SDF) ──
+        # Store per-link box primitives: (link_name, [(center, rotation, half_extents)])
+        self._box_primitives = {}  # link_name -> list of (center_h, R, half) tensors
+        for _le in _tree_sc.getroot().findall("link"):
+            _ln = _le.get("name")
+            if _ln not in self.collision_link_names:
+                continue
+            boxes = []
+            for _col_elem in _le.findall("collision"):
+                _g = _col_elem.find("geometry")
+                if _g is None: continue
+                _b = _g.find("box")
+                if _b is None: continue
+                _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
+                _o = _col_elem.find("origin")
+                _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
+                _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
+                _R = ScipyR.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
+                # Store as homogeneous center + rotation + half-extents
+                center_h = np.array([*_p, 1.0], dtype=np.float32)
+                boxes.append((
+                    torch.tensor(center_h, device=self.device),
+                    torch.tensor(_R, dtype=torch.float32, device=self.device),
+                    torch.tensor([_sx/2, _sy/2, _sz/2], dtype=torch.float32, device=self.device),
+                ))
+            if boxes:
+                self._box_primitives[_ln] = boxes
+
+        # Build box-box SC pairs: all non-adjacent box pairs from different fingers
+        self._box_sc_pairs = []  # [(link_A, box_idx_A, link_B, box_idx_B)]
+        for nm_i in self._box_primitives:
+            for nm_j in self._box_primitives:
+                if nm_i >= nm_j: continue
+                short_i = nm_i.replace(_prefix, '')
+                short_j = nm_j.replace(_prefix, '')
+                if (short_i, short_j) in _adjacent or (short_j, short_i) in _adjacent:
+                    continue
+                fi = short_i.split('_')[0] if '_' in short_i else short_i
+                fj = short_j.split('_')[0] if '_' in short_j else short_j
+                if fi == fj and fi != 'palm':
+                    continue
+                for bi in range(len(self._box_primitives[nm_i])):
+                    for bj in range(len(self._box_primitives[nm_j])):
+                        self._box_sc_pairs.append((nm_i, bi, nm_j, bj))
+        print(f"  Box-box SC pairs: {len(self._box_sc_pairs)}")
 
     def _precompute_collision_points_mesh(self):
         """Fallback: sample collision points from visual meshes (for Allegro)."""
@@ -1108,6 +1265,116 @@ class BatchedGraspOptimizer:
                     torch.tensor(idx2, dtype=torch.long, device=self.device),
                 ))
 
+    # -- phase snapshot (for tracing optimisation) --------------------------
+    def _snapshot(self, tag, idx=0):
+        """Save a snapshot of a single environment's grasp state."""
+        with torch.no_grad():
+            q = self._u2q(self.u)
+            bT = self._base_T(self.pos, self.rot6d)
+            fk = self.chain.forward_kinematics(q)
+            tp, cp, _ = self._get_points(fk, bT)
+            ts = self.sdf.query(tp)
+            cs = self.sdf.query(cp)
+
+            # Extract scalar state for env idx
+            snap = {
+                "tag": tag,
+                "q_joints": q[idx].cpu().numpy(),
+                "base_pos": self.pos[idx].cpu().numpy(),
+                "base_rot": self._rot6d_to_matrix(self.rot6d[idx:idx+1])[0].cpu().numpy(),
+                "tip_sdf": ts[idx].cpu().numpy(),
+                "col_sdf": cs[idx].cpu().numpy(),
+                "tip_sdf_abs_mean": ts[idx].abs().mean().item(),
+                "col_min_sdf": cs[idx].min().item(),
+                "col_inside_pct": (cs[idx] < 0).float().mean().item() * 100,
+                "col_margin_violated": (self._col_margins - cs[idx] > 0).float().mean().item() * 100,
+            }
+            if not hasattr(self, '_phase_snapshots'):
+                self._phase_snapshots = []
+            self._phase_snapshots.append(snap)
+
+            # Palm orientation check
+            R_all = self._rot6d_to_matrix(self.rot6d)
+            palm_inward = R_all[:, :, 0]  # base +X = palm inward
+            B_check = min(self.num_envs, self.pos.shape[0])
+            if hasattr(self, '_obj_center'):
+                to_c = self._obj_center.unsqueeze(0) - self.pos[:B_check].detach()
+                to_c = to_c / to_c.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                dots = (palm_inward[:B_check] * to_c).sum(-1)
+                n_face = (dots > 0.3).sum().item()
+                n_away = (dots < -0.3).sum().item()
+            else:
+                n_face = n_away = -1
+                dots = torch.zeros(1)
+
+            print(f"  [SNAP] {tag}: tip_sdf={snap['tip_sdf_abs_mean']*1000:.1f}mm "
+                  f"col_inside={snap['col_inside_pct']:.1f}% "
+                  f"col_min={snap['col_min_sdf']*1000:.1f}mm "
+                  f"palm_facing={n_face}/{B_check} away={n_away}")
+
+            # Save best 10 grasps — use consistent ordering across all stages.
+            # _final_order is set once at the end of optimization and reused
+            # for all snapshots so the same grasp index = same grasp across stages.
+            if hasattr(self, '_final_order'):
+                order = self._final_order.cpu().numpy()
+            elif hasattr(self, '_opt_quality_order'):
+                order = self._opt_quality_order.cpu().numpy()
+            elif hasattr(self, '_act_sort_order'):
+                order = self._act_sort_order.cpu().numpy()
+            else:
+                order = np.arange(B_check)
+            # Pre-compute sigma_min for all envs if we have the needed data
+            sigma_min_all = None
+            if tag == "after_optimization" and hasattr(self, '_F_prim') and hasattr(self, '_ns'):
+                try:
+                    F_prim_snap = self._F_prim
+                    ns_snap = self._ns
+                    # Compute tip positions for 4 fingertips
+                    tp_fc = torch.stack([
+                        (bT @ fk[self.tip_link_names[fi]].get_matrix()
+                         @ torch.cat([self.tip_offsets[fi], torch.ones(1, device=self.device)]).unsqueeze(-1)
+                        ).squeeze(-1)[:, :3]
+                        for fi in range(4)], dim=1)  # [B, 4, 3]
+                    # Query SDF normals via finite differences
+                    eps_fd = 5e-4
+                    fd_o = torch.zeros(3, 3, device=self.device)
+                    for d3 in range(3): fd_o[d3, d3] = eps_fd
+                    gx = (self.sdf.query(tp_fc+fd_o[0]) - self.sdf.query(tp_fc-fd_o[0])) / (2*eps_fd)
+                    gy = (self.sdf.query(tp_fc+fd_o[1]) - self.sdf.query(tp_fc-fd_o[1])) / (2*eps_fd)
+                    gz = (self.sdf.query(tp_fc+fd_o[2]) - self.sdf.query(tp_fc-fd_o[2])) / (2*eps_fd)
+                    tn = -torch.stack([gx, gy, gz], dim=-1)
+                    tn = tn / tn.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    # Compute contact frames, grasp matrix, wrench matrix
+                    g_OCs = compute_contact_frames(tp_fc, tn)
+                    G = compute_grasp_matrix_torch(g_OCs)
+                    W = compute_wrench_matrix(G, F_prim_snap, 4, ns_snap)
+                    sigma_min_all = torch.linalg.svdvals(W)[:, -1]  # [B]
+                except Exception as e:
+                    print(f"  [SNAP] Warning: sigma_min computation failed: {e}")
+                    sigma_min_all = None
+
+            grasps = []
+            for rank in range(min(10, B_check)):
+                i = int(order[rank]) if rank < len(order) else rank
+                sm = sigma_min_all[i].item() if sigma_min_all is not None else 0.0
+                g_dict = {
+                    "q_joints": q[i].cpu().numpy(),
+                    "base_pos": self.pos[i].detach().cpu().numpy(),
+                    "base_rot": R_all[i].cpu().numpy(),
+                    "sigma_min": sm, "l_star": 0.0, "feasible": False,
+                }
+                if hasattr(self, '_init_surf_pts') and i < len(self._init_surf_pts):
+                    g_dict["surf_pt"] = self._init_surf_pts[i].numpy()
+                    g_dict["outward_normal"] = self._init_outward[i].numpy()
+                    g_dict["z_hat_init"] = self._init_z_hat[i].numpy()
+                g_dict["act_finger"] = int(self.amap[i, 0])
+                g_dict["env_idx"] = int(i)
+                grasps.append(g_dict)
+            save_dir = os.path.join(os.path.dirname(__file__), "../output/grasps")
+            os.makedirs(save_dir, exist_ok=True)
+            import torch as _t
+            _t.save(grasps, os.path.join(save_dir, f"stage_{tag}.pt"))
+
     # -- FK point extraction ----------------------------------------------
     def _get_points(self, fk, bT):
         dev = self.device
@@ -1117,7 +1384,7 @@ class BatchedGraspOptimizer:
             wT = bT @ fk[nm].get_matrix()  # [B, 4, 4]
             oh = torch.cat([self.tip_offsets[i], torch.ones(1, device=dev)])
             tips.append((wT @ oh.unsqueeze(-1)).squeeze(-1)[:, :3])
-            tip_x_axes.append(wT[:, :3, 0])  # x-axis column of rotation
+            tip_x_axes.append(-wT[:, :3, 0])  # -x of tip link = pad push direction
         # Add palm contact points if enabled (4 spread points for area contact)
         if self.palm_contact and self.palm_link in fk:
             wT_palm = bT @ fk[self.palm_link].get_matrix()
@@ -1126,8 +1393,8 @@ class BatchedGraspOptimizer:
                 palm_off_i = self.tip_offsets[4 + pi]
                 oh = torch.cat([palm_off_i, torch.ones(1, device=dev)])
                 tips.append((wT_palm @ oh.unsqueeze(-1)).squeeze(-1)[:, :3])
-                # Palm normal direction: -z in palm frame (inner surface faces -z)
-                tip_x_axes.append(-wT_palm[:, :3, 2])
+                # Palm contact normal: +x in base frame (inner surface faces +x)
+                tip_x_axes.append(wT_palm[:, :3, 0])
         cols = []
         for nm, local_pts in self._col_data:
             if nm in fk:
@@ -1182,13 +1449,11 @@ class BatchedGraspOptimizer:
         B, dev = self.num_envs, self.device
 
         if self.hand_type == "leap":
-            # Init with CMC spread + moderate curl.
-            # CMC > 0 spreads fingers outward from palm → helps wrapping.
-            # PIP/DIP at 0.7 for moderate curl reach.
+            # Seed: moderate curl for all fingers
             dq = torch.tensor(
-                [1.0, 0.0, 0.7, 0.7,   # IF: CMC=1.0 spreads outward
-                 1.0, 0.0, 0.7, 0.7,   # MF: same
-                 1.0, 0.0, 0.7, 0.7,   # RF: same
+                [1.0, 0.0, 0.7, 0.7,   # IF
+                 1.0, 0.0, 0.7, 0.7,   # MF
+                 1.0, 0.0, 0.7, 0.7,   # RF
                  1.0, 0.4, 0.7, 0.7],  # TH
                 device=dev,
             )
@@ -1210,87 +1475,95 @@ class BatchedGraspOptimizer:
         # 2. Get surface normals at those points
         # 3. Compute base pose that places palm inner surface AT each point
         with torch.no_grad():
-            verts_W = torch.tensor(self.sdf._verts_W, dtype=torch.float32, device=dev)
-            z_range = verts_W[:, 2].max() - verts_W[:, 2].min()
-            z_min = verts_W[:, 2].min()
+            # Sample surface points UNIFORMLY from the object mesh
+            # (not mesh vertices — vertices are non-uniformly distributed).
+            # Uses trimesh area-weighted sampling for uniform coverage.
+            obj_mesh_W = trimesh.Trimesh(
+                vertices=self.sdf._verts_W,
+                faces=self.sdf._faces)
+            n_pool = max(B * 4, 10000)  # oversample, then filter
+            pool_pts, _ = trimesh.sample.sample_surface(obj_mesh_W, n_pool)
+            pool_pts = torch.tensor(pool_pts, dtype=torch.float32, device=dev)
 
-            if act_positions is not None and len(act_positions) > 0:
-                # Bias palm placement toward actuation target height.
-                # Palm should be near the target so the actuation finger can
-                # reach it by curling, not by crossing through the object.
-                act_z = act_positions[0][2]  # z-height of first actuation target
-                # Sample from a band: target_z ± 40mm (within object bounds)
-                z_lo = max(z_min.item(), act_z - 0.04)
-                z_hi = min((z_min + z_range).item(), act_z + 0.04)
-                band_mask = (verts_W[:, 2] >= z_lo) & (verts_W[:, 2] <= z_hi)
-                # Also include some from the general body (lower 70%) for diversity
-                z_cutoff = z_min + 0.70 * z_range
-                body_mask = verts_W[:, 2] < z_cutoff
-                # 70% near actuation, 30% body region
-                n_act_sample = int(B * 0.7)
-                n_body_sample = B - n_act_sample
-                act_verts = verts_W[band_mask] if band_mask.sum() >= 100 else verts_W
-                body_verts = verts_W[body_mask] if body_mask.sum() >= 100 else verts_W
-                idx_a = torch.randint(0, act_verts.shape[0], (n_act_sample,), device=dev)
-                idx_b = torch.randint(0, body_verts.shape[0], (n_body_sample,), device=dev)
-                surf_pts = torch.cat([act_verts[idx_a], body_verts[idx_b]], dim=0)
-            else:
-                # No actuation: sample from body region (lower 70%)
-                z_cutoff = z_min + 0.70 * z_range
-                body_mask = verts_W[:, 2] < z_cutoff
-                body_verts = verts_W[body_mask] if body_mask.sum() >= B else verts_W
-                idx = torch.randint(0, body_verts.shape[0], (B,), device=dev)
-                surf_pts = body_verts[idx]
+            z_range = pool_pts[:, 2].max() - pool_pts[:, 2].min()
+            z_min = pool_pts[:, 2].min()
 
-            # Get outward normals at surface points via SDF gradient
+            # Uniform sampling, excluding the bottom 15% of the object
+            # (palm at the bottom is useless — object sits on table there).
+            z_cutoff = z_min + 0.15 * z_range
+            valid_mask = pool_pts[:, 2] > z_cutoff
+            valid_pts = pool_pts[valid_mask] if valid_mask.sum() >= B else pool_pts
+            idx = torch.randint(0, valid_pts.shape[0], (B,), device=dev)
+            surf_pts = valid_pts[idx]
+
+            # Get outward normals via SDF gradient (uniform points, not vertices)
             surf_pts_q = surf_pts.unsqueeze(1)  # [B, 1, 3]
             _, surf_normals = self.sdf.query_with_normals(surf_pts_q)
-            # query_with_normals returns INWARD normals, negate for outward
-            outward_normals = -surf_normals[:, 0, :]  # [B, 3]
+            outward_normals = -surf_normals[:, 0, :]  # negate inward to get outward
             outward_normals = F.normalize(outward_normals, dim=-1)
 
-            # Palm geometry (verified by FK at q=0):
-            #   Inner surface center in BASE frame: [0, 0.005, 0.05]
-            #   Palm inward direction in BASE frame: [0, 0, -1] (base -z)
-            #   So: base -z must point toward object (= inward normal = -outward)
-            #   Equivalently: base +z = outward normal (away from object)
-            # Contact point near finger bases (NOT deep in palm).
-            # The object rests where fingers can reach around it.
-            # In base frame at q=0: finger bases are at z≈0.09, palm inner at z≈0.05.
-            # Contact should be between them, closer to finger bases.
-            palm_contact_base = torch.tensor([0.0, 0.005, 0.095], device=dev)
+            # Palm contact face faces base +X (fingertip curl test: dot=0.989).
+            # In link frame, base +X = link -Z (R_palm^T @ [1,0,0] = [0,0,-1]).
+            # Contact center: area-weighted -Z face centers, link→base transformed.
+            palm_contact_base = torch.tensor([0.023, -0.000, 0.048], device=dev)
 
-            # Orientation: base z = outward normal (so palm inner face = -z faces object)
-            z_hat = outward_normals  # [B, 3]
+            # --- Structured sampling: (surface_point, distance, 1-of-4 rotations) ---
 
-            # y_hat: prefer OBB longest axis for finger spread along object
-            obb_long = self._obb_axes[:, 0]
-            y_hat = obb_long.unsqueeze(0).expand(B, -1).clone()
-            y_sign = 2.0 * (torch.rand(B, device=dev) > 0.5).float() - 1.0
-            y_hat = y_hat * y_sign.unsqueeze(-1)
-            y_hat = y_hat + 0.15 * torch.randn(B, 3, device=dev)
-            y_hat = y_hat - (y_hat * z_hat).sum(-1, keepdim=True) * z_hat
-            y_hat = F.normalize(y_hat, dim=-1)
-            x_hat = torch.cross(y_hat, z_hat, dim=-1)
-            x_hat = F.normalize(x_hat, dim=-1)
+            # Palm inward = base +X (verified: fingertip curl aligns 0.989 with +X).
+            # So base +X = toward object = -outward.
+            x_hat = -outward_normals  # [B, 3]
 
+            # Y-axis: one of 4 canonical choices from OBB axes.
+            # Project all 3 OBB axes onto the plane ⊥ x_hat.
+            obb_axes = self._obb_axes  # [3, 3]
+            projections = []
+            for ai in range(3):
+                ax = obb_axes[:, ai].unsqueeze(0).expand(B, -1)
+                proj = ax - (ax * x_hat).sum(-1, keepdim=True) * x_hat
+                proj_norm = proj.norm(dim=-1)
+                projections.append((proj, proj_norm))
+
+            norms = torch.stack([p[1] for p in projections], dim=-1)
+            _, top2_idx = norms.topk(2, dim=-1)
+
+            y_cand0 = torch.zeros(B, 3, device=dev)
+            y_cand1 = torch.zeros(B, 3, device=dev)
+            for b_idx in range(B):
+                i0, i1 = top2_idx[b_idx, 0].item(), top2_idx[b_idx, 1].item()
+                y_cand0[b_idx] = projections[i0][0][b_idx]
+                y_cand1[b_idx] = projections[i1][0][b_idx]
+            y_cand0 = F.normalize(y_cand0, dim=-1)
+            y_cand1 = F.normalize(y_cand1, dim=-1)
+
+            choice = torch.arange(B, device=dev) % 4
+            y_hat = torch.where((choice == 0).unsqueeze(-1), y_cand0,
+                    torch.where((choice == 1).unsqueeze(-1), -y_cand0,
+                    torch.where((choice == 2).unsqueeze(-1), y_cand1,
+                    -y_cand1)))
+
+            z_hat = torch.cross(x_hat, y_hat, dim=-1)
+            z_hat = F.normalize(z_hat, dim=-1)
             R_base = torch.stack([x_hat, y_hat, z_hat], dim=-1)  # [B, 3, 3]
 
-            # Place base so that palm INNER SURFACE contact point is at the surface:
-            # contact_world = R_base @ palm_contact_base + base_pos = surf_pt + margin * outward
-            margin = 0.000 + 0.003 * torch.rand(B, device=dev)  # 0-3mm outside surface
-            palm_target = surf_pts + margin.unsqueeze(-1) * outward_normals
-            contact_in_world = (R_base @ palm_contact_base.unsqueeze(-1)).squeeze(-1)
-            base_pos = palm_target - contact_in_world
+            d = 0.02 * torch.rand(B, device=dev)  # [0, 2cm]
+            target = surf_pts + d.unsqueeze(-1) * outward_normals
 
-        palm_pos = base_pos + 0.005 * torch.randn(B, 3, device=dev)
-        self.pos = palm_pos.detach().requires_grad_(True)
-
-        # 5) 6D rotation = [x_column, y_column] from the computed R_base
+        # 5) Store rotation (no noise — canonical poses are exact)
         r6d = torch.cat([x_hat, y_hat], dim=-1)
-        r6d = r6d + 0.05 * torch.randn_like(r6d)  # small noise to preserve palm orientation
-        self.rot6d = r6d.detach().requires_grad_(True)
-        self._rot6d_init = self.rot6d.detach().clone()  # for rotation regularization
+        self.rot6d = r6d.detach().requires_grad_(False)  # FROZEN
+
+        # 6) Position: exact, using the actual stored rotation
+        R_actual = self._rot6d_to_matrix(self.rot6d)
+        contact_in_world = (R_actual @ palm_contact_base.unsqueeze(-1)).squeeze(-1)
+        base_pos = target - contact_in_world
+        self.pos = base_pos.detach().requires_grad_(True)
+        self._rot6d_init = self.rot6d.detach().clone()
+
+        # Save init debug info (surface points, normals, z_hat) for visualization
+        self._init_surf_pts = surf_pts.detach().cpu()
+        self._obj_z_min = float(valid_pts[:, 2].min().item())
+        self._init_outward = outward_normals.detach().cpu()
+        self._init_z_hat = z_hat.detach().cpu()
 
         # Actuation-finger assignment
         self.amap = np.zeros((B, max(n_act, 1)), dtype=np.int64)
@@ -1303,96 +1576,269 @@ class BatchedGraspOptimizer:
         self.amap_t = torch.tensor(self.amap, dtype=torch.long, device=dev)
 
         # ================================================================
-        # POST-INIT: Verify collision-free and push out if needed.
-        # Use URDF BOX collision geometry (functional body, not visual mesh
-        # motor housings) for the init check. The boxes are the correct
-        # collision geometry from MuJoCo Menagerie.
+        # Actuation finger IK: position + pad direction
         # ================================================================
-        import xml.etree.ElementTree as _ET
-        from scipy.spatial.transform import Rotation as _ScipyR_init
-        _urdf_path = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}/leap.urdf")
-        if os.path.exists(_urdf_path) and self.hand_type == "leap":
-            _tree = _ET.parse(_urdf_path)
-            _root = _tree.getroot()
-            # Build box corner points per link (26 per box: corners+edges+faces)
-            _box_pts = {}
-            for _link_elem in _root.findall("link"):
-                _ln = _link_elem.get("name")
-                if _ln not in [nm for nm, _ in self._col_data]:
-                    continue
-                _pts_list = []
-                for _col in _link_elem.findall("collision"):
-                    _geom = _col.find("geometry")
-                    if _geom is None: continue
-                    _box = _geom.find("box")
-                    if _box is None: continue
-                    _sx, _sy, _sz = [float(x) for x in _box.get("size").split()]
-                    _half = np.array([_sx/2, _sy/2, _sz/2])
-                    _origin = _col.find("origin")
-                    _pos = np.array([float(x) for x in _origin.get("xyz", "0 0 0").split()])
-                    _rpy = np.array([float(x) for x in _origin.get("rpy", "0 0 0").split()])
-                    _R = _ScipyR_init.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
-                    # 8 corners
-                    for sx in [-1, 1]:
-                        for sy in [-1, 1]:
-                            for sz in [-1, 1]:
-                                _p = _R @ np.array([sx*_half[0], sy*_half[1], sz*_half[2]]) + _pos
-                                _pts_list.append(_p)
-                if _pts_list:
-                    _box_pts[_ln] = torch.tensor(np.array(_pts_list), dtype=torch.float32, device=dev)
+        if n_act and act_positions is not None:
+            act_pos = torch.tensor(act_positions[0], dtype=torch.float32, device=dev)
+            act_dir = None
+            if act_directions is not None and act_directions[0] is not None:
+                act_dir = F.normalize(
+                    torch.tensor(act_directions[0], dtype=torch.float32, device=dev), dim=0)
 
-            for push_iter in range(10):
+            # Optimize ONLY actuation finger joints (palm stays fixed).
+            u_act = self.u.detach().clone().requires_grad_(True)
+            opt_act = torch.optim.Adam([u_act], lr=0.05)
+
+            # Mask: only the actuation finger's 4 joints per env
+            act_joint_mask = torch.zeros(B, 16, device=dev, dtype=torch.bool)
+            for b in range(B):
+                fi = self.amap[b, 0]
+                act_joint_mask[b, fi*4:fi*4+4] = True
+
+            for ik_step in range(150):
+                opt_act.zero_grad()
+                q_ik = self._u2q(u_act)
+                bT_ik = self._base_T(self.pos.detach(), self.rot6d.detach())
+                fk_ik = self.chain.forward_kinematics(q_ik)
+
+                loss_ik = torch.zeros(B, device=dev)
+                for b_fi in range(4):
+                    mask_fi = (self.amap_t[:, 0] == b_fi)
+                    if not mask_fi.any():
+                        continue
+                    nm = self.tip_link_names[b_fi]
+                    wT_tip = bT_ik @ fk_ik[nm].get_matrix()
+                    off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
+                    tip_pos = (wT_tip @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                    tip_pad_dir = -wT_tip[:, :3, 0]  # -x of tip link = pad push direction
+
+                    pos_err = ((tip_pos - act_pos) ** 2).sum(-1)
+                    loss_ik += mask_fi.float() * 500 * pos_err
+
+                    if act_dir is not None:
+                        cos_align = (tip_pad_dir * act_dir).sum(-1)
+                        dir_err = (1.0 - cos_align) ** 2
+                        loss_ik += mask_fi.float() * 50 * dir_err
+
+                    # Actuation finger link collision (exclude ds = fingertip on surface)
+                    prefixes_ik = ['if', 'mf', 'rf', 'th']
+                    sfx_ik = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
+                    for suf in sfx_ik[b_fi]:
+                        lnm = f"leap_{self.hand}_{prefixes_ik[b_fi]}_{suf}"
+                        for cnm, lp in self._col_data:
+                            if cnm == lnm and lnm in fk_ik:
+                                lwT = bT_ik @ fk_ik[lnm].get_matrix()
+                                lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                lsdf = self.sdf.query(lwp)
+                                loss_ik += mask_fi.float() * 100 * F.relu(-lsdf).sum(-1)
+
+                # Don't change non-actuation joints
+                non_act_reg = ((u_act - self.u.detach()) ** 2 * (~act_joint_mask).float()).sum(-1)
+                loss_ik += 100 * non_act_reg
+
+                loss_ik.mean().backward()
                 with torch.no_grad():
-                    q_chk = self._u2q(self.u)
-                    bT_chk = self._base_T(self.pos, self.rot6d)
-                    fk_chk = self.chain.forward_kinematics(q_chk)
+                    u_act.grad[~act_joint_mask] = 0.0
+                opt_act.step()
 
-                    # Query SDF at box corners
-                    all_sdf = []
-                    for _ln, _bpts in _box_pts.items():
-                        if _ln not in fk_chk: continue
-                        _wT = bT_chk @ fk_chk[_ln].get_matrix()
-                        _bpts_h = torch.cat([_bpts, torch.ones(_bpts.shape[0], 1, device=dev)], -1)
-                        _wp = (_wT @ _bpts_h.T)[:, :3, :].transpose(1, 2)
-                        _sv = self.sdf.query(_wp)
-                        all_sdf.append(_sv)
-                    if all_sdf:
-                        all_sdf = torch.cat(all_sdf, dim=-1)
-                        worst_col = all_sdf.min(dim=-1).values
+            with torch.no_grad():
+                self.u = u_act.detach().requires_grad_(True)
 
-                        bad = worst_col < 0.0
-                        if not bad.any():
-                            break
+            # Report IK success
+            with torch.no_grad():
+                q_ik_final = self._u2q(self.u)
+                bT_final = self._base_T(self.pos, self.rot6d)
+                fk_final = self.chain.forward_kinematics(q_ik_final)
+                act_dists = torch.zeros(B, device=dev)
+                for b_fi in range(4):
+                    mask_fi = (self.amap_t[:, 0] == b_fi)
+                    if not mask_fi.any(): continue
+                    nm = self.tip_link_names[b_fi]
+                    wT_tip = bT_final @ fk_final[nm].get_matrix()
+                    off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
+                    tip_pos = (wT_tip @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                    act_dists += mask_fi.float() * torch.norm(tip_pos - act_pos, dim=-1)
+                n_close = (act_dists < 0.010).sum().item()
+                n_vclose = (act_dists < 0.005).sum().item()
+                print(f"  Actuation IK: {n_vclose}/{B} within 5mm, "
+                      f"{n_close}/{B} within 10mm, "
+                      f"median={act_dists.median()*1000:.1f}mm")
+                # Sort envs by actuation distance so best are saved first
+                self._act_sort_order = act_dists.argsort()
 
-                        # Position-dominant push-out: move base away from object.
-                        # Minimal finger curl — only as last resort.
-                        R_chk = self._rot6d_to_matrix(self.rot6d)
-                        z_hat_chk = R_chk[:, :, 2]  # outward normal
-                        push_amt = F.relu(-worst_col) * 0.5 + 0.003  # proportional + 3mm
-                        self.pos.data[bad] += push_amt[bad].unsqueeze(-1) * z_hat_chk[bad]
+        # ================================================================
+        # Co-optimize: palm tangent slide + actuation finger re-projection
+        # Goal: clear palm-back collision while keeping actuation finger on target.
+        # ================================================================
+        if n_act and act_positions is not None:
+            with torch.no_grad():
+                R_slide = self._rot6d_to_matrix(self.rot6d)
+                y_dir = R_slide[:, :, 1]
+                z_dir = R_slide[:, :, 2]
+                tangent_dirs = [y_dir, -y_dir, z_dir, -z_dir]
+                total_shift = torch.zeros(B, device=dev)
+                act_joint_mask = torch.zeros(B, 16, device=dev, dtype=torch.bool)
+                for b in range(B):
+                    fi = self.amap[b, 0]
+                    act_joint_mask[b, fi*4:fi*4+4] = True
 
-                        # Light curl only for PIP/DIP (not MCP — keep fingers extended)
-                        if push_iter >= 5:  # only curl after position push fails
-                            curl_joints = [2, 3, 6, 7, 10, 11, 14, 15]
-                            for j in curl_joints:
-                                self.u.data[bad, j] += 0.15
+            for co_step in range(30):
+                with torch.no_grad():
+                    # 1) Check palm-back + actuation finger collision
+                    q_s = self._u2q(self.u)
+                    bT_s = self._base_T(self.pos, self.rot6d)
+                    fk_s = self.chain.forward_kinematics(q_s)
+                    R_s = self._rot6d_to_matrix(self.rot6d)
+
+                    # Palm back-side points
+                    palm_pts_list = []
+                    for nm, lp in self._col_data:
+                        if "palm" not in nm: continue
+                        if nm in fk_s:
+                            wT = bT_s @ fk_s[nm].get_matrix()
+                            palm_pts_list.append((wT @ lp.T)[:, :3, :].transpose(1, 2))
+                    palm_pts = torch.cat(palm_pts_list, dim=1) if palm_pts_list else None
+
+                    # Actuation finger link points (all links except ds fingertip)
+                    prefixes_act = ['if', 'mf', 'rf', 'th']
+                    sfx_act = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]  # exclude ds (touching object)
+                    act_pts_list = []
+                    for b_fi in range(4):
+                        mask_fi = (self.amap_t[:, 0] == b_fi)
+                        if not mask_fi.any(): continue
+                        for suf in sfx_act[b_fi]:
+                            nm = f"leap_{self.hand}_{prefixes_act[b_fi]}_{suf}"
+                            for cnm, lp in self._col_data:
+                                if cnm == nm and nm in fk_s:
+                                    wT = bT_s @ fk_s[nm].get_matrix()
+                                    wp = (wT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    # Only include for envs where this is the actuation finger
+                                    act_pts_list.append((mask_fi, wp))
+
+                    # Compute min SDF across palm-back + actuation links
+                    if palm_pts is None: break
+                    palm_sdf = self.sdf.query(palm_pts)
+                    pts_bx = ((palm_pts - self.pos.unsqueeze(1)) * R_s[:, :, 0].unsqueeze(1)).sum(-1)
+                    palm_sdf_back = torch.where(pts_bx < 0.020, palm_sdf, torch.ones_like(palm_sdf))
+                    min_sdf = palm_sdf_back.min(dim=-1).values
+
+                    # Add actuation finger collision
+                    for mask_fi, wp in act_pts_list:
+                        act_sdf = self.sdf.query(wp).min(dim=-1).values  # [B]
+                        # Only affect envs where this finger is actuation
+                        min_sdf = torch.where(mask_fi, torch.minimum(min_sdf, act_sdf), min_sdf)
+
+                    colliding = min_sdf < 0
+                    if not colliding.any(): break
+
+                    # 2) Slide palm: try 4 tangent directions, pick best
+                    step_size = 0.002
+                    best_dir = torch.zeros(B, 3, device=dev)
+                    best_imp = torch.full((B,), -1e9, device=dev)
+                    for td in tangent_dirs:
+                        tp = self.pos.data + step_size * td
+                        bT_t = self._base_T(tp, self.rot6d)
+                        # Palm back SDF
+                        tps = []
+                        for nm, lp in self._col_data:
+                            if "palm" not in nm: continue
+                            if nm in fk_s:
+                                tps.append((bT_t @ fk_s[nm].get_matrix() @ lp.T)[:, :3, :].transpose(1, 2))
+                        tpp = torch.cat(tps, dim=1)
+                        ts = self.sdf.query(tpp)
+                        tbx = ((tpp - tp.unsqueeze(1)) * R_s[:, :, 0].unsqueeze(1)).sum(-1)
+                        test_min = torch.where(tbx < 0.020, ts, torch.ones_like(ts)).min(-1).values
+                        # Actuation finger SDF
+                        for mask_fi, wp_orig in act_pts_list:
+                            # wp moves with base position
+                            delta = step_size * td
+                            wp_shifted = wp_orig + delta.unsqueeze(1)
+                            act_s = self.sdf.query(wp_shifted).min(-1).values
+                            test_min = torch.where(mask_fi, torch.minimum(test_min, act_s), test_min)
+                        imp = test_min - min_sdf
+                        better = imp > best_imp
+                        best_imp[better] = imp[better]
+                        best_dir[better] = td[better]
+
+                    can_move = colliding & (total_shift < 0.05) & (best_imp > 0)
+                    self.pos.data[can_move] += step_size * best_dir[can_move]
+                    total_shift[can_move] += step_size
+
+                # 3a) Collision step: minimize actuation finger link collision
+                u_col = self.u.detach().clone().requires_grad_(True)
+                opt_col = torch.optim.Adam([u_col], lr=0.02)
+                for col_s in range(5):
+                    opt_col.zero_grad()
+                    q_c = self._u2q(u_col)
+                    bT_c = self._base_T(self.pos.detach(), self.rot6d.detach())
+                    fk_c = self.chain.forward_kinematics(q_c)
+                    loss_c = torch.zeros(B, device=dev)
+                    for b_fi in range(4):
+                        mask_fi = (self.amap_t[:, 0] == b_fi)
+                        if not mask_fi.any(): continue
+                        for suf in sfx_act[b_fi]:
+                            lnm = f"leap_{self.hand}_{prefixes_act[b_fi]}_{suf}"
+                            for cnm, lp in self._col_data:
+                                if cnm == lnm and lnm in fk_c:
+                                    lwT = bT_c @ fk_c[lnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    lsdf = self.sdf.query(lwp)
+                                    loss_c += mask_fi.float() * 200 * F.relu(-lsdf).sum(-1)
+                    loss_c.mean().backward()
+                    with torch.no_grad():
+                        u_col.grad[~act_joint_mask] = 0.0
+                    opt_col.step()
+                with torch.no_grad():
+                    self.u = u_col.detach().requires_grad_(True)
+
+                # 3b) Hard re-project: snap actuation fingertip back to target
+                u_snap = self.u.detach().clone().requires_grad_(True)
+                opt_snap = torch.optim.Adam([u_snap], lr=0.05)
+                for snap_s in range(10):
+                    opt_snap.zero_grad()
+                    q_sn = self._u2q(u_snap)
+                    bT_sn = self._base_T(self.pos.detach(), self.rot6d.detach())
+                    fk_sn = self.chain.forward_kinematics(q_sn)
+                    loss_sn = torch.zeros(B, device=dev)
+                    for b_fi in range(4):
+                        mask_fi = (self.amap_t[:, 0] == b_fi)
+                        if not mask_fi.any(): continue
+                        nm = self.tip_link_names[b_fi]
+                        wT = bT_sn @ fk_sn[nm].get_matrix()
+                        off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
+                        tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                        loss_sn += mask_fi.float() * 1000 * ((tp - act_pos) ** 2).sum(-1)
+                        if act_dir is not None:
+                            pad = -wT[:, :3, 0]
+                            loss_sn += mask_fi.float() * 100 * (1.0 - (pad * act_dir).sum(-1)) ** 2
+                    loss_sn.mean().backward()
+                    with torch.no_grad():
+                        u_snap.grad[~act_joint_mask] = 0.0
+                    opt_snap.step()
+                with torch.no_grad():
+                    self.u = u_snap.detach().requires_grad_(True)
 
             # Report
             with torch.no_grad():
                 q_f = self._u2q(self.u)
                 bT_f = self._base_T(self.pos, self.rot6d)
                 fk_f = self.chain.forward_kinematics(q_f)
-                all_sv = []
-                for _ln, _bpts in _box_pts.items():
-                    if _ln not in fk_f: continue
-                    _wT = bT_f @ fk_f[_ln].get_matrix()
-                    _bpts_h = torch.cat([_bpts, torch.ones(_bpts.shape[0], 1, device=dev)], -1)
-                    _wp = (_wT @ _bpts_h.T)[:, :3, :].transpose(1, 2)
-                    all_sv.append(self.sdf.query(_wp))
-                if all_sv:
-                    all_sv = torch.cat(all_sv, dim=-1)
-                    n_clean = (all_sv.min(-1).values > 0).sum().item()
-                    print(f"  Init collision check (boxes): {n_clean}/{B} clean after {push_iter+1} push iters")
+                pp_f = []
+                for nm, lp in self._col_data:
+                    if "palm" not in nm: continue
+                    if nm in fk_f:
+                        pp_f.append((bT_f @ fk_f[nm].get_matrix() @ lp.T)[:, :3, :].transpose(1, 2))
+                if pp_f:
+                    ppf = torch.cat(pp_f, dim=1)
+                    sf = self.sdf.query(ppf)
+                    bx = ((ppf - self.pos.unsqueeze(1)) * R_s[:, :, 0].unsqueeze(1)).sum(-1)
+                    sf_back = torch.where(bx < 0.020, sf, torch.ones_like(sf)).min(-1).values
+                    nc = (sf_back >= 0).sum().item()
+                    ns = (total_shift > 0.001).sum().item()
+                    print(f"  Palm slide+reproj: {nc}/{B} back-clean, {ns} shifted")
+
+        # Support finger curling + IK is done in optimize() after
+        # filtering to grasps where actuation IK succeeded.
 
     # -- main loop --------------------------------------------------------
     def optimize(
@@ -1404,6 +1850,9 @@ class BatchedGraspOptimizer:
         mu: float = 0.5,
         ns: int = 4,
         save_path: Optional[str] = None,
+        opt_sections: str = "ABCD",
+        opt_variant: str = "PGD",
+        trajectory_log: Optional[list] = None,
     ):
         """Optimise grasps using the FRoGGeR formulation.
 
@@ -1449,6 +1898,8 @@ class BatchedGraspOptimizer:
 
         # Precompute friction cone primitive forces
         F_prim = compute_primitive_forces_torch(ns, mu, device=dev)  # [3, ns]
+        self._F_prim = F_prim
+        self._ns = ns
 
         ap = torch.stack([torch.tensor(t[0], dtype=torch.float32, device=dev)
                           for t in actuation_targets]) if n_act else None
@@ -1465,35 +1916,1106 @@ class BatchedGraspOptimizer:
             ad = ad_list  # list of (3,) tensors or None per target
 
         obj_c = torch.tensor(object_center, dtype=torch.float32, device=dev)
+        self._obj_center = obj_c  # for palm orientation check in snapshots
+        self._snapshot("after_init")
+
+        # ================================================================
+        # Filter to actuation-successful candidates, then support finger IK
+        # ================================================================
+        if n_act and hasattr(self, '_act_sort_order'):
+            with torch.no_grad():
+                # Keep only grasps where actuation finger reached within 10mm
+                q_check = self._u2q(self.u)
+                bT_check = self._base_T(self.pos, self.rot6d)
+                fk_check = self.chain.forward_kinematics(q_check)
+                act_dists = torch.zeros(B, device=dev)
+                for b_fi in range(4):
+                    mask_fi = (self.amap_t[:, 0] == b_fi)
+                    if not mask_fi.any(): continue
+                    nm = self.tip_link_names[b_fi]
+                    wT = bT_check @ fk_check[nm].get_matrix()
+                    off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
+                    tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                    act_dists += mask_fi.float() * torch.norm(tp - ap[0], dim=-1)
+                good = act_dists < 0.010
+                n_good = good.sum().item()
+                print(f"  Actuation filter: {n_good}/{B} passed (<10mm)")
+
+            if n_good > 0:
+                # Diversify support finger CMC (abduction) to spread them apart.
+                # Each support finger gets a different angular sector.
+                jl = torch.tensor(_LEAP_JOINT_LOWER, device=dev)
+                jh = torch.tensor(_LEAP_JOINT_UPPER, device=dev)
+                with torch.no_grad():
+                    for b in range(B):
+                        if not good[b]: continue
+                        act_fi = self.amap[b, 0]
+                        sup_fingers = [fi for fi in range(4) if fi != act_fi]
+                        # Divide CMC range into 3 sectors for 3 support fingers
+                        cmc_full = (0.0, 1.5)  # full CMC range we use
+                        sector_size = (cmc_full[1] - cmc_full[0]) / 3
+                        for si, fi in enumerate(sup_fingers):
+                            j0 = fi * 4
+                            # CMC: each finger gets its own sector + small noise
+                            cmc_lo = cmc_full[0] + si * sector_size
+                            cmc_hi = cmc_lo + sector_size
+                            ranges = [
+                                (cmc_lo, cmc_hi),                  # CMC: dedicated sector
+                                (-0.3, 0.6),                       # MCP: slight flex
+                                (0.2, 1.3),                        # PIP: moderate curl
+                                (0.1, 1.0),                        # DIP: moderate curl
+                            ]
+                            for ji, (lo, hi) in enumerate(ranges):
+                                q_val = lo + (hi - lo) * torch.rand(1, device=dev)
+                                u_val = (q_val - jl[j0+ji]) / (jh[j0+ji] - jl[j0+ji])
+                                u_val = torch.log(u_val.clamp(1e-6, 1-1e-6) / (1 - u_val.clamp(1e-6, 1-1e-6)))
+                                self.u.data[b, j0+ji] = u_val.item()
+
+                # Support finger IK: minimize SDF + avoid actuation finger.
+                u_sup = self.u.detach().clone().requires_grad_(True)
+                opt_sup = torch.optim.Adam([u_sup], lr=0.03)
+
+                sup_joint_mask = torch.zeros(B, 16, device=dev, dtype=torch.bool)
+                sup_finger_mask = torch.zeros(B, 4, device=dev, dtype=torch.bool)
+                for b in range(B):
+                    if not good[b]: continue
+                    act_fi = self.amap[b, 0]
+                    for fi in range(4):
+                        if fi != act_fi:
+                            sup_joint_mask[b, fi*4:fi*4+4] = True
+                            sup_finger_mask[b, fi] = True
+
+                for ik_step in range(200):
+                    opt_sup.zero_grad()
+                    q_ik = self._u2q(u_sup)
+                    bT_ik = self._base_T(self.pos.detach(), self.rot6d.detach())
+                    fk_ik = self.chain.forward_kinematics(q_ik)
+
+                    # Mid-way re-randomize: if any support finger still overlaps
+                    # actuation after 100 steps, re-roll its curl
+                    if ik_step == 100:
+                        with torch.no_grad():
+                            sc_check = self._get_sc_points(fk_ik, bT_ik)
+                            if sc_check is not None:
+                                fidx_check = {}
+                                soff = 0
+                                for nm, pts in self._sc_data:
+                                    n = pts.shape[0]
+                                    for ffi in range(4):
+                                        for s in suffix_list[ffi]:
+                                            if f'_{prefixes[ffi]}_{s}' in nm:
+                                                fidx_check.setdefault(ffi, []).extend(range(soff, soff+n))
+                                    soff += n
+                                for b in range(B):
+                                    if not good[b]: continue
+                                    act_fi = self.amap[b, 0]
+                                    if act_fi not in fidx_check: continue
+                                    act_p = sc_check[b, fidx_check[act_fi]]
+                                    for fi in range(4):
+                                        if fi == act_fi or fi not in fidx_check: continue
+                                        sup_p = sc_check[b, fidx_check[fi]]
+                                        d = torch.cdist(sup_p.unsqueeze(0), act_p.unsqueeze(0))[0].min()
+                                        if d < 0.008:  # still overlapping
+                                            j0 = fi * 4
+                                            for ji in range(4):
+                                                lo, hi = ranges[ji]
+                                                qv = lo + (hi - lo) * torch.rand(1, device=dev)
+                                                uv = (qv - jl[j0+ji]) / (jh[j0+ji] - jl[j0+ji])
+                                                uv = torch.log(uv.clamp(1e-6, 1-1e-6) / (1-uv.clamp(1e-6, 1-1e-6)))
+                                                u_sup.data[b, j0+ji] = uv.item()
+                            # Re-init optimizer after re-roll
+                            opt_sup = torch.optim.Adam([u_sup], lr=0.03)
+                            continue
+
+                    # Get actuation finger tip position for proximity check
+                    act_tip_pos = torch.zeros(B, 3, device=dev)
+                    for b_fi in range(4):
+                        mf = (self.amap_t[:, 0] == b_fi)
+                        if not mf.any(): continue
+                        nm_a = self.tip_link_names[b_fi]
+                        wT_a = bT_ik @ fk_ik[nm_a].get_matrix()
+                        off_a = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
+                        act_tip_pos[mf] = (wT_a @ off_a.unsqueeze(-1)).squeeze(-1)[mf, :3]
+
+                    loss_sup = torch.zeros(B, device=dev)
+                    for fi in range(4):
+                        nm = self.tip_link_names[fi]
+                        wT = bT_ik @ fk_ik[nm].get_matrix()
+                        off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                        tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                        tp_sdf = self.sdf.query(tp.unsqueeze(1)).squeeze(1)
+
+                        # If support tip is near actuation tip, INCREASE its SDF target
+                        # so it seeks a different surface point further away
+                        dist_to_act_tip = torch.norm(tp - act_tip_pos, dim=-1)
+                        too_close = (dist_to_act_tip < 0.030) & sup_finger_mask[:, fi]
+                        # For too-close fingers: penalize being near act, not SDF
+                        sdf_loss = torch.where(too_close,
+                            F.relu(0.030 - dist_to_act_tip) ** 2 * 5.0,  # push away from act
+                            tp_sdf ** 2)  # normal SDF loss
+
+                        below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
+                        loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
+
+                    # Support finger link collision + below-object penalty
+                    prefixes = ['if', 'mf', 'rf', 'th']
+                    suffix_list = [['bs', 'px', 'md', 'ds']] * 3 + [['mp', 'bs', 'px', 'ds']]
+                    for fi in range(4):
+                        if not sup_finger_mask[:, fi].any(): continue
+                        for suf in suffix_list[fi]:
+                            ln = f"leap_{self.hand}_{prefixes[fi]}_{suf}"
+                            # Below-object check (link origin)
+                            if ln in fk_ik:
+                                lp = (bT_ik @ fk_ik[ln].get_matrix())[:, :3, 3]
+                                below = F.relu(self._obj_z_min - lp[:, 2]) ** 2
+                                loss_sup += sup_finger_mask[:, fi].float() * 1000 * below
+                            # Link collision (exclude ds = fingertip touching surface)
+                            if suf in ('bs', 'px', 'md', 'mp'):
+                                for cnm, clp in self._col_data:
+                                    if cnm == ln and ln in fk_ik:
+                                        lwT = bT_ik @ fk_ik[ln].get_matrix()
+                                        lwp = (lwT @ clp.T)[:, :3, :].transpose(1, 2)
+                                        lsdf = self.sdf.query(lwp)
+                                        col_pen = F.relu(-lsdf).sum(-1)
+                                        loss_sup += sup_finger_mask[:, fi].float() * 50 * col_pen
+
+                    # Support vs actuation finger repulsion using SC box points.
+                    # _sc_data has box keypoints per link — much better than origins.
+                    sc_pts_world = self._get_sc_points(fk_ik, bT_ik)  # [B, N_sc, 3]
+                    if sc_pts_world is not None:
+                        # Build index mapping: which SC points belong to which finger
+                        prefixes = ['if', 'mf', 'rf', 'th']
+                        suffix_list = [['bs', 'px', 'md', 'ds']] * 3 + [['mp', 'bs', 'px', 'ds']]
+                        finger_sc_ranges = {}  # fi -> list of (start, end) in SC point array
+                        sc_offset = 0
+                        for nm, pts in self._sc_data:
+                            n = pts.shape[0]
+                            for fi in range(4):
+                                for suf in suffix_list[fi]:
+                                    if f"_{prefixes[fi]}_{suf}" in nm:
+                                        finger_sc_ranges.setdefault(fi, []).append((sc_offset, sc_offset + n))
+                            sc_offset += n
+
+                        for fi in range(4):
+                            if not sup_finger_mask[:, fi].any(): continue
+                            sup_ranges = finger_sc_ranges.get(fi, [])
+                            if not sup_ranges: continue
+                            sup_idx = []
+                            for s, e in sup_ranges:
+                                sup_idx.extend(range(s, e))
+                            sup_pts = sc_pts_world[:, sup_idx]  # [B, n_sup, 3]
+
+                            # Get actuation finger SC points
+                            for b_fi in range(4):
+                                mask_fi = (self.amap_t[:, 0] == b_fi)
+                                if not mask_fi.any(): continue
+                                act_ranges = finger_sc_ranges.get(b_fi, [])
+                                if not act_ranges: continue
+                                act_idx = []
+                                for s, e in act_ranges:
+                                    act_idx.extend(range(s, e))
+                                act_pts = sc_pts_world[:, act_idx]  # [B, n_act, 3]
+
+                                # Sum of penalties across ALL close pairs (not just min)
+                                dists = torch.cdist(sup_pts, act_pts)  # [B, n_sup, n_act]
+                                pair_pen = F.relu(0.020 - dists) ** 2  # [B, n_sup, n_act]
+                                repulsion = pair_pen.sum(dim=(-2, -1))  # [B]
+                                loss_sup += (sup_finger_mask[:, fi] & mask_fi).float() * 50 * repulsion
+
+                    # Spread support fingertips apart + diverse normals
+                    sup_tips = []
+                    sup_normals = []
+                    for fi in range(4):
+                        nm = self.tip_link_names[fi]
+                        wT = bT_ik @ fk_ik[nm].get_matrix()
+                        off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                        tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                        sup_tips.append(tp)
+                        # Tip SDF normal (surface normal where the tip touches)
+                        _, tn = self.sdf.query_with_normals(tp.unsqueeze(1))
+                        sup_normals.append(tn[:, 0])  # inward normal
+                    sup_tips = torch.stack(sup_tips, dim=1)  # [B, 4, 3]
+                    sup_normals = torch.stack(sup_normals, dim=1)  # [B, 4, 3]
+
+                    # Pairwise tip distance: penalize support tips being too close
+                    for fi in range(4):
+                        for fj in range(fi + 1, 4):
+                            both_sup = sup_finger_mask[:, fi] & sup_finger_mask[:, fj]
+                            if not both_sup.any(): continue
+                            td = torch.norm(sup_tips[:, fi] - sup_tips[:, fj], dim=-1)
+                            loss_sup += both_sup.float() * 300 * F.relu(0.04 - td) ** 2
+
+                    # Normal diversity: penalize parallel normals between support fingers
+                    for fi in range(4):
+                        for fj in range(fi + 1, 4):
+                            both_sup = sup_finger_mask[:, fi] & sup_finger_mask[:, fj]
+                            if not both_sup.any(): continue
+                            ndot = (sup_normals[:, fi] * sup_normals[:, fj]).sum(-1)
+                            # Penalize high similarity (dot > 0.5 = within 60°)
+                            loss_sup += both_sup.float() * 30 * F.relu(ndot - 0.3) ** 2
+
+                    # Don't change actuation finger or non-good envs
+                    act_reg = ((u_sup - self.u.detach()) ** 2 * (~sup_joint_mask).float()).sum(-1)
+                    loss_sup += 200 * act_reg
+
+                    loss_sup.mean().backward()
+                    with torch.no_grad():
+                        u_sup.grad[~sup_joint_mask] = 0.0
+                    opt_sup.step()
+
+                with torch.no_grad():
+                    self.u = u_sup.detach().requires_grad_(True)
+
+                # Report
+                with torch.no_grad():
+                    q_f = self._u2q(self.u)
+                    bT_f = self._base_T(self.pos, self.rot6d)
+                    fk_f = self.chain.forward_kinematics(q_f)
+                    sup_sdfs = []
+                    for fi in range(4):
+                        nm = self.tip_link_names[fi]
+                        wT = bT_f @ fk_f[nm].get_matrix()
+                        off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                        tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                        sup_sdfs.append(self.sdf.query(tp.unsqueeze(1)).squeeze(1).abs())
+                    all_sdf = torch.stack(sup_sdfs, dim=1)
+                    mean_sdf = all_sdf[good].mean(-1) if good.any() else torch.zeros(1)
+                    n_touch = (mean_sdf < 0.005).sum().item()
+                    print(f"  Support IK ({n_good} candidates): {n_touch} with mean SDF < 5mm, "
+                          f"median={mean_sdf.median()*1000:.1f}mm")
+
+        self._snapshot("after_support_ik")
+
+        # ================================================================
+        # Optimization: improve grasp quality on filtered candidates
+        # Frozen: palm pose, actuation finger. Optimized: 3 support fingers.
+        # ================================================================
+        if n_act and hasattr(self, '_act_sort_order'):
+            with torch.no_grad():
+                # Filter: actuation < 10mm, mean tip SDF < 15mm
+                q_filt = self._u2q(self.u)
+                bT_filt = self._base_T(self.pos, self.rot6d)
+                fk_filt = self.chain.forward_kinematics(q_filt)
+                act_d = torch.zeros(B, device=dev)
+                tip_sdf_mean = torch.zeros(B, device=dev)
+                for b_fi in range(4):
+                    mask_fi = (self.amap_t[:, 0] == b_fi)
+                    if not mask_fi.any(): continue
+                    nm = self.tip_link_names[b_fi]
+                    wT = bT_filt @ fk_filt[nm].get_matrix()
+                    off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
+                    tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                    act_d += mask_fi.float() * torch.norm(tp - ap[0], dim=-1)
+                for fi in range(4):
+                    nm = self.tip_link_names[fi]
+                    wT = bT_filt @ fk_filt[nm].get_matrix()
+                    off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                    tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                    s = self.sdf.query(tp.unsqueeze(1)).squeeze(1).abs()
+                    tip_sdf_mean += s / 4
+                # Also check: no support link deeper than -5mm
+                worst_sup_link = torch.zeros(B, device=dev)
+                for fi in range(4):
+                    for ci, (cnm, lp) in enumerate(self._col_data):
+                        is_sup = False
+                        for suf in (['bs','px','md'] if fi < 3 else ['mp','bs','px']):
+                            if cnm == f"leap_{self.hand}_{['if','mf','rf','th'][fi]}_{suf}":
+                                is_sup = True
+                        if not is_sup or cnm not in fk_filt: continue
+                        lwT = bT_filt @ fk_filt[cnm].get_matrix()
+                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                        lsdf = self.sdf.query(lwp).min(-1).values
+                        # Only for envs where this is a support finger
+                        for b in range(B):
+                            if self.amap[b, 0] != fi:
+                                worst_sup_link[b] = torch.minimum(worst_sup_link[b], lsdf[b])
+
+                # Also check actuation finger link collision (not just support)
+                worst_act_link = torch.zeros(B, device=dev)
+                for fi in range(4):
+                    for cnm, lp in self._col_data:
+                        is_act_link = False
+                        for suf in (['bs','px','md'] if fi < 3 else ['mp','bs','px']):
+                            if cnm == f"leap_{self.hand}_{['if','mf','rf','th'][fi]}_{suf}":
+                                is_act_link = True
+                        if not is_act_link or cnm not in fk_filt: continue
+                        lwT = bT_filt @ fk_filt[cnm].get_matrix()
+                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                        lsdf = self.sdf.query(lwp).min(-1).values
+                        for b in range(B):
+                            if self.amap[b, 0] == fi:
+                                worst_act_link[b] = torch.minimum(worst_act_link[b], lsdf[b])
+
+                opt_mask = ((act_d < 0.010) & (tip_sdf_mean < 0.015)
+                           & (worst_sup_link > -0.005) & (worst_act_link > -0.005))
+                n_opt = opt_mask.sum().item()
+                n_act_filtered = ((worst_act_link <= -0.005) & (act_d < 0.010)).sum().item()
+                print(f"  Optimization candidates: {n_opt}/{B} ({n_act_filtered} filtered by act collision)")
+
+            if n_opt > 0:
+                # Build support masks
+                opt_joint_mask = torch.zeros(B, 16, device=dev, dtype=torch.bool)
+                sup_finger_mask_opt = torch.zeros(B, 4, device=dev, dtype=torch.bool)
+                for b in range(B):
+                    if not opt_mask[b]: continue
+                    act_fi = self.amap[b, 0]
+                    for fi in range(4):
+                        if fi != act_fi:
+                            opt_joint_mask[b, fi*4:fi*4+4] = True
+                            sup_finger_mask_opt[b, fi] = True
+
+                prefixes_opt = ['if', 'mf', 'rf', 'th']
+                sfx_no_ds = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
+                sfx_all = [['bs', 'px', 'md', 'ds']] * 3 + [['mp', 'bs', 'px', 'ds']]
+
+                u_opt = self.u.detach().clone().requires_grad_(True)
+                opt_adam = torch.optim.Adam([u_opt], lr=0.005)
+
+                # Pre-compute support finger collision link names
+                prefixes_opt = ['if', 'mf', 'rf', 'th']
+                sfx_no_ds = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
+                sfx_all = [['bs', 'px', 'md', 'ds']] * 3 + [['mp', 'bs', 'px', 'ds']]
+
+                # Pre-compute: which _col_data entries belong to each support finger
+                sup_col_idx = {}  # fi -> list of (col_data_index, link_name)
+                for fi in range(4):
+                    sup_col_idx[fi] = []
+                    for ci, (cnm, lp) in enumerate(self._col_data):
+                        for suf in sfx_no_ds[fi]:
+                            if cnm == f"leap_{self.hand}_{prefixes_opt[fi]}_{suf}":
+                                sup_col_idx[fi].append((ci, cnm))
+
+                # ============================================================
+                # Optimization loop: dispatch based on opt_variant
+                # "PGD" = original projected gradient descent
+                # "A"   = soft penalty Adam (sections A+B+C+D)
+                # "B"   = min-k unified surface/collision
+                # "C"   = min-k with adaptive FC contacts
+                # ============================================================
+                opt_steps = min(steps, 300)
+                eps_fd = 5e-4
+                fd_ofst = torch.zeros(3, 3, device=dev)
+                for d3 in range(3): fd_ofst[d3, d3] = eps_fd
+                sigma = torch.zeros(B, device=dev)
+
+                # Pre-compute ds (fingertip) collision indices for variants B/C
+                sup_col_idx_ds = {}  # fi -> list of (col_data_index, link_name) for ds links
+                for fi in range(4):
+                    sup_col_idx_ds[fi] = []
+                    ds_suf = 'ds'
+                    cnm_ds = f"leap_{self.hand}_{prefixes_opt[fi]}_{ds_suf}"
+                    for ci, (cnm, lp) in enumerate(self._col_data):
+                        if cnm == cnm_ds:
+                            sup_col_idx_ds[fi].append((ci, cnm))
+
+                if opt_variant in ("A", "B", "C"):
+                    # ── Simple Adam loop (all variants A/B/C) ──
+                    opt_adam = torch.optim.Adam([u_opt], lr=0.005)
+                    fc_start_step = 100
+                    fc_weight = 1.0
+                    mink_k = 10  # number of lowest SDF points for variants B/C
+                    print(f"  Variant {opt_variant} Adam optimization ({opt_steps} steps)")
+
+                    for opt_step in range(opt_steps):
+                        opt_adam.zero_grad()
+                        q_o = self._u2q(u_opt)
+                        bT_o = self._base_T(self.pos.detach(), self.rot6d.detach())
+                        fk_o = self.chain.forward_kinematics(q_o)
+
+                        total_loss = torch.zeros(B, device=dev)
+
+                        # ── Section A: Surface loss ──
+                        if opt_variant == "A":
+                            # Original: SDF(tip_offset)^2 for each support finger
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                nm = self.tip_link_names[fi]
+                                wT = bT_o @ fk_o[nm].get_matrix()
+                                off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                                tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
+                                total_loss += sup_finger_mask_opt[:, fi].float() * 500 * tip_sdf ** 2
+
+                        elif opt_variant in ("B", "C"):
+                            # Min-k unified: for ds links, query ALL collision points,
+                            # take k lowest |SDF|, loss = sum(SDF^2) — pulls tips to surface
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                # ds (fingertip) link: min-k SDF^2 (both push out AND pull in)
+                                for ci, cnm in sup_col_idx_ds[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm not in fk_o: continue
+                                    lwT = bT_o @ fk_o[cnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)  # [B, N, 3]
+                                    lsdf = self.sdf.query(lwp)  # [B, N]
+                                    # Take k points with lowest |SDF| (closest to surface)
+                                    k = min(mink_k, lsdf.shape[1])
+                                    _, topk_idx = lsdf.abs().topk(k, dim=1, largest=False)
+                                    topk_sdf = lsdf.gather(1, topk_idx)  # [B, k]
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 200 * (topk_sdf ** 2).sum(dim=1)
+
+                        # ── Section B: Collision loss ──
+                        if opt_variant == "A":
+                            # Original: relu(-SDF) for non-ds links
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                for ci, cnm in sup_col_idx[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm in fk_o:
+                                        lwT = bT_o @ fk_o[cnm].get_matrix()
+                                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                        lsdf = self.sdf.query(lwp)
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
+
+                        elif opt_variant in ("B", "C"):
+                            # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
+                            # Only push OUT, don't pull in (these links shouldn't touch)
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                for ci, cnm in sup_col_idx[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm not in fk_o: continue
+                                    lwT = bT_o @ fk_o[cnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    lsdf = self.sdf.query(lwp)  # [B, N]
+                                    k = min(mink_k, lsdf.shape[1])
+                                    _, topk_idx = lsdf.topk(k, dim=1, largest=False)  # lowest SDF
+                                    topk_sdf = lsdf.gather(1, topk_idx)
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 500 * (F.relu(-topk_sdf) ** 2).sum(dim=1)
+
+                        # ── Section C: Force closure (σ_min) ──
+                        if opt_step >= fc_start_step:
+                            all_tips = torch.stack([
+                                (bT_o @ fk_o[self.tip_link_names[fi]].get_matrix()
+                                 @ torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)]).unsqueeze(-1)
+                                ).squeeze(-1)[:, :3]
+                                for fi in range(4)], dim=1)
+                            palm_pt = None
+                            if self.palm_contact and self.palm_link in fk_o:
+                                wT_palm = bT_o @ fk_o[self.palm_link].get_matrix()
+                                palm_oh = torch.cat([self.palm_offset, torch.ones(1, device=dev)])
+                                palm_pt = (wT_palm @ palm_oh.unsqueeze(-1)).squeeze(-1)[:, :3]
+
+                            for act_fi in range(4):
+                                group_mask = opt_mask & (self.amap_t[:, 0] == act_fi)
+                                if not group_mask.any(): continue
+                                sup_fi = [fi for fi in range(4) if fi != act_fi]
+
+                                if opt_variant == "C":
+                                    # Variant C: use min-k contact point as FC location
+                                    fc_pts = []
+                                    for fi in sup_fi:
+                                        # Find collision point with lowest |SDF| on ds link
+                                        best_pt = all_tips[:, fi]  # fallback to tip offset
+                                        for ci, cnm in sup_col_idx_ds[fi]:
+                                            lp = self._col_data[ci][1]
+                                            if cnm not in fk_o: continue
+                                            lwT = bT_o @ fk_o[cnm].get_matrix()
+                                            lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                            lsdf = self.sdf.query(lwp)  # [B, N]
+                                            # Index of point with lowest |SDF| per env
+                                            min_idx = lsdf.abs().argmin(dim=1)  # [B]
+                                            best_pt = lwp[torch.arange(B, device=dev), min_idx]  # [B, 3]
+                                        fc_pts.append(best_pt)
+                                else:
+                                    # Variants A, B: use fixed tip offset
+                                    fc_pts = [all_tips[:, fi] for fi in sup_fi]
+
+                                if palm_pt is not None:
+                                    fc_pts.append(palm_pt)
+                                nc_fc = len(fc_pts)
+                                tp_fc = torch.stack(fc_pts, dim=1)
+                                gx = (self.sdf.query(tp_fc+fd_ofst[0])-self.sdf.query(tp_fc-fd_ofst[0]))/(2*eps_fd)
+                                gy = (self.sdf.query(tp_fc+fd_ofst[1])-self.sdf.query(tp_fc-fd_ofst[1]))/(2*eps_fd)
+                                gz = (self.sdf.query(tp_fc+fd_ofst[2])-self.sdf.query(tp_fc-fd_ofst[2]))/(2*eps_fd)
+                                tn = -torch.stack([gx,gy,gz],dim=-1)
+                                tn = tn / tn.norm(dim=-1,keepdim=True).clamp(min=1e-8)
+                                g_OCs = compute_contact_frames(tp_fc, tn)
+                                G = compute_grasp_matrix_torch(g_OCs)
+                                W = compute_wrench_matrix(G, F_prim, nc_fc, ns)
+                                s = torch.linalg.svdvals(W)[:, -1]
+                                sigma[group_mask] = s[group_mask].detach()
+                                total_loss += group_mask.float() * fc_weight * (-s)
+
+                        # ── Section D: Inter-finger self-collision ──
+                        sc_pts = self._get_sc_points(fk_o, bT_o)
+                        if sc_pts is not None:
+                            for sc_i1, sc_i2 in self._self_col_pairs:
+                                d = torch.cdist(sc_pts[:, sc_i1], sc_pts[:, sc_i2])
+                                min_d = d.min(-1).values.min(-1).values
+                                total_loss += opt_mask.float() * 200 * F.relu(0.005 - min_d) ** 2
+
+                        # Freeze non-support joints
+                        total_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
+
+                        total_loss.mean().backward()
+                        with torch.no_grad():
+                            u_opt.grad[~opt_joint_mask] = 0.0
+                        opt_adam.step()
+
+                        # ── Logging + trajectory ──
+                        if opt_step % 50 == 0:
+                            with torch.no_grad():
+                                q_e = self._u2q(u_opt)
+                                bT_e = self._base_T(self.pos, self.rot6d)
+                                fk_e = self.chain.forward_kinematics(q_e)
+                                sup_sdf = []
+                                for fi in range(4):
+                                    nm = self.tip_link_names[fi]
+                                    wT = bT_e @ fk_e[nm].get_matrix()
+                                    off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                                    tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                    sup_sdf.append(self.sdf.query(tp.unsqueeze(1)).squeeze(1).abs())
+                                sup_sdf = torch.stack(sup_sdf, dim=1)
+                                se = sup_sdf[opt_mask].mean().item() if opt_mask.any() else 0
+                                sig_val = sigma[opt_mask].mean().item() if opt_mask.any() else 0
+                                print(f"    [{opt_variant}] step {opt_step}: surf={se*1000:.1f}mm sigma={sig_val:.4f}")
+                                if trajectory_log is not None:
+                                    trajectory_log.append({
+                                        "step": opt_step,
+                                        "surface_mm": se * 1000,
+                                        "sigma": sig_val,
+                                    })
+
+                else:
+                    # ── Original PGD optimization ──
+                    lr_fc = 0.01
+                    lr_proj = 0.02
+                    proj_iters = 2
+                    print(f"  PGD optimization ({opt_steps} steps, lr_fc={lr_fc}, proj={proj_iters}x{lr_proj})")
+
+                    for opt_step in range(opt_steps):
+                        bT_o = self._base_T(self.pos.detach(), self.rot6d.detach())
+
+                        # Phase A: FC gradient step
+                        u_opt.requires_grad_(True)
+                        q_o = self._u2q(u_opt)
+                        fk_o = self.chain.forward_kinematics(q_o)
+
+                        fc_loss = torch.zeros(B, device=dev)
+                        all_tips = torch.stack([
+                            (bT_o @ fk_o[self.tip_link_names[fi]].get_matrix()
+                             @ torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)]).unsqueeze(-1)
+                            ).squeeze(-1)[:, :3]
+                            for fi in range(4)], dim=1)
+                        palm_pt = None
+                        if self.palm_contact and self.palm_link in fk_o:
+                            wT_palm = bT_o @ fk_o[self.palm_link].get_matrix()
+                            palm_oh = torch.cat([self.palm_offset, torch.ones(1, device=dev)])
+                            palm_pt = (wT_palm @ palm_oh.unsqueeze(-1)).squeeze(-1)[:, :3]
+
+                        for act_fi in range(4):
+                            group_mask = opt_mask & (self.amap_t[:, 0] == act_fi)
+                            if not group_mask.any(): continue
+                            sup_fi = [fi for fi in range(4) if fi != act_fi]
+                            fc_pts = [all_tips[:, fi] for fi in sup_fi]
+                            if palm_pt is not None:
+                                fc_pts.append(palm_pt)
+                            nc_fc = len(fc_pts)
+                            tp_fc = torch.stack(fc_pts, dim=1)
+                            gx = (self.sdf.query(tp_fc+fd_ofst[0])-self.sdf.query(tp_fc-fd_ofst[0]))/(2*eps_fd)
+                            gy = (self.sdf.query(tp_fc+fd_ofst[1])-self.sdf.query(tp_fc-fd_ofst[1]))/(2*eps_fd)
+                            gz = (self.sdf.query(tp_fc+fd_ofst[2])-self.sdf.query(tp_fc-fd_ofst[2]))/(2*eps_fd)
+                            tn = -torch.stack([gx,gy,gz],dim=-1)
+                            tn = tn / tn.norm(dim=-1,keepdim=True).clamp(min=1e-8)
+                            g_OCs = compute_contact_frames(tp_fc, tn)
+                            G = compute_grasp_matrix_torch(g_OCs)
+                            W = compute_wrench_matrix(G, F_prim, nc_fc, ns)
+                            s = torch.linalg.svdvals(W)[:, -1]
+                            sigma[group_mask] = s[group_mask].detach()
+                            fc_loss += group_mask.float() * (-s)
+
+                        fc_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
+
+                        fc_loss.mean().backward()
+                        with torch.no_grad():
+                            grad_fc = u_opt.grad.clone()
+                            grad_fc[~opt_joint_mask] = 0.0
+
+                        # Tangent projection
+                        u_tang = u_opt.detach().requires_grad_(True)
+                        q_tang = self._u2q(u_tang)
+                        fk_tang = self.chain.forward_kinematics(q_tang)
+                        surf_sq = torch.zeros(B, device=dev)
+                        for fi in range(4):
+                            if not sup_finger_mask_opt[:, fi].any(): continue
+                            nm = self.tip_link_names[fi]
+                            wT = bT_o @ fk_tang[nm].get_matrix()
+                            off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                            tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                            tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
+                            surf_sq += sup_finger_mask_opt[:, fi].float() * tip_sdf ** 2
+                        surf_sq.mean().backward()
+                        with torch.no_grad():
+                            grad_surf = u_tang.grad.clone()
+                            grad_surf[~opt_joint_mask] = 0.0
+                            dot = (grad_fc * grad_surf).sum(-1, keepdim=True)
+                            surf_sq_norm = (grad_surf * grad_surf).sum(-1, keepdim=True).clamp(min=1e-12)
+                            grad_tangent = grad_fc - (dot / surf_sq_norm) * grad_surf
+                            u_opt = (u_opt.detach() - lr_fc * grad_tangent).detach()
+
+                        # Phase B: Project onto constraints
+                        for pi in range(proj_iters):
+                            u_opt.requires_grad_(True)
+                            q_p = self._u2q(u_opt)
+                            fk_p = self.chain.forward_kinematics(q_p)
+                            bT_p = bT_o
+
+                            proj_loss = torch.zeros(B, device=dev)
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                nm = self.tip_link_names[fi]
+                                wT = bT_p @ fk_p[nm].get_matrix()
+                                off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                                tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
+                                proj_loss += sup_finger_mask_opt[:, fi].float() * 500 * tip_sdf ** 2
+
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                for ci, cnm in sup_col_idx[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm in fk_p:
+                                        lwT = bT_p @ fk_p[cnm].get_matrix()
+                                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                        lsdf = self.sdf.query(lwp)
+                                        proj_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(-lsdf).max(-1).values ** 2
+
+                            sc_pts = self._get_sc_points(fk_p, bT_p)
+                            if sc_pts is not None:
+                                for sc_i1, sc_i2 in self._self_col_pairs:
+                                    d = torch.cdist(sc_pts[:, sc_i1], sc_pts[:, sc_i2])
+                                    min_d = d.min(-1).values.min(-1).values
+                                    proj_loss += opt_mask.float() * 100 * F.relu(0.005 - min_d) ** 2
+
+                            proj_loss += 500 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
+
+                            proj_loss.mean().backward()
+                            with torch.no_grad():
+                                u_opt.grad[~opt_joint_mask] = 0.0
+                                u_opt = (u_opt - lr_proj * u_opt.grad).detach()
+
+                        # Logging
+                        if opt_step % 50 == 0:
+                            with torch.no_grad():
+                                q_e = self._u2q(u_opt)
+                                bT_e = self._base_T(self.pos, self.rot6d)
+                                fk_e = self.chain.forward_kinematics(q_e)
+                                sup_sdf = []
+                                for fi in range(4):
+                                    nm = self.tip_link_names[fi]
+                                    wT = bT_e @ fk_e[nm].get_matrix()
+                                    off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                                    tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                    sup_sdf.append(self.sdf.query(tp.unsqueeze(1)).squeeze(1).abs())
+                                sup_sdf = torch.stack(sup_sdf, dim=1)
+                                se = sup_sdf[opt_mask].mean().item() if opt_mask.any() else 0
+                                sig_val = sigma[opt_mask].mean().item() if opt_mask.any() else 0
+                                print(f"    pgd {opt_step}: surf={se*1000:.1f}mm sigma={sig_val:.4f}")
+                                if trajectory_log is not None:
+                                    trajectory_log.append({
+                                        "step": opt_step,
+                                        "surface_mm": se * 1000,
+                                        "sigma": sig_val,
+                                    })
+
+                with torch.no_grad():
+                    self.u = u_opt.detach().requires_grad_(True)
+
+                # Rank by combined quality: low surface SDF + low collision + high σ_min
+                with torch.no_grad():
+                    q_rank = self._u2q(self.u)
+                    bT_rank = self._base_T(self.pos, self.rot6d)
+                    fk_rank = self.chain.forward_kinematics(q_rank)
+                    rank_score = torch.full((B,), -1e9, device=dev)
+                    for b in range(B):
+                        if not opt_mask[b]: continue
+                        act_fi = self.amap[b, 0]
+                        # Support tip surface quality (lower = better)
+                        tip_err = 0
+                        for fi in range(4):
+                            if fi == act_fi: continue
+                            nm = self.tip_link_names[fi]
+                            wT = bT_rank @ fk_rank[nm].get_matrix()
+                            off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                            tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[b, :3]
+                            tip_err += self.sdf.query(tp.reshape(1,1,3)).abs().item()
+                        # Support link collision (lower = better)
+                        col_count = 0
+                        for fi in range(4):
+                            if fi == act_fi: continue
+                            for ci, cnm in sup_col_idx[fi]:
+                                lp = self._col_data[ci][1]
+                                if cnm in fk_rank:
+                                    lwT = bT_rank @ fk_rank[cnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[b:b+1, :3, :].transpose(1, 2)
+                                    lsv = self.sdf.query(lwp)
+                                    col_count += (lsv < 0).sum().item()
+                        # Score: higher = better
+                        rank_score[b] = -tip_err * 100 - col_count * 0.01
+                        if sigma is not None:
+                            rank_score[b] += sigma[b].item() * 10
+
+                    self._opt_quality_order = rank_score.argsort(descending=True)
+                    self._final_order = self._opt_quality_order.clone()
+                    top5 = self._opt_quality_order[:5]
+                    print(f"  Top 5 quality scores: {[f'{rank_score[i].item():.2f}' for i in top5]}")
+
+                self._snapshot("after_optimization")
+
+            # ==============================================================
+            # Final evaluation: rank by σ_min + l* + feasibility
+            # ==============================================================
+            with torch.no_grad():
+                q_final = self._u2q(self.u)
+                bT_final = self._base_T(self.pos, self.rot6d)
+                fk_final = self.chain.forward_kinematics(q_final)
+
+                # Tip positions + collision points
+                tp_final, cp_final, tip_x_final = self._get_points(fk_final, bT_final)
+                ts_final = self.sdf.query(tp_final)
+                cs_final = self.sdf.query(cp_final)
+
+                # FC from 3 support fingertips + palm per actuation group
+                all_tips_final = tp_final[:, :4]  # [B, 4, 3]
+                palm_pt_final = None
+                if self.palm_contact and self.palm_link in fk_final:
+                    wT_palm = bT_final @ fk_final[self.palm_link].get_matrix()
+                    palm_oh = torch.cat([self.palm_offset, torch.ones(1, device=dev)])
+                    palm_pt_final = (wT_palm @ palm_oh.unsqueeze(-1)).squeeze(-1)[:, :3]
+
+                eps_fd = 5e-4
+                fd_o = torch.zeros(3, 3, device=dev)
+                for d3 in range(3): fd_o[d3, d3] = eps_fd
+
+                sigma_all = torch.zeros(B, device=dev)
+                final_lstars = np.full(B, -1.0)
+                for act_fi in range(4):
+                    group = opt_mask & (self.amap_t[:, 0] == act_fi)
+                    if not group.any(): continue
+                    sup_fi = [fi for fi in range(4) if fi != act_fi]
+                    fc_pts = [all_tips_final[:, fi] for fi in sup_fi]
+                    if palm_pt_final is not None:
+                        fc_pts.append(palm_pt_final)
+                    nc_fc = len(fc_pts)
+                    tp_fc = torch.stack(fc_pts, dim=1)
+
+                    gx = (self.sdf.query(tp_fc+fd_o[0])-self.sdf.query(tp_fc-fd_o[0]))/(2*eps_fd)
+                    gy = (self.sdf.query(tp_fc+fd_o[1])-self.sdf.query(tp_fc-fd_o[1]))/(2*eps_fd)
+                    gz = (self.sdf.query(tp_fc+fd_o[2])-self.sdf.query(tp_fc-fd_o[2]))/(2*eps_fd)
+                    sdf_grad = torch.stack([gx, gy, gz], dim=-1)
+                    tip_normals = -sdf_grad / sdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+                    g_OCs = compute_contact_frames(tp_fc, tip_normals)
+                    G = compute_grasp_matrix_torch(g_OCs)
+                    W = compute_wrench_matrix(G, F_prim, nc_fc, ns)
+                    s = torch.linalg.svdvals(W)[:, -1]
+                    sigma_all[group] = s[group]
+
+                    # l* via LP for this group
+                    W_np = W.cpu().numpy()
+                    ls, _, _, _ = solve_min_weight_lp_batch(W_np)
+                    for b in range(B):
+                        if group[b]:
+                            final_lstars[b] = ls[b]
+
+                final_lstars_t = torch.tensor(final_lstars, dtype=torch.float32, device=dev)
+                final_lstars_t = torch.tensor(final_lstars, dtype=torch.float32, device=dev)
+
+                # Surface error: max |SDF| across support fingers
+                surf_err = ts_final[:, :4].abs().max(dim=-1).values  # [B]
+
+                # Collision: margin-adjusted violations
+                col_violation = F.relu(self._col_margins - cs_final)
+                max_col_viol = col_violation.max(-1).values
+
+                # Self-collision
+                sc_cp = self._get_sc_points(fk_final, bT_final)
+                sc_min_d = torch.full((B,), 1.0, device=dev)
+                if sc_cp is not None:
+                    for sc_i1, sc_i2 in self._self_col_pairs:
+                        d = torch.cdist(sc_cp[:, sc_i1], sc_cp[:, sc_i2])
+                        pair_min = d.reshape(B, -1).min(-1).values
+                        sc_min_d = torch.minimum(sc_min_d, pair_min)
+
+                # Actuation distance
+                act_dist = torch.full((B,), 999.0, device=dev)
+                if n_act and ap is not None:
+                    for j in range(n_act):
+                        fi = self.amap_t[:, j]
+                        act_dist = torch.norm(tp_final[torch.arange(B, device=dev), fi] - ap[j], dim=-1)
+
+                # Feasibility: only candidates that passed opt_mask + quality checks
+                feasible = (opt_mask
+                            & (surf_err < 0.005)  # 5mm surface tolerance
+                            & (max_col_viol < 0.002)  # 2mm collision margin
+                            & (sc_min_d > 0.001)  # 1mm self-collision
+                            & (sigma_all > 0.01))  # force closure
+                if n_act:
+                    feasible = feasible & (act_dist < 0.010)  # 10mm actuation
+
+                # Wrapping quality (fingertips only)
+                wrap_dirs = F.normalize(tp_fc - obj_c.unsqueeze(0).unsqueeze(0), dim=-1)
+                wrap_balance = wrap_dirs.sum(dim=1).norm(dim=-1)
+                wrap_quality = 1.0 - wrap_balance.clamp(max=1.5) / 1.5
+
+                # Composite ranking: l* first (the authoritative FC metric), then σ_min
+                # Grasps with l*>0 are strictly preferred over l*=-1
+                has_lstar = final_lstars_t > 0
+                rank_score = torch.where(
+                    feasible & has_lstar,
+                    10.0 + final_lstars_t + 0.3 * wrap_quality,  # l*>0 grasps rank highest
+                    torch.where(
+                        feasible,
+                        sigma_all + 0.3 * wrap_quality,  # feasible but no l*
+                        torch.tensor(-10.0, device=dev) + sigma_all - 5.0 * surf_err - 10.0 * max_col_viol,
+                    ),
+                )
+                order = rank_score.argsort(descending=True)
+                self._final_order = order.clone()
+
+                n_feasible = feasible.sum().item()
+                n_fc = (sigma_all > 0.01).sum().item()
+                n_lstar = has_lstar.sum().item()
+                n_surf_ok = (surf_err < 0.005).sum().item()
+                n_col_ok = (max_col_viol < 0.002).sum().item()
+                print(f"\n  === Optimization Results ===")
+                print(f"  {n_feasible}/{n_opt} feasible | l*>0: {n_lstar} | σ>0.01: {n_fc} | "
+                      f"surf<5mm: {n_surf_ok} | col<2mm: {n_col_ok}")
+                bi = order[0].item()
+                print(f"  Best: idx={bi} σ_min={sigma_all[bi]:.4f} l*={final_lstars[bi]:.4f} "
+                      f"surf={surf_err[bi]*1000:.1f}mm col={max_col_viol[bi]*1000:.1f}mm")
+
+                # Build result list
+                R_all = self._rot6d_to_matrix(self.rot6d)
+                feas_order = order[feasible[order]]
+                infeas_order = order[~feasible[order]]
+                final_order = torch.cat([feas_order, infeas_order])
+
+                res = []
+                for i in range(min(10, len(final_order))):
+                    ix = final_order[i].item()
+                    if not opt_mask[ix]:
+                        continue
+                    res.append({
+                        "q_joints": q_final[ix].cpu().numpy(),
+                        "base_pos": self.pos[ix].detach().cpu().numpy(),
+                        "base_rot": R_all[ix].cpu().numpy(),
+                        "score": float(rank_score[ix]),
+                        "l_star": float(final_lstars[ix]),
+                        "l_bar": float(4 * ns * final_lstars[ix]),
+                        "feasible": bool(feasible[ix]),
+                        "act_assignment": self.amap[ix].tolist(),
+                        "act_dist": float(act_dist[ix]) if n_act else 0.0,
+                        "surf_err": float(surf_err[ix]),
+                        "min_col": float(cs_final[ix].min()),
+                        "sigma_min": float(sigma_all[ix]),
+                        "sc_min_dist": float(sc_min_d[ix]),
+                    })
+                    # Add init metadata
+                    if hasattr(self, '_init_surf_pts') and ix < len(self._init_surf_pts):
+                        res[-1]["surf_pt"] = self._init_surf_pts[ix].numpy()
+                        res[-1]["outward_normal"] = self._init_outward[ix].numpy()
+                    res[-1]["act_finger"] = int(self.amap[ix, 0])
+                    res[-1]["env_idx"] = int(ix)
+
+            # Post-solve box-grid verification
+            if self.hand_type == "leap" and res:
+                from scipy.spatial.transform import Rotation as _ScipyR
+                from scipy.spatial import cKDTree as _cKDTree
+                import xml.etree.ElementTree as _ET_v
+                _urdf_v = os.path.join(os.path.dirname(__file__),
+                                       f"../models/leap_{self.hand}/leap.urdf")
+                _tree_v = _ET_v.parse(_urdf_v)
+                _vp = 0.005  # 5mm verification grid
+                _verify_pts = {}
+                for _le in _tree_v.getroot().findall("link"):
+                    _ln = _le.get("name")
+                    _lpts = []
+                    for _cel in _le.findall("collision"):
+                        _g = _cel.find("geometry")
+                        if _g is None: continue
+                        _b = _g.find("box")
+                        if _b is None: continue
+                        _sz = [float(x) for x in _b.get("size").split()]
+                        _o = _cel.find("origin")
+                        _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
+                        _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
+                        _R = (_ScipyR.from_euler("xyz", _rpy).as_matrix()
+                              if np.any(np.abs(_rpy) > 1e-6) else np.eye(3))
+                        hx, hy, hz = _sz[0]/2, _sz[1]/2, _sz[2]/2
+                        gx = np.arange(-hx, hx + _vp/2, _vp)
+                        gy = np.arange(-hy, hy + _vp/2, _vp)
+                        gz = np.arange(-hz, hz + _vp/2, _vp)
+                        grid = np.stack(np.meshgrid(gx, gy, gz, indexing='ij'),
+                                        axis=-1).reshape(-1, 3)
+                        grid = ((_R @ grid.T).T + _p).astype(np.float32)
+                        _lpts.append(grid)
+                    if _lpts:
+                        _verify_pts[_ln] = np.vstack(_lpts)
+
+                _adj = {('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
+                        ('if_bs','if_px'),('if_px','if_md'),('if_md','if_ds'),
+                        ('mf_bs','mf_px'),('mf_px','mf_md'),('mf_md','mf_ds'),
+                        ('rf_bs','rf_px'),('rf_px','rf_md'),('rf_md','rf_ds'),
+                        ('th_mp','th_bs'),('th_bs','th_px'),('th_px','th_ds')}
+
+                print(f"\n  === BOX-GRID VERIFICATION (5mm) ===")
+                for i, r in enumerate(res):
+                    q_v = torch.tensor(r["q_joints"], dtype=torch.float32, device=dev).unsqueeze(0)
+                    fk_v = self.chain.forward_kinematics(q_v)
+                    bT_v = np.eye(4)
+                    bT_v[:3, :3] = r["base_rot"]; bT_v[:3, 3] = r["base_pos"]
+
+                    total_v = 0; total_pen = 0; worst_sdf = 0.0; worst_link = ""
+                    for nm, pts in _verify_pts.items():
+                        if nm not in fk_v: continue
+                        lt = fk_v[nm].get_matrix()[0].detach().cpu().numpy()
+                        wT = bT_v @ lt
+                        pw = (wT[:3, :3] @ pts.T).T + wT[:3, 3]
+                        sv = self.sdf.query(
+                            torch.tensor(pw, dtype=torch.float32, device=dev).unsqueeze(0)
+                        )[0].cpu().numpy()
+                        total_v += len(sv)
+                        n_pen = (sv < -0.001).sum()
+                        total_pen += n_pen
+                        link_worst = sv.min()
+                        if link_worst < worst_sdf:
+                            worst_sdf = link_worst
+                            worst_link = nm.split("leap_rh_")[-1] if "leap_rh_" in nm else nm
+
+                    pct = 100 * total_pen / total_v if total_v > 0 else 0
+                    r["mesh_pen_pct"] = pct
+                    r["mesh_pen_worst"] = float(worst_sdf)
+                    if pct > 5.0:
+                        r["feasible"] = False
+
+                    # Self-collision check (box points)
+                    _lv_col = {}
+                    for _cnm, _cpts in self._col_data:
+                        if _cnm in fk_v:
+                            _cwT = bT_v @ fk_v[_cnm].get_matrix()[0].detach().cpu().numpy()
+                            _cp_np = _cpts[:, :3].cpu().numpy()
+                            _lv_col[_cnm] = (_cwT[:3, :3] @ _cp_np.T).T + _cwT[:3, 3]
+                    worst_sc = 999.0; sc_bad = []
+                    _lnames = sorted(_lv_col.keys())
+                    for _ii in range(len(_lnames)):
+                        if len(_lv_col[_lnames[_ii]]) < 2: continue
+                        _tree_sc = _cKDTree(_lv_col[_lnames[_ii]])
+                        for _jj in range(_ii + 1, len(_lnames)):
+                            if len(_lv_col[_lnames[_jj]]) < 2: continue
+                            _ni = _lnames[_ii].split('leap_rh_')[-1]
+                            _nj = _lnames[_jj].split('leap_rh_')[-1]
+                            if (_ni, _nj) in _adj or (_nj, _ni) in _adj: continue
+                            # Skip same-finger pairs (non-adjacent but still same finger)
+                            _fi = _ni.split('_')[0] if '_' in _ni else _ni
+                            _fj = _nj.split('_')[0] if '_' in _nj else _nj
+                            if _fi == _fj and _fi != 'palm': continue
+                            _dd, _ = _tree_sc.query(_lv_col[_lnames[_jj]], k=1)
+                            _md = _dd.min()
+                            if _md < worst_sc: worst_sc = _md
+                            if _md < 0.003: sc_bad.append(f"{_ni}-{_nj}")
+                    r["sc_worst"] = float(worst_sc)
+                    if worst_sc < 0.0005:
+                        r["feasible"] = False
+
+                    f_tag = "FEAS" if r["feasible"] else "FAIL"
+                    sc_str = f"sc={worst_sc*1000:.1f}mm" if worst_sc < 999 else ""
+                    sc_bad_str = f" [{','.join(sc_bad[:3])}]" if sc_bad else ""
+                    print(f"    G{i} [{f_tag}] σ={r['sigma_min']:.4f} l*={r['l_star']:.4f} "
+                          f"surf={r['surf_err']*1000:.1f}mm pen={pct:.1f}%@{worst_link} "
+                          f"{sc_str}{sc_bad_str}")
+
+            if save_path is not None:
+                import torch as _torch
+                os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+                _torch.save(res, save_path)
+                print(f"  Results saved to {save_path}")
+            return res
+
+        # No candidates passed entry criteria — return empty
+        print("  WARNING: No candidates passed entry criteria for optimization")
+        if save_path is not None:
+            import torch as _torch
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            _torch.save([], save_path)
+        return []
 
         # -- Phase 0: Two-stage warm-start ---
-        # Stage A: FREEZE base, optimize JOINTS only (batched IK: curl fingers)
-        # Stage B: Optimize BASE POSITION only (approach object, bring palm near)
+        # Stage A: FREEZE base, optimize JOINTS to reach target positions
+        #   (IK-guided: each finger gets a target on the object surface)
+        # Stage B: Optimize BASE POSITION only (approach object)
         p0_steps = steps // 5
         p0a = p0_steps * 2 // 3  # joints
         p0b = p0_steps - p0a      # base approach
 
-        # Stage A: joints only
+        # Compute finger target positions: surface points spread around the object.
+        # For each env, the palm approach direction is known from init. Place
+        # finger targets at ~90° and ~180° from palm direction on the surface.
+        with torch.no_grad():
+            R_init = self._rot6d_to_matrix(self.rot6d)
+            palm_inward = R_init[:, :, 0]  # base +X = toward object
+            palm_inward_xy = F.normalize(palm_inward[:, :2], dim=-1)  # [B, 2]
+
+            # 4 target angles relative to palm approach: 90°, 135°, 180°, -90°
+            # This spreads fingers around the object
+            verts_W = torch.tensor(self.sdf._verts_W, dtype=torch.float32, device=dev)
+            finger_targets = []  # [4] list of [B, 3] targets
+            angles = [1.57, 2.36, 3.14, -1.57]  # radians from palm direction
+            for angle in angles:
+                cos_a = torch.cos(torch.tensor(angle, device=dev))
+                sin_a = torch.sin(torch.tensor(angle, device=dev))
+                # Rotate palm direction by angle in xy plane
+                target_dir_x = palm_inward_xy[:, 0] * cos_a - palm_inward_xy[:, 1] * sin_a
+                target_dir_y = palm_inward_xy[:, 0] * sin_a + palm_inward_xy[:, 1] * cos_a
+                target_dir = torch.stack([target_dir_x, target_dir_y], dim=-1)  # [B, 2]
+
+                # Find closest surface point in that direction from object center
+                # Offset from center in target direction, then project to surface
+                search_pt = obj_c[:2].unsqueeze(0) + 0.05 * target_dir  # 5cm out
+                search_3d = torch.cat([search_pt, obj_c[2:].unsqueeze(0).expand(B, -1)], -1)
+                # Project to nearest surface point
+                _, tgt_normals = self.sdf.query_with_normals(search_3d.unsqueeze(1))
+                tgt_sdf = self.sdf.query(search_3d.unsqueeze(1)).squeeze(1)
+                tgt_pts = search_3d - tgt_sdf.unsqueeze(-1) * tgt_normals[:, 0]
+                finger_targets.append(tgt_pts)  # [B, 3]
+
+        # Stage A: joints only, guided by finger targets + collision
         opt0a = torch.optim.Adam([self.u], lr=lr * 3.0)
+        aB = torch.arange(B, device=dev)
         for s in range(p0a):
             opt0a.zero_grad()
             q = self._u2q(self.u)
             bT = self._base_T(self.pos, self.rot6d)
             fk = self.chain.forward_kinematics(q)
-            tp, _, _ = self._get_points(fk, bT)
+            tp, cp, _ = self._get_points(fk, bT)
             ts = self.sdf.query(tp)
+            cs = self.sdf.query(cp)
+
+            # Surface: get tips near SDF=0
             ts_abs = ts.abs()
             loss0 = 500 * ((ts ** 2).sum(-1) + 5 * ts_abs.sum(-1)
                            + 20 * ts_abs.max(dim=-1).values ** 2
                            + 10 * ts_abs.max(dim=-1).values)
+            # Collision: prevent joints from bending links through object
+            pen0a = F.relu(-cs)  # zero margin
+            loss0 += 1000 * pen0a.max(-1).values + 200 * pen0a.mean(-1)
+            # Finger targets: guide each finger toward its target position
+            for fi in range(min(4, tp.shape[1])):
+                tgt = finger_targets[fi]  # [B, 3]
+                loss0 += 100 * ((tp[:, fi] - tgt) ** 2).sum(-1)
+            # Actuation target (stronger for the actuation finger)
             if n_act and ap is not None:
                 for j in range(n_act):
                     fi = self.amap_t[:, j]
-                    loss0 += 200 * ((tp[torch.arange(B, device=dev), fi] - ap[j]) ** 2).sum(-1)
+                    loss0 += 300 * ((tp[aB, fi] - ap[j]) ** 2).sum(-1)
             loss0.mean().backward()
             opt0a.step()
 
-        # Stage B: base approach with collision
+        # Stage B: base approach with collision.
+        # Use ZERO margins here — the approach step should not push the palm
+        # into the object at all. The per-link margins (-5mm palm, -1mm tips)
+        # are for final optimization where exact contact matters.
         opt0b = torch.optim.Adam([self.pos], lr=lr * 2.0)
         for s in range(p0b):
             opt0b.zero_grad()
@@ -1507,7 +3029,7 @@ class BatchedGraspOptimizer:
             loss0 = 500 * ((ts ** 2).sum(-1) + 5 * ts_abs.sum(-1)
                            + 20 * ts_abs.max(dim=-1).values ** 2
                            + 10 * ts_abs.max(dim=-1).values)
-            pen0 = F.relu(self._col_margins - cs)
+            pen0 = F.relu(-cs)  # zero margin: any penetration penalized
             loss0 += 2000 * pen0.max(-1).values + 500 * pen0.mean(-1)
             loss0.mean().backward()
             opt0b.step()
@@ -1519,12 +3041,13 @@ class BatchedGraspOptimizer:
             tp0, _, _ = self._get_points(fk0, bT0)
             ts0 = self.sdf.query(tp0)
             print(f"  P0 done ({p0_steps} steps). Mean tip SDF: {ts0.abs().mean():.4f}")
+        self._snapshot("after_P0")
 
         # -- Phase 1: Get fingertips onto surface -------------------------
         p1_steps = steps * 2 // 5
         # All DOF: joints + position + rotation. The routing fix should
         # prevent the palm from going through the middle now.
-        opt1 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr)
+        opt1 = torch.optim.Adam([self.u, self.pos], lr=lr)  # rot6d frozen
         sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, p1_steps, lr * 0.1)
         aB = torch.arange(B, device=dev)
 
@@ -1535,9 +3058,11 @@ class BatchedGraspOptimizer:
         # but link bodies penetrate.
         n_col_links = self._n_col_links
         col_link_ranges = self._col_link_ranges
-        col_lambda = torch.full((B, n_col_links), 5000.0, device=dev)
-        col_rho = 20000.0
-        AL_UPDATE_EVERY = 25
+        # AL multipliers: start at 0 and grow. This is how AL is SUPPOSED to work.
+        # Previous code started at 5000-10000 which killed surface contact.
+        col_lambda = torch.full((B, n_col_links), 500.0, device=dev)
+        col_rho = 10000.0
+        AL_UPDATE_EVERY = 10
 
         t0 = time.time()
         for s in range(p1_steps):
@@ -1549,33 +3074,26 @@ class BatchedGraspOptimizer:
             ts = self.sdf.query(tp)
             cs = self.sdf.query(cp)
 
-            # Surface: single-point tip SDF (works better than geometry-based in Phase 1)
+            # Surface
             ts_abs_p1 = ts.abs()
             Ls = ((ts ** 2).sum(-1)
                   + 5.0 * ts_abs_p1.sum(-1)
                   + 20.0 * ts_abs_p1.max(dim=-1).values ** 2
                   + 10.0 * ts_abs_p1.max(dim=-1).values)
-            # (Approach direction handled by routing constraint L_route)
-            # Per-link collision via Augmented Lagrangian with smooth hinge
-            # (cuRobo-style: quadratic region near boundary for gradient before contact)
-            _eta = 0.005  # 5mm buffer zone
-            _d = self._col_margins - cs  # positive = violation
-            pen = torch.where(
-                _d > 0, _d,  # inside: linear
-                torch.where(_d > -_eta, 0.5 / _eta * (_d + _eta) ** 2, torch.zeros_like(_d))  # buffer: quadratic
-            )  # [B, N_col]
+            # Collision: relu + AL with growing multipliers
+            pen = F.relu(self._col_margins - cs)  # [B, N_col]
             pen_per_link = torch.zeros(B, n_col_links, device=dev)
             for _li, (_si, _ei) in enumerate(col_link_ranges):
                 if _si < _ei:
                     pen_per_link[:, _li] = pen[:, _si:_ei].max(-1).values
             pen_tip = F.relu(-ts - 0.0005)
-            # AL loss per link: λ_l * g_l + (ρ/2) * g_l², summed over links
+            # AL: λ*g + (ρ/2)*g² per link, plus pen.sum for broad gradient
             Lp = ((col_lambda * pen_per_link
                    + (col_rho / 2.0) * pen_per_link ** 2).sum(-1)
-                  + (pen_tip ** 2).sum(-1)
-                  + pen.mean(-1) * 3.0)
+                  + pen.sum(-1) * 0.5
+                  + (pen_tip ** 2).sum(-1))
 
-            # Update per-link multipliers
+            # Update multipliers: grow where collision is violated
             if s % AL_UPDATE_EVERY == 0 and s > 0:
                 with torch.no_grad():
                     col_lambda = (col_lambda + col_rho * pen_per_link.detach()).clamp(0, 50000)
@@ -1606,7 +3124,7 @@ class BatchedGraspOptimizer:
                 for sc_i1, sc_i2 in self._self_col_pairs:
                     d = torch.cdist(sc_cp[:, sc_i1, :], sc_cp[:, sc_i2, :])
                     min_d = d.reshape(B, -1).min(dim=-1).values
-                    L_sc = L_sc + F.relu(0.008 - min_d) ** 2
+                    L_sc = L_sc + F.relu(0.002 - min_d) ** 2
 
             # Adjacent finger spacing at ALL link levels (not just tips)
             # Prevent adjacent fingers from converging and overlapping
@@ -1625,78 +3143,21 @@ class BatchedGraspOptimizer:
                         # 20mm minimum between adjacent link origins
                         L_sc = L_sc + F.relu(0.020 - link_dist) ** 2
 
-            # Grasp topology: palm approach direction determines finger routing
-            # - MF/RF (idx 1,2): same side as palm (support the palm grasp)
-            # - TH (idx 3): opposite side (opposing thumb)
-            # - Palm (idx 4 if enabled): defines the approach direction
-            # - IF (idx 0): free (actuation target determines it)
-            tip_dirs = tp - obj_c.unsqueeze(0).unsqueeze(0)  # [B, nc, 3]
-            tip_dirs_xy = F.normalize(tip_dirs[:, :, :2], dim=-1)  # xy only
+            # Phase 1: surface + collision + actuation + spread
+            # No routing heuristics — let force closure guide topology.
+            # Freeze pos/rot at 40% to reduce DOF and help convergence.
+            if s == int(p1_steps * 0.4):
+                self.pos = self.pos.detach().requires_grad_(False)
+                self.rot6d = self.rot6d.detach().requires_grad_(False)
+                opt1 = torch.optim.Adam([self.u], lr=lr)
+                sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt1, int(p1_steps * 0.6), lr * 0.1)
 
-            # Palm approach direction (from palm contact point or average)
-            if self.palm_contact:
-                # Use mean of palm contact points for direction
-                palm_dir_xy = F.normalize(tip_dirs[:, 4:, :2].mean(dim=1), dim=-1)
-            else:
-                palm_dir_xy = F.normalize(tip_dirs[:, :4, :2].mean(dim=1), dim=-1)
-
-            L_route = torch.zeros(B, device=dev)
-            for fi in [0, 1, 2]:  # IF, MF, RF: OPPOSITE side from palm (wrapping)
-                dot_palm = (tip_dirs_xy[:, fi] * palm_dir_xy).sum(-1)
-                L_route += F.relu(dot_palm + 0.3)  # penalize same side (dot > -0.3)
-            # TH: same side as palm (thumb supports from palm side)
-            dot_th = (tip_dirs_xy[:, 3] * palm_dir_xy).sum(-1)
-            L_route += F.relu(-dot_th)  # penalize opposite side from palm
-
-            # Also keep generic wrapping balance (gentler)
-            wrap_dirs = F.normalize(tip_dirs, dim=-1)
-            L_wrap = wrap_dirs.sum(dim=1).norm(dim=-1) ** 2
-
-            # Link wrapping: intermediate links (_px, _md) must follow the
-            # object surface, not fan outward. Without this, the optimizer
-            # avoids box collision by extending link bodies away and only
-            # bending tips back — producing a non-wrapping grasp.
-            L_link_wrap = torch.zeros(B, device=dev)
-            if self.hand_type == "leap":
-                _wrap_names = []
-                for _f in ['if', 'mf', 'rf']:
-                    for _s in ['px', 'md']:
-                        _wrap_names.append(f"leap_{self.hand}_{_f}_{_s}")
-                for _s in ['bs', 'px']:
-                    _wrap_names.append(f"leap_{self.hand}_th_{_s}")
-                for _wn in _wrap_names:
-                    if _wn in fk:
-                        _wp = (bT @ fk[_wn].get_matrix())[:, :3, 3]
-                        _ws = self.sdf.query(_wp.unsqueeze(1)).squeeze(1)
-                        _wd = F.relu(_ws - 0.015)  # excess beyond 15mm
-                        L_link_wrap += _wd ** 2 + 3.0 * _wd
-
-            # Phase 1a (first 40%): routing only — establish wrapping topology
-            # Phase 1b (last 60%): freeze pos/rot, add surface via joints only
-            if s < p1_steps * 0.4:
-                # P1a: routing + collision, NO surface. Full DOF.
-                total = (100 * La_p1
-                         + Lp + 500 * L_sc
-                         + 60 * Lat + 3 * Ld + 100 * L_wrap + 3000 * L_route
-                         + 50 * L_link_wrap
-                         + 100 * ((self.rot6d - self._rot6d_init) ** 2).mean(-1))
-            else:
-                # P1b: surface + routing + collision. Freeze pos/rot via detach.
-                if s == int(p1_steps * 0.4):
-                    # Lock position and rotation — only joints change from here
-                    self.pos = self.pos.detach().requires_grad_(False)
-                    self.rot6d = self.rot6d.detach().requires_grad_(False)
-                    opt1 = torch.optim.Adam([self.u], lr=lr)
-                    sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        opt1, int(p1_steps * 0.6), lr * 0.1)
-                total = (100 * La_p1
-                         + 800 * Ls + Lp + 500 * L_sc
-                         + 60 * Lat + 3 * Ld + 100 * L_wrap + 2000 * L_route
-                         + 50 * L_link_wrap)
+            total = (100 * La_p1
+                     + 800 * Ls + 10 * Lp + 500 * L_sc
+                     + 60 * Lat + 3 * Ld)
             total.mean().backward()
             opt1.step(); sch1.step()
-
-            # (collision projection removed — interferes with optimizer)
 
             if s % (p1_steps // 4) == 0:
                 act_str = f" act={La_p1.mean():.3e}" if n_act else ""
@@ -1719,8 +3180,8 @@ class BatchedGraspOptimizer:
             wrap_dirs = F.normalize(tp_final - obj_c.unsqueeze(0).unsqueeze(0), dim=-1)
             wrap_balance = wrap_dirs.sum(dim=1).norm(dim=-1)
 
-            # Collision: penalize any penetration
-            col_penalty = F.relu(-cs_final).sum(-1)
+            # Collision: penalize margin violations (consistent with loss margins)
+            col_penalty = F.relu(self._col_margins - cs_final).sum(-1)
 
             # Combined selection score (lower = better)
             select_score = surf_score + 2.0 * wrap_balance + 50.0 * col_penalty
@@ -1728,6 +3189,7 @@ class BatchedGraspOptimizer:
             top_idx = select_score.argsort()[:K]
             print(f"  P1 done. Top-{K} mean tip SDF: {ts_final[top_idx].abs().mean():.4f}"
                   f"  wrap_bal: {wrap_balance[top_idx].mean():.3f}")
+        self._snapshot("after_P1")
 
         # -- Phase 2: FRoGGeR refinement ----------------------------------
         M = max(4, B // K)
@@ -1738,7 +3200,7 @@ class BatchedGraspOptimizer:
             r2 = self.rot6d[top_idx].repeat(M, 1) + 0.01 * torch.randn(K * M, 6, device=dev)
         self.u = u2.detach().requires_grad_(True)
         self.pos = p2.detach().requires_grad_(True)
-        self.rot6d = r2.detach().requires_grad_(True)
+        self.rot6d = r2.detach().requires_grad_(False)  # FREEZE rotation — palm must face object
 
         # Re-assign actuation fingers
         self.amap = np.zeros((B2, max(n_act, 1)), dtype=np.int64)
@@ -1774,7 +3236,7 @@ class BatchedGraspOptimizer:
 
         p2_steps = steps - p1_steps
         # FREEZE rotation in Phase 2 as well — preserve palm-on-object orientation
-        opt2 = torch.optim.Adam([self.u, self.pos, self.rot6d], lr=lr * 0.5)
+        opt2 = torch.optim.Adam([self.u, self.pos], lr=lr * 0.5)  # no rot6d — frozen
         sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, p2_steps, lr * 0.05)
         best_sigma = torch.full((B2,), -1.0, device=dev)
         best_u = self.u.clone().detach()
@@ -1783,8 +3245,9 @@ class BatchedGraspOptimizer:
         best_score = torch.full((B2,), -float("inf"), device=dev)
 
         # Per-link Augmented Lagrangian for Phase 2 collision
-        col_lambda_p2 = torch.full((B2, n_col_links), 10000.0, device=dev)
-        col_rho_p2 = 20000.0
+        # AL for Phase 2: start from 0, grow naturally
+        col_lambda_p2 = torch.full((B2, n_col_links), 500.0, device=dev)
+        col_rho_p2 = 10000.0
 
         # Palm grid for proximity
         palm_grid_h = None
@@ -1801,7 +3264,6 @@ class BatchedGraspOptimizer:
                 pp = torch.stack([torch.full_like(yy, 0.005), yy, zz], dim=-1).reshape(-1, 3)
             palm_grid_h = torch.cat([pp, torch.ones(pp.shape[0], 1, device=dev)], -1)
 
-        _eta = 0.005  # smooth hinge buffer (same as Phase 1)
         triu_mask = torch.triu(torch.ones(nc, nc, device=dev), diagonal=1).bool()
         eps_fd = 5e-4
         fd_offsets = torch.zeros(3, 3, device=dev)
@@ -1820,10 +3282,8 @@ class BatchedGraspOptimizer:
             t_frac = s / max(p2_steps - 1, 1)
 
             # ==============================================================
-            # ALTERNATING MINIMIZATION:
-            # Even steps: constraint satisfaction (surface + collision + SC)
-            # Odd steps: objective optimization (FC + actuation + spread)
-            # This prevents the tug-of-war between constraints and objective
+            # COMBINED STEP: all losses in one backward pass.
+            # AL handles constraint enforcement; FC ramps up gradually.
             # ==============================================================
             opt2.zero_grad()
             q = self._u2q(self.u)
@@ -1833,113 +3293,151 @@ class BatchedGraspOptimizer:
             ts = self.sdf.query(tp)
             cs = self.sdf.query(cp)
 
-            if s % 2 == 0:
-                # --- CONSTRAINT STEP: surface + collision + self-collision ---
-                ts_abs = ts.abs()
-                L_surf = ((ts ** 2).sum(-1)
-                          + 5.0 * ts_abs.sum(-1)
-                          + 20.0 * ts_abs.max(-1).values ** 2
-                          + 10.0 * ts_abs.max(-1).values)
-                _d2 = self._col_margins - cs
-                pen = torch.where(
-                    _d2 > 0, _d2,
-                    torch.where(_d2 > -_eta, 0.5 / _eta * (_d2 + _eta) ** 2, torch.zeros_like(_d2))
-                )
-                pen_per_link_p2 = torch.zeros(B2, n_col_links, device=dev)
-                for _li, (_si, _ei) in enumerate(col_link_ranges):
-                    if _si < _ei:
-                        pen_per_link_p2[:, _li] = pen[:, _si:_ei].max(-1).values
-                # Per-link Augmented Lagrangian collision
-                L_col = ((col_lambda_p2 * pen_per_link_p2
-                          + (col_rho_p2 / 2.0) * pen_per_link_p2 ** 2).sum(-1)
-                         + pen.mean(-1) * 3.0)
-                # Update per-link multipliers
-                if s % 20 == 0 and s > 0:
-                    with torch.no_grad():
-                        col_lambda_p2 = (col_lambda_p2 + col_rho_p2 * pen_per_link_p2.detach()).clamp(0, 50000)
-                sc_cp = self._get_sc_points(fk, bT)
-                L_sc = torch.zeros(B2, device=dev)
-                if sc_cp is not None:
-                    for sc_i1, sc_i2 in self._self_col_pairs:
-                        d = torch.cdist(sc_cp[:, sc_i1, :], sc_cp[:, sc_i2, :])
-                        min_d = d.reshape(B2, -1).min(-1).values
-                        L_sc += F.relu(0.008 - min_d) ** 2 + 2.0 * F.relu(0.008 - min_d)
-                # Adjacent fingertip spacing
-                for ti, tj in [(0, 1), (1, 2)]:
-                    if ti < tp.shape[1] and tj < tp.shape[1]:
-                        td = torch.norm(tp[:, ti] - tp[:, tj], dim=-1)
-                        L_sc += F.relu(0.025 - td) ** 2 + 2.0 * F.relu(0.025 - td)
-                # Palm proximity
-                # Palm proximity REMOVED — it fights collision constraint.
-                # The palm position is determined by collision (stay clear)
-                # and the base position from init. Fingertip contacts provide
-                # the grasp; palm doesn't need to touch the object.
-                L_palm = torch.zeros(B2, device=dev)
-                # Routing in Phase 2: keep thumb on opposite side from palm
-                tip_dirs_p2 = tp - obj_c.unsqueeze(0).unsqueeze(0)
-                tip_dirs_xy_p2 = F.normalize(tip_dirs_p2[:, :, :2], dim=-1)
-                if self.palm_contact:
-                    palm_dir_p2 = F.normalize(tip_dirs_p2[:, 4:, :2].mean(dim=1), dim=-1)
-                else:
-                    palm_dir_p2 = F.normalize(tip_dirs_p2[:, :4, :2].mean(dim=1), dim=-1)
-                # Fingers must wrap to opposite side from palm
-                L_route_p2 = torch.zeros(B2, device=dev)
-                for fi in [0, 1, 2]:  # IF, MF, RF opposite from palm
-                    dot_p2 = (tip_dirs_xy_p2[:, fi] * palm_dir_p2).sum(-1)
-                    L_route_p2 += F.relu(dot_p2 + 0.3)
-                # Link wrapping in Phase 2 (maintain wrapping during FC opt)
-                L_lw_p2 = torch.zeros(B2, device=dev)
-                if self.hand_type == "leap":
-                    _wn2 = []
-                    for _f in ['if', 'mf', 'rf']:
-                        for _s in ['px', 'md']:
-                            _wn2.append(f"leap_{self.hand}_{_f}_{_s}")
-                    for _s in ['bs', 'px']:
-                        _wn2.append(f"leap_{self.hand}_th_{_s}")
-                    for _w in _wn2:
-                        if _w in fk:
-                            _p2 = (bT @ fk[_w].get_matrix())[:, :3, 3]
-                            _s2 = self.sdf.query(_p2.unsqueeze(1)).squeeze(1)
-                            _d2 = F.relu(_s2 - 0.010)
-                            L_lw_p2 += _d2 ** 2 + 5.0 * _d2
-                total = 1500 * L_surf + L_col + 800 * L_sc + 200 * L_palm + 2000 * L_route_p2 + 150 * L_lw_p2
-                sigma_min = torch.zeros(B2, device=dev)  # not computed on constraint steps
-            else:
-                # --- OBJECTIVE STEP: FC + actuation + spread ---
-                # Differentiable normals via FD
-                gx_n = (self.sdf.query(tp + fd_offsets[0]) - self.sdf.query(tp - fd_offsets[0])) / (2*eps_fd)
-                gy_n = (self.sdf.query(tp + fd_offsets[1]) - self.sdf.query(tp - fd_offsets[1])) / (2*eps_fd)
-                gz_n = (self.sdf.query(tp + fd_offsets[2]) - self.sdf.query(tp - fd_offsets[2])) / (2*eps_fd)
-                sdf_grad = torch.stack([gx_n, gy_n, gz_n], dim=-1)
-                tip_normals = -sdf_grad / sdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            # --- Surface loss ---
+            ts_abs = ts.abs()
+            L_surf = ((ts ** 2).sum(-1)
+                      + 5.0 * ts_abs.sum(-1)
+                      + 20.0 * ts_abs.max(-1).values ** 2
+                      + 10.0 * ts_abs.max(-1).values)
 
-                g_OCs = compute_contact_frames(tp, tip_normals)
-                G = compute_grasp_matrix_torch(g_OCs)
-                W = compute_wrench_matrix(G, F_prim, nc, ns)
-                sigma_min = torch.linalg.svdvals(W)[:, -1]
-                L_fc = -sigma_min
+            # --- Collision loss (AL with growing multipliers) ---
+            pen = F.relu(self._col_margins - cs)
+            pen_per_link_p2 = torch.zeros(B2, n_col_links, device=dev)
+            for _li, (_si, _ei) in enumerate(col_link_ranges):
+                if _si < _ei:
+                    pen_per_link_p2[:, _li] = pen[:, _si:_ei].max(-1).values
+            L_col = ((col_lambda_p2 * pen_per_link_p2
+                      + (col_rho_p2 / 2.0) * pen_per_link_p2 ** 2).sum(-1)
+                     + pen.sum(-1) * 0.5)
+            if s % 15 == 0 and s > 0:
+                with torch.no_grad():
+                    col_lambda_p2 = (col_lambda_p2 + col_rho_p2 * pen_per_link_p2.detach()).clamp(0, 50000)
 
-                L_proxy = compute_fc_proxy_loss(tp, tip_normals, obj_c)
-                La = torch.zeros(B2, device=dev)
-                if n_act:
-                    for j in range(n_act):
-                        fi = self.amap_t[:, j]
-                        d_sq = ((tp[aB2, fi] - ap[j]) ** 2).sum(-1)
-                        d = d_sq.sqrt()
-                        La += torch.where(d < 0.015, d_sq, 0.015 * d - 0.015**2 / 2)
-                        if ad is not None and ad[j] is not None:
-                            cos_al = (tip_x[aB2, fi] * ad[j]).sum(-1)
-                            La += 0.5 * (1.0 - cos_al) ** 2
-                pw_d = torch.cdist(tp, tp)
-                Ld = -pw_d[:, triu_mask].mean(-1)
+            # --- Self-collision loss ---
+            sc_cp = self._get_sc_points(fk, bT)
+            L_sc = torch.zeros(B2, device=dev)
+            if sc_cp is not None:
+                for sc_i1, sc_i2 in self._self_col_pairs:
+                    d = torch.cdist(sc_cp[:, sc_i1, :], sc_cp[:, sc_i2, :])
+                    min_d = d.reshape(B2, -1).min(-1).values
+                    L_sc += F.relu(0.002 - min_d) ** 2 + 2.0 * F.relu(0.002 - min_d)
+            # Tip spacing removed — FC determines natural tip placement
 
-                fc_w = min(1.0, t_frac / 0.30) * 200.0
-                proxy_w = max(0.0, 1.0 - t_frac / 0.50) * 80.0
-                total = fc_w * L_fc + proxy_w * L_proxy + 600 * La + 3 * Ld
+            # --- Force closure loss (fingertips only, no palm) ---
+            # FC from the 4 fingertips — palm is a passive collision body,
+            # not a force generator. The actuation finger contributes to FC
+            # but its position is constrained by the actuation loss.
+            tp_fc = tp[:, :4]  # first 4 contacts = fingertips
+            nc_fc = 4
+            gx_n = (self.sdf.query(tp_fc + fd_offsets[0]) - self.sdf.query(tp_fc - fd_offsets[0])) / (2*eps_fd)
+            gy_n = (self.sdf.query(tp_fc + fd_offsets[1]) - self.sdf.query(tp_fc - fd_offsets[1])) / (2*eps_fd)
+            gz_n = (self.sdf.query(tp_fc + fd_offsets[2]) - self.sdf.query(tp_fc - fd_offsets[2])) / (2*eps_fd)
+            sdf_grad = torch.stack([gx_n, gy_n, gz_n], dim=-1)
+            tip_normals = -sdf_grad / sdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            g_OCs = compute_contact_frames(tp_fc, tip_normals)
+            G = compute_grasp_matrix_torch(g_OCs)
+            W = compute_wrench_matrix(G, F_prim, nc_fc, ns)
+            sigma_min = torch.linalg.svdvals(W)[:, -1]
+            L_fc = -sigma_min
+
+            # --- Actuation loss ---
+            La = torch.zeros(B2, device=dev)
+            if n_act:
+                for j in range(n_act):
+                    fi = self.amap_t[:, j]
+                    d_sq = ((tp[aB2, fi] - ap[j]) ** 2).sum(-1)
+                    d = d_sq.sqrt()
+                    La += torch.where(d < 0.015, d_sq, 0.015 * d - 0.015**2 / 2)
+                    if ad is not None and ad[j] is not None:
+                        cos_al = (tip_x[aB2, fi] * ad[j]).sum(-1)
+                        La += 0.5 * (1.0 - cos_al) ** 2
+
+            # --- Spread loss ---
+            pw_d = torch.cdist(tp, tp)
+            Ld = -pw_d[:, triu_mask].mean(-1)
+
+            # --- Combined loss: FC + constraints ---
+            # FC ramps up over first 30% of Phase 2
+            fc_w = min(1.0, t_frac / 0.30) * 200.0
+            total = (fc_w * L_fc
+                     + 1500 * L_surf + 10 * L_col + 800 * L_sc
+                     + 600 * La + 3 * Ld)
 
             total.mean().backward()
             opt2.step()
             sch2.step()
+
+            # ==============================================================
+            # Collision projection via Jacobian null-space
+            # When palm collides: move base out, adjust joints to keep tips
+            # ==============================================================
+            if s % 25 == 0 and s > 50:
+                with torch.no_grad():
+                    q_proj = self._u2q(self.u)
+                    bT_proj = self._base_T(self.pos, self.rot6d)
+                    fk_proj = self.chain.forward_kinematics(q_proj)
+                    _, cp_proj, _ = self._get_points(fk_proj, bT_proj)
+                    cs_proj = self.sdf.query(cp_proj)
+                    worst_viol = (self._col_margins - cs_proj).max(-1).values
+                    bad = worst_viol > 0.003  # >3mm — only severe violations
+
+                    if bad.any():
+                        n_bad = bad.sum().item()
+                        # 1) Compute base push direction and amount
+                        R_proj = self._rot6d_to_matrix(self.rot6d)
+                        outward = -R_proj[:, :, 0]  # -X = away from object
+                        push_amt = worst_viol[bad].clamp(max=0.003) * 0.3  # very gentle, max 0.9mm
+
+                        # 2) Record current tip positions BEFORE base move
+                        tp_before, _, _ = self._get_points(fk_proj, bT_proj)
+                        tp_before_bad = tp_before[bad, :4]  # [n_bad, 4, 3]
+
+                        # 3) Move base
+                        self.pos.data[bad] += push_amt.unsqueeze(-1) * outward[bad]
+
+                        # 4) Compute tip positions AFTER base move
+                        bT_after = self._base_T(self.pos, self.rot6d)
+                        fk_after = self.chain.forward_kinematics(q_proj)
+                        tp_after, _, _ = self._get_points(fk_after, bT_after)
+                        tp_after_bad = tp_after[bad, :4]
+
+                        # 5) Compute tip displacement to correct (want tips back where they were)
+                        dp = (tp_before_bad - tp_after_bad).reshape(n_bad, -1)  # [n_bad, 12]
+
+                    # 6) Compute Jacobian with grad enabled
+                    with torch.enable_grad():
+                        q_bad = self._u2q(self.u[bad].detach())
+                        q_bad_g = q_bad.detach().requires_grad_(True)
+                        fk_g = self.chain.forward_kinematics(q_bad_g)
+                        bT_g = self._base_T(self.pos[bad].detach(), self.rot6d[bad].detach())
+                        tips_g = []
+                        for ti, nm in enumerate(self.tip_link_names):
+                            wT = bT_g @ fk_g[nm].get_matrix()
+                            off_h = torch.cat([self.tip_offsets[ti],
+                                             torch.ones(1, device=dev)])
+                            tips_g.append((wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3])
+                        all_tips_g = torch.stack(tips_g, dim=1)  # [n_bad, 4, 3]
+
+                        J_rows = []
+                        for fi in range(4):
+                            for dim in range(3):
+                                grad = torch.autograd.grad(
+                                    all_tips_g[:, fi, dim].sum(), q_bad_g,
+                                    retain_graph=True)[0]
+                                J_rows.append(grad)
+                        J = torch.stack(J_rows, dim=1)  # [n_bad, 12, 16]
+
+                    # 7) Pseudoinverse: dq = J^+ @ dp
+                    with torch.no_grad():
+                        JT = J.transpose(1, 2)
+                        JJT = J @ JT + 0.01 * torch.eye(12, device=dev).unsqueeze(0)
+                        dq = (JT @ torch.linalg.solve(JJT, dp.unsqueeze(-1))).squeeze(-1)
+
+                        # 8) Apply joint correction (clamped for safety)
+                        dq = dq.clamp(-0.1, 0.1)
+                        du = self._q2u(q_bad + dq) - self._q2u(q_bad)
+                        self.u.data[bad] += du
 
             # ==============================================================
             # Track best solutions
@@ -1953,9 +3451,10 @@ class BatchedGraspOptimizer:
                 cs_eval = self.sdf.query(cp_eval)
 
                 se = ts_eval.abs().max(-1).values
-                mc = cs_eval.min(-1).values
+                # Margin-adjusted collision: how much each point exceeds its margin
+                col_violation = F.relu(self._col_margins - cs_eval)  # [B2, N_col]
+                max_col_viol = col_violation.max(-1).values  # worst violation per env
 
-                # Check self-collision (box points)
                 sc_cp_eval = self._get_sc_points(fk_eval, bT_eval)
                 sc_min_d = torch.full((B2,), 1.0, device=dev)
                 if sc_cp_eval is not None:
@@ -1964,23 +3463,17 @@ class BatchedGraspOptimizer:
                         pair_min = d.reshape(B2, -1).min(-1).values
                         sc_min_d = torch.minimum(sc_min_d, pair_min)
 
-                feas = (se < 0.002) & (mc > -0.002) & (sc_min_d > 0.003)
-                # Only update best on objective steps (odd) when sigma_min is computed
-                if s % 2 == 0:
-                    # Constraint step: update best based on feasibility alone
-                    score = torch.where(feas, best_score + 0.001, best_score - 1.0)
-                else:
-                    # Objective step: score by σ_min, penalize infeasible
-                    score = torch.where(
-                        feas,
-                        sigma_min,
-                        sigma_min - 5.0 * se - 5.0 * F.relu(-mc) - 5.0 * F.relu(0.008 - sc_min_d)
-                    )
+                # Feasibility: 2mm surface, 2mm collision, 1mm SC (field standard)
+                feas = (se < 0.002) & (max_col_viol < 0.002) & (sc_min_d > 0.001)
+                score = torch.where(
+                    feas,
+                    sigma_min,
+                    sigma_min - 5.0 * se - 10.0 * max_col_viol - 5.0 * F.relu(0.008 - sc_min_d)
+                )
                 improved = score > best_score
                 if improved.any():
                     best_score[improved] = score[improved]
-                    if s % 2 == 1:  # only update sigma on objective steps (when it's computed)
-                        best_sigma[improved] = sigma_min[improved]
+                    best_sigma[improved] = sigma_min[improved]
                     best_u[improved] = self.u[improved]
                     best_p[improved] = self.pos[improved]
                     best_r[improved] = self.rot6d[improved]
@@ -1989,11 +3482,11 @@ class BatchedGraspOptimizer:
                     n_ok = feas.sum().item()
                     n_fc = (sigma_min > 0.01).sum().item()
                     n_surf = (se < 0.002).sum().item()
-                    n_nocol = (mc > -0.002).sum().item()
-                    n_nosc = (sc_min_d > 0.003).sum().item()
+                    n_nocol = (max_col_viol < 0.001).sum().item()
+                    n_nosc = (sc_min_d > 0.001).sum().item()
                     bi = best_score.argmax().item()
                     print(f"  P2 {s:3d} | σ_min_best={best_sigma[bi]:.4f} "
-                          f"surf<2mm={n_surf}/{B2} nocol={n_nocol}/{B2} "
+                          f"surf<2mm={n_surf}/{B2} nocol(margin)={n_nocol}/{B2} "
                           f"noSC={n_nosc}/{B2} feas={n_ok}/{B2} fc={n_fc}/{B2}")
 
         elapsed = time.time() - t0
@@ -2007,11 +3500,15 @@ class BatchedGraspOptimizer:
             tp_all, cp_all, tip_x_all = self._get_points(fk_all, bT_all)
             ts_all = self.sdf.query(tp_all)
             cs_all = self.sdf.query(cp_all)
-            _, tip_normals_all = self.sdf.query_with_normals(tp_all)
 
-            g_OCs_all = compute_contact_frames(tp_all, tip_normals_all)
+            # FC from fingertips only (first 4 contacts), not palm
+            tp_fc_all = tp_all[:, :4]
+            _, tip_normals_fc = self.sdf.query_with_normals(tp_fc_all)
+            nc_fc = 4
+
+            g_OCs_all = compute_contact_frames(tp_fc_all, tip_normals_fc)
             G_all = compute_grasp_matrix_torch(g_OCs_all)
-            W_all = compute_wrench_matrix(G_all, F_prim, nc, ns)
+            W_all = compute_wrench_matrix(G_all, F_prim, nc_fc, ns)
 
             # σ_min for all candidates (fast, on GPU)
             sigma_all = torch.linalg.svdvals(W_all)[:, -1]
@@ -2061,35 +3558,21 @@ class BatchedGraspOptimizer:
                 sc_min_d_all = torch.minimum(sc_min_d_all, pair_min)
             feasible = feasible & (sc_min_d_all > 0.003)
 
-            # Thumb-palm opposition: thumb must be on opposite side of object from palm
-            if self.palm_contact and nc > 4:
-                palm_dir_f = F.normalize((tp_all[:, 4:, :2] - obj_c[:2]).mean(dim=1), dim=-1)
-                th_dir_f = F.normalize(tp_all[:, 3, :2] - obj_c[:2], dim=-1)
-                th_palm_dot = (palm_dir_f * th_dir_f).sum(-1)
-                feasible = feasible & (th_palm_dot < 0.0)  # must be opposite
+            # No routing/topology heuristics — FC determines grasp quality
 
-            # Opposing normals check: at least one pair with dot < -0.3
-            nc = tp_all.shape[1]
-            eps_fd = 5e-4
-            tip_normals_all = torch.zeros_like(tp_all)
-            for dim in range(3):
-                delta = torch.zeros_like(tp_all)
-                delta[:, :, dim] = eps_fd
-                sp = self.sdf.query(tp_all + delta)
-                sm = self.sdf.query(tp_all - delta)
-                tip_normals_all[:, :, dim] = -(sp - sm) / (2 * eps_fd)
-            tip_normals_all = F.normalize(tip_normals_all, dim=-1)
+            # Opposing normals check (fingertips only): at least one pair with dot < -0.3
+            tip_normals_all = tip_normals_fc  # already computed above
             ndots = torch.bmm(tip_normals_all, tip_normals_all.transpose(1, 2))
-            triu_mask = torch.triu(torch.ones(nc, nc, device=dev), diagonal=1).bool()
-            pair_ndots = ndots[:, triu_mask]
+            triu_fc = torch.triu(torch.ones(nc_fc, nc_fc, device=dev), diagonal=1).bool()
+            pair_ndots = ndots[:, triu_fc]
             has_opposing = (pair_ndots < -0.2).any(dim=-1)
             n_with_opp = (feasible & has_opposing).sum().item()
             n_without = feasible.sum().item()
             print(f"  Final: {n_without} feasible (σ>{0.05}), {n_with_opp} also opposing")
             # Don't filter by opposing — let ranking handle it via wrap_quality
 
-            # Wrapping quality for ranking
-            wrap_dirs = F.normalize(tp_all - obj_c.unsqueeze(0).unsqueeze(0), dim=-1)
+            # Wrapping quality for ranking (fingertips only)
+            wrap_dirs = F.normalize(tp_fc_all - obj_c.unsqueeze(0).unsqueeze(0), dim=-1)
             wrap_balance = wrap_dirs.sum(dim=1).norm(dim=-1)
             wrap_quality = 1.0 - wrap_balance.clamp(max=1.5) / 1.5
 
@@ -2246,34 +3729,49 @@ class BatchedGraspOptimizer:
                     "sc_min_dist": float(sc_min_d_all[ix]),
                 })
         # ================================================================
-        # Post-solve verification: full visual mesh penetration check
+        # Post-solve verification: URDF box-grid penetration check
         # ================================================================
-        # The optimizer uses sparse collision points. This final check uses
-        # ALL visual mesh vertices to catch any remaining penetration.
+        # Uses uniform box grids (same as optimizer) with finer pitch (5mm)
+        # for honest penetration measurement. Never use mesh vertices —
+        # they are non-uniformly distributed and give misleading results.
         if self.hand_type == "leap" and res:
             from scipy.spatial.transform import Rotation as _ScipyR
-            vis_meshes = _visual_meshes(self.hand, self.hand_type)
-            mesh_dir = os.path.join(os.path.dirname(__file__), f"../models/leap_{self.hand}")
-            # Preload all link meshes once
-            link_mesh_verts = {}
-            for nm in vis_meshes:
-                all_v = []
-                for mf, vp in vis_meshes[nm]:
-                    path = os.path.join(mesh_dir, mf)
-                    if not os.path.exists(path):
-                        continue
-                    lm = trimesh.load(path, force="mesh")
-                    v = np.asarray(lm.vertices, dtype=np.float64)
-                    if vp is not None:
-                        vpa = np.array(vp, dtype=np.float64)
-                        Rv = _ScipyR.from_euler("xyz", vpa[3:]).as_matrix()
-                        v = (Rv @ v.T).T + vpa[:3]
-                    # No palm filtering — rigid hand, all vertices checked
-                    all_v.append(v)
-                if all_v:
-                    link_mesh_verts[nm] = np.vstack(all_v)
+            import xml.etree.ElementTree as _ET_verify
+            _urdf_verify = os.path.join(os.path.dirname(__file__),
+                                        f"../models/leap_{self.hand}/leap.urdf")
+            _tree_verify = _ET_verify.parse(_urdf_verify)
+            _verify_pitch = 0.005  # 5mm grid (finer than optimizer's 8mm)
+            # Build box-grid points per link (link-local frame)
+            _verify_link_pts = {}
+            for _le in _tree_verify.getroot().findall("link"):
+                _ln = _le.get("name")
+                _is_palm = "palm" in _ln
+                _link_pts = []
+                for _cel in _le.findall("collision"):
+                    _g = _cel.find("geometry")
+                    if _g is None: continue
+                    _b = _g.find("box")
+                    if _b is None: continue
+                    _sz = [float(x) for x in _b.get("size").split()]
+                    _o = _cel.find("origin")
+                    _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
+                    _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
+                    _R = (_ScipyR.from_euler("xyz", _rpy).as_matrix()
+                          if np.any(np.abs(_rpy) > 1e-6) else np.eye(3))
+                    if _is_palm and _p[0] < -0.025:
+                        continue  # skip structural back boxes
+                    hx, hy, hz = _sz[0]/2, _sz[1]/2, _sz[2]/2
+                    gx = np.arange(-hx, hx + _verify_pitch/2, _verify_pitch)
+                    gy = np.arange(-hy, hy + _verify_pitch/2, _verify_pitch)
+                    gz = np.arange(-hz, hz + _verify_pitch/2, _verify_pitch)
+                    grid = np.stack(np.meshgrid(gx, gy, gz, indexing='ij'),
+                                    axis=-1).reshape(-1, 3)
+                    grid = ((_R @ grid.T).T + _p).astype(np.float32)
+                    _link_pts.append(grid)
+                if _link_pts:
+                    _verify_link_pts[_ln] = np.vstack(_link_pts)
 
-            print(f"\n  === FULL VISUAL MESH VERIFICATION ===")
+            print(f"\n  === BOX-GRID PENETRATION VERIFICATION (5mm) ===")
             for i, r in enumerate(res):
                 q_v = torch.tensor(r["q_joints"], dtype=torch.float32, device=dev).unsqueeze(0)
                 fk_v = self.chain.forward_kinematics(q_v)
@@ -2284,23 +3782,28 @@ class BatchedGraspOptimizer:
                 total_v = 0
                 total_pen = 0
                 worst_sdf = 0.0
-                for nm, verts in link_mesh_verts.items():
+                worst_link = ""
+                for nm, pts in _verify_link_pts.items():
                     if nm not in fk_v:
                         continue
                     lt = fk_v[nm].get_matrix()[0].detach().cpu().numpy()
                     wT = bT_v @ lt
-                    vw = (wT[:3, :3] @ verts.T).T + wT[:3, 3]
+                    pw = (wT[:3, :3] @ pts.T).T + wT[:3, 3]
                     sv = self.sdf.query(
-                        torch.tensor(vw, dtype=torch.float32, device=dev).unsqueeze(0)
+                        torch.tensor(pw, dtype=torch.float32, device=dev).unsqueeze(0)
                     )[0].cpu().numpy()
                     total_v += len(sv)
-                    total_pen += (sv < -0.001).sum()  # -1mm threshold (honest)
-                    worst_sdf = min(worst_sdf, sv.min())
+                    n_pen = (sv < -0.001).sum()
+                    total_pen += n_pen
+                    link_worst = sv.min()
+                    if link_worst < worst_sdf:
+                        worst_sdf = link_worst
+                        worst_link = nm.split("leap_rh_")[-1] if "leap_rh_" in nm else nm
 
                 pct = 100 * total_pen / total_v if total_v > 0 else 0
                 r["mesh_pen_pct"] = pct
                 r["mesh_pen_worst"] = float(worst_sdf)
-                if pct > 5.0:  # 5% at -1mm — matches honest diagnostic
+                if pct > 5.0:  # 5% at -1mm
                     r["feasible"] = False
 
                 # Self-collision check using PCA-filtered collision points
@@ -2340,14 +3843,14 @@ class BatchedGraspOptimizer:
                         if _md < 0.003:
                             sc_bad.append(f"{_ni}-{_nj}")
                 r["sc_worst"] = float(worst_sc)
-                if worst_sc < 0.002:
+                if worst_sc < 0.0005:  # 0.5mm — actual overlap only
                     r["feasible"] = False  # severe self-collision
 
                 z = r["base_pos"][2] * 1000
                 f_tag = "FEAS" if r["feasible"] else "FAIL"
                 sc_str = f"sc={worst_sc*1000:.1f}mm" if worst_sc < 999 else ""
                 sc_bad_str = f" [{','.join(sc_bad[:3])}]" if sc_bad else ""
-                print(f"    G{i} [{f_tag}] z={z:.0f}mm: {pct:.1f}%pen worst={worst_sdf*1000:.0f}mm {sc_str}{sc_bad_str}")
+                print(f"    G{i} [{f_tag}] z={z:.0f}mm: {pct:.1f}%pen worst={worst_sdf*1000:.0f}mm@{worst_link} {sc_str}{sc_bad_str}")
 
         if save_path is not None:
             import torch as _torch
