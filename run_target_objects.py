@@ -77,7 +77,7 @@ def run_object(name):
             steps=300, lr=0.005,
             save_path=save_file,
             opt_sections="ABCD",
-            opt_variant="CA",
+            opt_variant="SA",
         )
         elapsed = time.time() - t0
 
