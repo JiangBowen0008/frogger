@@ -1969,7 +1969,9 @@ class BatchedGraspOptimizer:
                     act_fi = self.amap[b, 0]
                     for fi in range(4):
                         if fi != act_fi:
-                            sup_joint_mask[b, fi*4:fi*4+4] = True
+                            # Freeze CMC (joint 0) — init placed it to avoid actuation.
+                            # Only optimize MCP, PIP, DIP (curl joints).
+                            sup_joint_mask[b, fi*4+1:fi*4+4] = True
                             sup_finger_mask[b, fi] = True
 
                 # Compute spread target positions for support fingers
