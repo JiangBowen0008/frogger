@@ -922,15 +922,9 @@ class BatchedGraspOptimizer:
                 except Exception:
                     surf_pts, _ = trimesh.sample.sample_surface(
                         tip_mesh, n_tip_surface)
-                # Interior: concentric shells toward centroid for even fill
-                centroid = tip_mesh.centroid
-                int_pts = []
-                for shell in np.linspace(0.3, 0.85, 5):
-                    n_shell = n_tip_interior // 5
-                    idx = np.random.choice(len(surf_pts), n_shell, replace=False)
-                    int_pts.append(centroid + shell * (surf_pts[idx] - centroid))
-                int_pts = np.vstack(int_pts)
-                tip_pts = np.vstack([surf_pts, int_pts]).astype(np.float32)
+                # Surface samples only — interior fill creates conflict with surface contact
+                # (interior points 5-8mm deep fight Section A's surface-seeking)
+                tip_pts = surf_pts.astype(np.float32)
                 # Append to this link's collision data
                 tip_h = np.hstack([tip_pts, np.ones((len(tip_pts), 1), dtype=np.float32)])
                 existing = col_data[ci][1]
@@ -2374,7 +2368,12 @@ class BatchedGraspOptimizer:
                                 off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
                                 tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                                 tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
-                                total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * tip_sdf ** 2
+                                # Huber-like: |SDF| when far (strong pull), SDF² when close (smooth)
+                                tip_sdf_abs = tip_sdf.abs()
+                                surf_loss = torch.where(tip_sdf_abs > 0.003,
+                                    tip_sdf_abs - 0.0015,  # linear beyond 3mm
+                                    tip_sdf ** 2 / 0.006)  # quadratic within 3mm, continuous
+                                total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * surf_loss
 
                         elif opt_variant in ("B", "C"):
                             # Min-k unified: for ds links, query ALL collision points,
@@ -2492,23 +2491,19 @@ class BatchedGraspOptimizer:
                                 total_loss += group_mask.float() * fc_weight * (-s)
 
                         # ── Section D: Inter-finger self-collision ──
-                        # For each link pair, check how many SC points from link A
-                        # have their nearest neighbor in link B within 10mm.
-                        # This detects volumetric overlap (interleaved point clouds)
-                        # that min-distance misses.
+                        # Directly optimize sc_min_d (same metric as feasibility check).
+                        # Also add overlap fraction for gross overlap detection.
                         sc_pts = self._get_sc_points(fk_o, bT_o)
                         if sc_pts is not None:
                             for sc_i1, sc_i2 in self._self_col_pairs:
                                 d = torch.cdist(sc_pts[:, sc_i1], sc_pts[:, sc_i2])
-                                # For each point in A, distance to nearest point in B
-                                nn_d_A = d.min(dim=-1).values  # [B, n1]
-                                nn_d_B = d.min(dim=-2).values  # [B, n2]
-                                # Fraction of A's points that are "inside" B (nn < 10mm)
-                                frac_A = (nn_d_A < 0.010).float().mean(dim=-1)  # [B]
-                                frac_B = (nn_d_B < 0.010).float().mean(dim=-1)  # [B]
-                                overlap = torch.maximum(frac_A, frac_B)  # [B]
-                                # Penalize any overlap fraction > 0
-                                total_loss += opt_mask.float() * 2000 * overlap
+                                pair_min = d.reshape(B, -1).min(-1).values  # [B]
+                                # Direct penalty on min distance (matches feasibility sc_min_d > 1mm)
+                                total_loss += opt_mask.float() * 500 * F.relu(0.002 - pair_min) ** 2
+                                # Overlap fraction for gross overlap detection
+                                nn_d_A = d.min(dim=-1).values
+                                frac_A = (nn_d_A < 0.010).float().mean(dim=-1)
+                                total_loss += opt_mask.float() * 500 * frac_A
 
                         # ── Section E: Actuation area exclusion ──
                         # Support tips within 35mm of actuation FINGER get pushed away
@@ -3000,7 +2995,7 @@ class BatchedGraspOptimizer:
 
                     # Self-collision check (box points)
                     _lv_col = {}
-                    for _cnm, _cpts in self._col_data:
+                    for _cnm, _cpts in self._sc_data:  # same point set as optimizer
                         if _cnm in fk_v:
                             _cwT = bT_v @ fk_v[_cnm].get_matrix()[0].detach().cpu().numpy()
                             _cp_np = _cpts[:, :3].cpu().numpy()
