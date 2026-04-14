@@ -2794,8 +2794,15 @@ class BatchedGraspOptimizer:
                 # Surface error: max |SDF| across support fingers
                 surf_err = ts_final[:, :4].abs().max(dim=-1).values  # [B]
 
-                # Collision: margin-adjusted violations
-                col_violation = F.relu(self._col_margins - cs_final)
+                # Collision: margin-adjusted violations (exclude ds links)
+                # ds links are contact surfaces — their back side penetrates
+                # on curved objects by design. Only check non-ds links.
+                non_ds_mask = torch.ones(cs_final.shape[1], device=dev, dtype=torch.bool)
+                for li, (nm, _) in enumerate(self._col_data):
+                    if "_ds" in nm:
+                        si, ei = self._col_link_ranges[li]
+                        non_ds_mask[si:ei] = False
+                col_violation = F.relu(self._col_margins[non_ds_mask] - cs_final[:, non_ds_mask])
                 max_col_viol = col_violation.max(-1).values
 
                 # Self-collision
