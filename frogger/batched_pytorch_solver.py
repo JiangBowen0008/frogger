@@ -2452,16 +2452,28 @@ class BatchedGraspOptimizer:
                                 total_loss += opt_mask.float() * 200 * F.relu(0.005 - min_d) ** 2
 
                         # ── Section E: Actuation area exclusion ──
-                        # Support tips within 35mm of actuation target get pushed away
-                        if n_act and ap is not None:
+                        # Support tips within 35mm of actuation FINGER get pushed away
+                        # (uses actual FK position, not the target point on the object)
+                        if n_act:
+                            # Compute actual actuation finger tip position per env
+                            act_tip_actual = torch.zeros(B, 3, device=dev)
+                            for act_fi in range(4):
+                                amask = (self.amap_t[:, 0] == act_fi)
+                                if not amask.any(): continue
+                                anm = self.tip_link_names[act_fi]
+                                awT = bT_o @ fk_o[anm].get_matrix()
+                                aoff = torch.cat([self.tip_offsets[act_fi], torch.ones(1, device=dev)])
+                                atp = (awT @ aoff.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                act_tip_actual[amask] = atp[amask]
+                            # Push support tips away from actuation finger
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 nm = self.tip_link_names[fi]
                                 wT = bT_o @ fk_o[nm].get_matrix()
                                 off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
                                 tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                                dist_to_act = torch.norm(tip - ap[0], dim=-1)
-                                total_loss += sup_finger_mask_opt[:, fi].float() * 100 * F.relu(0.035 - dist_to_act) ** 2
+                                dist_to_act = torch.norm(tip - act_tip_actual, dim=-1)
+                                total_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(0.035 - dist_to_act) ** 2
 
                         # Freeze non-support joints
                         total_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)

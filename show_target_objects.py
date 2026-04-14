@@ -83,12 +83,12 @@ def load_object(name):
         if os.path.exists(path):
             data["stages"][sname] = torch.load(path, weights_only=False, map_location="cpu")
 
-    # Also load final grasps as a stage
+    # Load final grasps (with correct feasibility) — ALWAYS prefer over stage snapshot
     grasps_path = os.path.join(obj_dir, "grasps.pt")
     if os.path.exists(grasps_path):
         grasps = torch.load(grasps_path, weights_only=False, map_location="cpu")
-        if grasps and "3_optimized" not in data["stages"]:
-            data["stages"]["3_optimized"] = grasps
+        if grasps:
+            data["stages"]["3_optimized"] = grasps  # overwrite stage snapshot
 
     # Load metadata
     meta_path = os.path.join(obj_dir, "meta.pt")
