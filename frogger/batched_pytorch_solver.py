@@ -2931,7 +2931,7 @@ class BatchedGraspOptimizer:
                 feasible = (opt_mask
                             & (surf_err < 0.008)  # 8mm surface
                             & (max_col_viol < 0.003)  # 3mm non-ds collision margin
-                            & (ds_worst > -0.005)  # 5mm max ds penetration
+                            & (ds_worst > -0.012)  # 12mm max ds penetration (fingertip wraps around curved surfaces)
                             & (sc_min_d > 0.001)  # 1mm self-collision
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
