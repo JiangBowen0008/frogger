@@ -1095,51 +1095,8 @@ class BatchedGraspOptimizer:
         print(f"  Self-collision: {len(self._self_col_pairs)} pairs, {n_sc_pts} box pts "
               f"(separate from {sum(p.shape[0] for _, p in col_data)} collision pts)")
 
-        # ── Box-level self-collision data (for analytical box-box SDF) ──
-        # Store per-link box primitives: (link_name, [(center, rotation, half_extents)])
-        self._box_primitives = {}  # link_name -> list of (center_h, R, half) tensors
-        for _le in _tree_sc.getroot().findall("link"):
-            _ln = _le.get("name")
-            if _ln not in self.collision_link_names:
-                continue
-            boxes = []
-            for _col_elem in _le.findall("collision"):
-                _g = _col_elem.find("geometry")
-                if _g is None: continue
-                _b = _g.find("box")
-                if _b is None: continue
-                _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
-                _o = _col_elem.find("origin")
-                _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
-                _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
-                _R = ScipyR.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
-                # Store as homogeneous center + rotation + half-extents
-                center_h = np.array([*_p, 1.0], dtype=np.float32)
-                boxes.append((
-                    torch.tensor(center_h, device=self.device),
-                    torch.tensor(_R, dtype=torch.float32, device=self.device),
-                    torch.tensor([_sx/2, _sy/2, _sz/2], dtype=torch.float32, device=self.device),
-                ))
-            if boxes:
-                self._box_primitives[_ln] = boxes
-
-        # Build box-box SC pairs: all non-adjacent box pairs from different fingers
-        self._box_sc_pairs = []  # [(link_A, box_idx_A, link_B, box_idx_B)]
-        for nm_i in self._box_primitives:
-            for nm_j in self._box_primitives:
-                if nm_i >= nm_j: continue
-                short_i = nm_i.replace(_prefix, '')
-                short_j = nm_j.replace(_prefix, '')
-                if (short_i, short_j) in _adjacent or (short_j, short_i) in _adjacent:
-                    continue
-                fi = short_i.split('_')[0] if '_' in short_i else short_i
-                fj = short_j.split('_')[0] if '_' in short_j else short_j
-                if fi == fj and fi != 'palm':
-                    continue
-                for bi in range(len(self._box_primitives[nm_i])):
-                    for bj in range(len(self._box_primitives[nm_j])):
-                        self._box_sc_pairs.append((nm_i, bi, nm_j, bj))
-        print(f"  Box-box SC pairs: {len(self._box_sc_pairs)}")
+        # Box-box SC pairs removed — too slow in Python loop (1700 pairs).
+        # The analytical box_box_sdf_batch is available for verification.
 
     def _precompute_collision_points_mesh(self):
         """Fallback: sample collision points from visual meshes (for Allegro)."""
