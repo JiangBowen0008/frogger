@@ -99,6 +99,64 @@ class BatchedSDF:
         )
         self.obj_center = (self.obj_bbox_min + self.obj_bbox_max) / 2
 
+    def add_clearance_volume(self, center, direction, radius=0.015, height=0.05):
+        """Add a cylindrical no-go zone to the SDF.
+
+        Any SDF grid point inside the cylinder gets set to a negative value
+        (as if inside a solid object). This makes all collision checks
+        automatically avoid this region.
+
+        Args:
+            center: [3] world-frame position (start of cylinder)
+            direction: [3] world-frame direction (cylinder axis, normalized)
+            radius: cylinder radius in meters (default 1.5cm)
+            height: cylinder height in meters (default 5cm)
+        """
+        center = np.asarray(center, dtype=np.float64)
+        direction = np.asarray(direction, dtype=np.float64)
+        direction = direction / np.linalg.norm(direction)
+
+        res = self.sdf_tensor.shape[2]
+        lin = [np.linspace(self.bbox_min[i], self.bbox_max[i], res) for i in range(3)]
+        gx, gy, gz = np.meshgrid(*lin, indexing="ij")
+        pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
+
+        # Project onto cylinder axis
+        delta = pts - center
+        proj_along = delta @ direction  # signed distance along axis
+        proj_perp = delta - np.outer(proj_along, direction).reshape(-1, 3)
+        perp_dist = np.linalg.norm(proj_perp, axis=-1)
+
+        # Inside cylinder: 0 <= proj_along <= height AND perp_dist <= radius
+        inside = (proj_along >= 0) & (proj_along <= height) & (perp_dist <= radius)
+
+        if inside.any():
+            sdf_np = self.sdf_tensor[0, 0].cpu().numpy().ravel()
+            # Set SDF to negative where inside cylinder (min with existing)
+            sdf_np[inside] = np.minimum(sdf_np[inside], -0.01)
+            self.sdf_tensor = (
+                torch.tensor(sdf_np.reshape(res, res, res),
+                             dtype=torch.float32, device=self.sdf_tensor.device)
+                .unsqueeze(0).unsqueeze(0)
+            )
+            n_modified = inside.sum()
+            print(f"  Actuation clearance: {n_modified} grid points set to SDF<0 "
+                  f"(r={radius*1000:.0f}mm h={height*1000:.0f}mm)")
+
+    def add_floor(self, z_min):
+        """Set SDF to negative below z_min (object bottom = table surface)."""
+        res = self.sdf_tensor.shape[2]
+        lin_z = np.linspace(self.bbox_min[2], self.bbox_max[2], res)
+        sdf_np = self.sdf_tensor[0, 0].cpu().numpy()
+        for zi, z in enumerate(lin_z):
+            if z < z_min:
+                sdf_np[:, :, zi] = np.minimum(sdf_np[:, :, zi], -0.01)
+        self.sdf_tensor = (
+            torch.tensor(sdf_np, dtype=torch.float32, device=self.sdf_tensor.device)
+            .unsqueeze(0).unsqueeze(0)
+        )
+        print(f"  Floor added at z={z_min*1000:.0f}mm")
+
     def query(self, points: torch.Tensor) -> torch.Tensor:
         """Differentiable SDF look-up.  points [B,N,3] -> [B,N]."""
         B, N, _ = points.shape
@@ -3019,7 +3077,7 @@ class BatchedGraspOptimizer:
                             if _md < worst_sc: worst_sc = _md
                             if _md < 0.003: sc_bad.append(f"{_ni}-{_nj}")
                     r["sc_worst"] = float(worst_sc)
-                    if worst_sc < 0.0005:
+                    if worst_sc < 0.002:  # 2mm — catch link overlap
                         r["feasible"] = False
 
                     f_tag = "FEAS" if r["feasible"] else "FAIL"
