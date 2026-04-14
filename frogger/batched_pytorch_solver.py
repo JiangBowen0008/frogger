@@ -2285,7 +2285,10 @@ class BatchedGraspOptimizer:
                     act_fi = self.amap[b, 0]
                     for fi in range(4):
                         if fi != act_fi:
-                            opt_joint_mask[b, fi*4:fi*4+4] = True
+                            # Optimize MCP, PIP, DIP (joints 1-3). Freeze CMC (joint 0).
+                            # CMC controls finger spread — init places it to avoid actuation.
+                            # Optimizing CMC undoes the spreading within ~10 steps.
+                            opt_joint_mask[b, fi*4+1:fi*4+4] = True
                             sup_finger_mask_opt[b, fi] = True
 
                 prefixes_opt = ['if', 'mf', 'rf', 'th']
