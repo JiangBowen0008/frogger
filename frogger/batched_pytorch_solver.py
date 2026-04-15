@@ -2844,14 +2844,19 @@ class BatchedGraspOptimizer:
                 col_violation = F.relu(self._col_margins[non_ds_mask] - cs_final[:, non_ds_mask])
                 max_col_viol = col_violation.max(-1).values
 
-                # Self-collision
+                # Self-collision: min distance + overlap fraction
                 sc_cp = self._get_sc_points(fk_final, bT_final)
                 sc_min_d = torch.full((B,), 1.0, device=dev)
+                sc_max_overlap = torch.zeros(B, device=dev)
                 if sc_cp is not None:
                     for sc_i1, sc_i2 in self._self_col_pairs:
                         d = torch.cdist(sc_cp[:, sc_i1], sc_cp[:, sc_i2])
                         pair_min = d.reshape(B, -1).min(-1).values
                         sc_min_d = torch.minimum(sc_min_d, pair_min)
+                        # Overlap fraction: % of A's points with nearest B within 10mm
+                        nn_d = d.min(dim=-1).values  # [B, n1]
+                        frac = (nn_d < 0.010).float().mean(dim=-1)  # [B]
+                        sc_max_overlap = torch.maximum(sc_max_overlap, frac)
 
                 # Actuation distance
                 act_dist = torch.full((B,), 999.0, device=dev)
@@ -2862,9 +2867,10 @@ class BatchedGraspOptimizer:
 
                 # Feasibility: only candidates that passed opt_mask + quality checks
                 feasible = (opt_mask
-                            & (surf_err < 0.008)  # 8mm surface (ds collision push-out makes 5mm too strict)
+                            & (surf_err < 0.008)  # 8mm surface
                             & (max_col_viol < 0.003)  # 3mm collision margin
-                            & (sc_min_d > 0.001)  # 1mm self-collision
+                            & (sc_min_d > 0.001)  # 1mm self-collision min distance
+                            & (sc_max_overlap < 0.15)  # max 15% overlap between any link pair
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
                     feasible = feasible & (act_dist < 0.010)  # 10mm actuation
