@@ -2378,9 +2378,9 @@ class BatchedGraspOptimizer:
                                 worst_act_link[b] = torch.minimum(worst_act_link[b], lsdf[b])
 
                 opt_mask = ((act_d < 0.010) & (tip_sdf_mean < 0.015)
-                           & (worst_sup_link > -0.005) & (worst_act_link > -0.005))
+                           & (worst_sup_link > -0.005) & (worst_act_link > -0.010))
                 n_opt = opt_mask.sum().item()
-                n_act_filtered = ((worst_act_link <= -0.005) & (act_d < 0.010)).sum().item()
+                n_act_filtered = ((worst_act_link <= -0.010) & (act_d < 0.010)).sum().item()
                 print(f"  Optimization candidates: {n_opt}/{B} ({n_act_filtered} filtered by act collision)")
 
             if n_opt > 0:
