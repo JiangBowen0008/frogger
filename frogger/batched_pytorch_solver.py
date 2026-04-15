@@ -387,7 +387,7 @@ def compute_wrench_matrix(G, F_prim, nc, ns):
     return W
 
 
-def solve_min_weight_lp_batch(W_batch_np):
+def solve_min_weight_lp_batch(W_batch_np, env_mask=None):
     """Solve min-weight LP for a batch of wrench matrices.
 
     For each W [6, m], solves:
@@ -395,6 +395,8 @@ def solve_min_weight_lp_batch(W_batch_np):
 
     Args:
         W_batch_np: numpy array [B, 6, m]
+        env_mask: optional boolean array [B] — only solve LP for True entries.
+                  If None, solve for all environments.
 
     Returns:
         l_stars: [B] optimal min-weight values
@@ -419,16 +421,23 @@ def solve_min_weight_lp_batch(W_batch_np):
     A_ub[:, :m] = -np.eye(m)
     A_ub[:, -1] = 1.0
     b_ub = np.zeros(m)
+    b_eq = np.array([0.,0.,0.,0.,0.,0.,1.])
 
-    for b in range(B):
+    # Determine which envs to solve
+    if env_mask is not None:
+        solve_indices = np.where(env_mask)[0]
+    else:
+        solve_indices = np.arange(B)
+
+    for b in solve_indices:
         W = W_batch_np[b]
         A_eq = np.zeros((7, m + 1))
         A_eq[:6, :m] = W
         A_eq[6, :m] = 1.0
 
         try:
-            res = scipy_linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=np.array([0.,0.,0.,0.,0.,0.,1.]),
-                                method='highs', options={'presolve': False})
+            res = scipy_linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                                method='highs-ds', options={'presolve': False})
             if res.success:
                 l_stars[b] = res.x[-1]
                 alphas[b] = res.x[:m]
@@ -2157,7 +2166,8 @@ class BatchedGraspOptimizer:
                                 lp = (bT_ik @ fk_ik[ln].get_matrix())[:, :3, 3]
                                 below = F.relu(self._obj_z_min - lp[:, 2]) ** 2
                                 loss_sup += sup_finger_mask[:, fi].float() * 1000 * below
-                            # Link collision (exclude ds = fingertip touching surface)
+                            # Link collision: non-ds links penalize any penetration,
+                            # ds links allow 3mm contact but penalize deep penetration
                             if suf in ('bs', 'px', 'md', 'mp'):
                                 for cnm, clp in self._col_data:
                                     if cnm == ln and ln in fk_ik:
@@ -2166,6 +2176,17 @@ class BatchedGraspOptimizer:
                                         lsdf = self.sdf.query(lwp)
                                         col_pen = F.relu(-lsdf).sum(-1)
                                         loss_sup += sup_finger_mask[:, fi].float() * 50 * col_pen
+                            elif suf == 'ds':
+                                # Fingertip ds: allow light contact (3mm) but prevent
+                                # deep penetration that optimization can't fix later
+                                for cnm, clp in self._col_data:
+                                    if cnm == ln and ln in fk_ik:
+                                        lwT = bT_ik @ fk_ik[ln].get_matrix()
+                                        lwp = (lwT @ clp.T)[:, :3, :].transpose(1, 2)
+                                        lsdf = self.sdf.query(lwp)
+                                        # Worst penetration beyond 3mm threshold
+                                        deep_pen = F.relu(-lsdf - 0.003).max(-1).values
+                                        loss_sup += sup_finger_mask[:, fi].float() * 200 * deep_pen ** 2
 
                     # Support vs actuation finger repulsion using SC box points.
                     # _sc_data has box keypoints per link — much better than origins.
@@ -2549,11 +2570,25 @@ class BatchedGraspOptimizer:
                                 # σ_min gradient (fast, every step)
                                 total_loss += group_mask.float() * fc_weight * 0.5 * (-s)
 
-                                # l* gradient every 5 steps (authoritative, slower)
-                                if opt_step % 5 == 0:
+                                # l* gradient with adaptive frequency and env filtering.
+                                # Adaptive LP frequency: early steps (FC just started) run
+                                # less often; mid-range steps run most often; late steps
+                                # taper off as grasps are near convergence.
+                                _lp_step = opt_step - fc_start_step  # steps since FC started
+                                if _lp_step < 50:
+                                    _lp_freq = 20   # FC just ramping up, l* not useful yet
+                                elif _lp_step < 150:
+                                    _lp_freq = 5    # active FC optimization, l* gradient important
+                                else:
+                                    _lp_freq = 10   # near convergence, less benefit
+
+                                if opt_step % _lp_freq == 0:
                                     with torch.no_grad():
                                         W_np = W.detach().cpu().numpy()
-                                        ls, al, la, nu = solve_min_weight_lp_batch(W_np)
+                                        # Only solve LP for envs in this group with σ_min > 0.01
+                                        # (others have no meaningful FC, LP gradient won't help)
+                                        lp_mask_np = group_mask.cpu().numpy() & (s.detach().cpu().numpy() > 0.01)
+                                        ls, al, la, nu = solve_min_weight_lp_batch(W_np, env_mask=lp_mask_np)
                                         dl_dW = min_weight_gradient_batch(W_np, ls, al, la, nu, device=dev)
                                     lstar_loss = -(dl_dW * W).sum(dim=(1, 2))
                                     valid = torch.tensor(ls > -0.99, device=dev)
@@ -2877,12 +2912,11 @@ class BatchedGraspOptimizer:
                     s = torch.linalg.svdvals(W)[:, -1]
                     sigma_all[group] = s[group]
 
-                    # l* via LP for this group
+                    # l* via LP for this group only (skip non-group envs)
                     W_np = W.cpu().numpy()
-                    ls, _, _, _ = solve_min_weight_lp_batch(W_np)
-                    for b in range(B):
-                        if group[b]:
-                            final_lstars[b] = ls[b]
+                    group_np = group.cpu().numpy()
+                    ls, _, _, _ = solve_min_weight_lp_batch(W_np, env_mask=group_np)
+                    final_lstars[group_np] = ls[group_np]
 
                 final_lstars_t = torch.tensor(final_lstars, dtype=torch.float32, device=dev)
                 final_lstars_t = torch.tensor(final_lstars, dtype=torch.float32, device=dev)
