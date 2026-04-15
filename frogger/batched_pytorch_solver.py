@@ -2976,7 +2976,7 @@ class BatchedGraspOptimizer:
                         "surf_err": float(surf_err[ix]),
                         "min_col": float(cs_final[ix].min()),
                         "sigma_min": float(sigma_all[ix]),
-                        "sc_min_dist": float(sc_min_d[ix]),
+                        "sc_min_dist": float(sc_worst_sdf[ix]),
                     })
                     # Add init metadata
                     if hasattr(self, '_init_surf_pts') and ix < len(self._init_surf_pts):
