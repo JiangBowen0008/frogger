@@ -2488,7 +2488,19 @@ class BatchedGraspOptimizer:
                                 W = compute_wrench_matrix(G, F_prim, nc_fc, ns)
                                 s = torch.linalg.svdvals(W)[:, -1]
                                 sigma[group_mask] = s[group_mask].detach()
-                                total_loss += group_mask.float() * fc_weight * (-s)
+                                # σ_min gradient (fast, every step)
+                                total_loss += group_mask.float() * fc_weight * 0.5 * (-s)
+
+                                # l* gradient (authoritative, every 10 steps)
+                                if opt_step % 10 == 0:
+                                    with torch.no_grad():
+                                        W_np = W.detach().cpu().numpy()
+                                        ls, al, la, nu = solve_min_weight_lp_batch(W_np)
+                                        dl_dW = min_weight_gradient_batch(W_np, ls, al, la, nu, device=dev)
+                                    # Inject l* gradient: loss = -l* ≈ -(dl_dW * W).sum()
+                                    lstar_loss = -(dl_dW * W).sum(dim=(1, 2))
+                                    valid = torch.tensor(ls > -0.99, device=dev)
+                                    total_loss += (group_mask & valid).float() * fc_weight * 2.0 * lstar_loss
 
                         # ── Section D: Inter-finger self-collision ──
                         # Directly optimize sc_min_d (same metric as feasibility check).
