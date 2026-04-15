@@ -990,6 +990,27 @@ class BatchedGraspOptimizer:
             print(f"  Box-grid collision: {len(col_data)} links, "
                   f"{n_total} points ({_pitch*1000:.0f}mm grid + {tip_pts_added} tip surface pts)")
 
+            # Side-aware ds collision: classify ds points as back-side vs pad-side.
+            # The fingertip pad faces -y in link frame. Points near the pad tip
+            # (y < -15mm) wrap around curved surfaces by design — checking them
+            # for collision penalizes normal contact physics.
+            # Only back-side points (y > -15mm) indicate actual penetration.
+            ds_back_mask = torch.zeros(n_total, device=self.device, dtype=torch.bool)
+            n_back = 0
+            for li, (nm, pts) in enumerate(col_data):
+                if "_ds" not in nm:
+                    continue
+                si, ei = col_link_ranges[li]
+                local_y = pts[:, 1]  # y-coordinate in link frame
+                # Back/side: y > -15mm (URDF boxes + body region)
+                # Pad extension: y < -20mm (visual mesh surface only)
+                back = (local_y > -0.015)
+                ds_back_mask[si:ei] = back
+                n_back += back.sum().item()
+            self._ds_back_mask = ds_back_mask
+            print(f"  Side-aware ds: {n_back} back-side points (collision-checked), "
+                  f"{n_total - n_back} pad-side (wrapping allowed)")
+
         else:
             # Allegro: original mesh-based collision points
             self._precompute_collision_points_mesh()
@@ -2177,14 +2198,15 @@ class BatchedGraspOptimizer:
                                         col_pen = F.relu(-lsdf).sum(-1)
                                         loss_sup += sup_finger_mask[:, fi].float() * 50 * col_pen
                             elif suf == 'ds':
-                                # Fingertip ds: allow light contact (3mm) but prevent
-                                # deep penetration that optimization can't fix later
-                                for cnm, clp in self._col_data:
+                                # Fingertip ds: back-side only (pad wrapping is expected).
+                                for ci_ik, (cnm, clp) in enumerate(self._col_data):
                                     if cnm == ln and ln in fk_ik:
+                                        si_ik, ei_ik = self._col_link_ranges[ci_ik]
+                                        back_m_ik = self._ds_back_mask[si_ik:ei_ik]
+                                        if not back_m_ik.any(): continue
                                         lwT = bT_ik @ fk_ik[ln].get_matrix()
-                                        lwp = (lwT @ clp.T)[:, :3, :].transpose(1, 2)
+                                        lwp = (lwT @ clp[back_m_ik].T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
-                                        # Worst penetration beyond 3mm threshold
                                         deep_pen = F.relu(-lsdf - 0.003).max(-1).values
                                         loss_sup += sup_finger_mask[:, fi].float() * 200 * deep_pen ** 2
 
@@ -2484,16 +2506,20 @@ class BatchedGraspOptimizer:
                                         lsdf = self.sdf.query(lwp)
                                         total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
 
-                            # B2: Fingertip ds collision (worst penetration², allow 1mm contact)
-                            # Match surface loss scaling: surface = 1000 * sdf²,
-                            # so B2 = 1000 * max_pen² — same order of magnitude.
+                            # B2: Fingertip ds back-side collision only.
+                            # Pad-side points (y < -15mm in link frame) wrap around
+                            # curved surfaces by design — penalizing them fights surface contact.
+                            # Only back-side points indicate actual finger-through-object.
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 for ci, cnm in sup_col_idx_ds[fi]:
                                     lp = self._col_data[ci][1]
                                     if cnm in fk_o:
+                                        si, ei = self._col_link_ranges[ci]
+                                        back_m = self._ds_back_mask[si:ei]
+                                        if not back_m.any(): continue
                                         lwT = bT_o @ fk_o[cnm].get_matrix()
-                                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                        lwp = (lwT @ lp[back_m].T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
                                         worst_pen = F.relu(-lsdf - 0.001).max(-1).values
                                         total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * worst_pen ** 2
@@ -2594,20 +2620,60 @@ class BatchedGraspOptimizer:
                                     valid = torch.tensor(ls > -0.99, device=dev)
                                     total_loss += (group_mask & valid).float() * fc_weight * 3.0 * lstar_loss
 
-                        # ── Section D: Inter-finger self-collision ──
-                        # Directly optimize sc_min_d (same metric as feasibility check).
-                        # Also add overlap fraction for gross overlap detection.
-                        sc_pts = self._get_sc_points(fk_o, bT_o)
-                        if sc_pts is not None:
-                            for sc_i1, sc_i2 in self._self_col_pairs:
-                                d = torch.cdist(sc_pts[:, sc_i1], sc_pts[:, sc_i2])
-                                pair_min = d.reshape(B, -1).min(-1).values  # [B]
-                                # Direct penalty on min distance (matches feasibility sc_min_d > 1mm)
-                                total_loss += opt_mask.float() * 500 * F.relu(0.002 - pair_min) ** 2
-                                # Overlap fraction for gross overlap detection
-                                nn_d_A = d.min(dim=-1).values
-                                frac_A = (nn_d_A < 0.010).float().mean(dim=-1)
-                                total_loss += opt_mask.float() * 500 * frac_A
+                        # ── Section D: Inter-finger self-collision (box-box SDF) ──
+                        # Use box-box SDF directly — matches the feasibility metric.
+                        # Only process opt_mask envs and skip distant pairs for efficiency.
+                        # Computed every 10 steps to amortize cost.
+                        if hasattr(self, '_box_primitives') and opt_step % 10 == 0:
+                            _prefix_d = f"leap_{self.hand}_"
+                            _adj_d = {
+                                ('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
+                                ('if_bs','if_px'),('if_px','if_md'),('if_md','if_ds'),
+                                ('mf_bs','mf_px'),('mf_px','mf_md'),('mf_md','mf_ds'),
+                                ('rf_bs','rf_px'),('rf_px','rf_md'),('rf_md','rf_ds'),
+                                ('th_mp','th_bs'),('th_bs','th_px'),('th_px','th_ds')}
+                            # Only process opt_mask envs to save memory
+                            opt_idx_d = torch.where(opt_mask)[0]
+                            B_d = len(opt_idx_d)
+                            if B_d > 0:
+                                bT_d = bT_o[opt_idx_d]
+                                fk_d_matrices = {}
+                                for nm_d in self._box_primitives:
+                                    if nm_d in fk_o:
+                                        fk_d_matrices[nm_d] = fk_o[nm_d].get_matrix()[opt_idx_d]
+                                _link_wT_d = {}
+                                for nm_d in self._box_primitives:
+                                    if nm_d in fk_d_matrices:
+                                        _link_wT_d[nm_d] = bT_d @ fk_d_matrices[nm_d]
+                                sc_loss_d = torch.zeros(B_d, device=dev)
+                                for nm_i in self._box_primitives:
+                                    if nm_i not in _link_wT_d: continue
+                                    for nm_j in self._box_primitives:
+                                        if nm_j not in _link_wT_d or nm_i >= nm_j: continue
+                                        si_d = nm_i.replace(_prefix_d, '')
+                                        sj_d = nm_j.replace(_prefix_d, '')
+                                        if (si_d, sj_d) in _adj_d or (sj_d, si_d) in _adj_d: continue
+                                        fi_d = si_d.split('_')[0]; fj_d = sj_d.split('_')[0]
+                                        if fi_d == fj_d and fi_d != 'palm': continue
+                                        for bi_c, bi_r, bi_h in self._box_primitives[nm_i]:
+                                            for bj_c, bj_r, bj_h in self._box_primitives[nm_j]:
+                                                ci_w = (_link_wT_d[nm_i] @ bi_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                                ri_w = _link_wT_d[nm_i][:, :3, :3] @ bi_r.unsqueeze(0)
+                                                cj_w = (_link_wT_d[nm_j] @ bj_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                                rj_w = _link_wT_d[nm_j][:, :3, :3] @ bj_r.unsqueeze(0)
+                                                # Skip distant pairs (centers > 40mm apart)
+                                                cdist = (ci_w - cj_w).norm(dim=-1)
+                                                close = cdist < 0.040
+                                                if not close.any(): continue
+                                                sd = box_box_sdf_batch(
+                                                    ci_w, ri_w, bi_h.unsqueeze(0).expand(B_d, -1),
+                                                    cj_w, rj_w, bj_h.unsqueeze(0).expand(B_d, -1))
+                                                overlap = F.relu(-sd - 0.001)
+                                                sc_loss_d += 2000 * overlap ** 2
+                                # Scatter back to full batch
+                                sc_loss_full = torch.zeros(B, device=dev)
+                                sc_loss_full[opt_idx_d] = sc_loss_d
+                                total_loss += sc_loss_full
 
                         # ── Section E: Actuation area exclusion ──
                         # Support tips within 35mm of actuation FINGER get pushed away
@@ -2979,19 +3045,22 @@ class BatchedGraspOptimizer:
                         fi = self.amap_t[:, j]
                         act_dist = torch.norm(tp_final[torch.arange(B, device=dev), fi] - ap[j], dim=-1)
 
-                # ds deep penetration: worst SDF across ds collision points
-                ds_worst = torch.zeros(B, device=dev)
+                # ds back-side penetration: only check back/side points (y > -15mm in link frame).
+                # Pad-side points (y < -15mm) wrap around curved surfaces by design.
+                ds_back_worst = torch.zeros(B, device=dev)
                 for li, (nm, _) in enumerate(self._col_data):
                     if "_ds" not in nm: continue
                     si, ei = self._col_link_ranges[li]
-                    ds_sdf = cs_final[:, si:ei].min(-1).values
-                    ds_worst = torch.minimum(ds_worst, ds_sdf)
+                    back_mask_li = self._ds_back_mask[si:ei]
+                    if back_mask_li.any():
+                        ds_back_sdf = cs_final[:, si:ei][:, back_mask_li].min(-1).values
+                        ds_back_worst = torch.minimum(ds_back_worst, ds_back_sdf)
 
                 # Feasibility: only candidates that passed opt_mask + quality checks
                 feasible = (opt_mask
                             & (surf_err < 0.008)  # 8mm surface
                             & (max_col_viol < 0.003)  # 3mm non-ds collision margin
-                            & (ds_worst > -0.015)  # 15mm max ds pen (catches full insertion, allows normal wrapping)
+                            & (ds_back_worst > -0.005)  # 5mm back-side ds pen (catches insertion, ignores pad wrapping)
                             & (sc_worst_sdf > -0.001)  # box-box SDF > -1mm (no inter-finger overlap)
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
@@ -3022,12 +3091,16 @@ class BatchedGraspOptimizer:
                 n_lstar = has_lstar.sum().item()
                 n_surf_ok = (surf_err < 0.005).sum().item()
                 n_col_ok = (max_col_viol < 0.002).sum().item()
+                n_ds_ok = (ds_back_worst > -0.005).sum().item()
+                n_sc_ok = (sc_worst_sdf > -0.001).sum().item()
                 print(f"\n  === Optimization Results ===")
                 print(f"  {n_feasible}/{n_opt} feasible | l*>0: {n_lstar} | σ>0.01: {n_fc} | "
-                      f"surf<5mm: {n_surf_ok} | col<2mm: {n_col_ok}")
+                      f"surf<5mm: {n_surf_ok} | col<2mm: {n_col_ok} | "
+                      f"ds_back<5mm: {n_ds_ok} | sc>-1mm: {n_sc_ok}")
                 bi = order[0].item()
                 print(f"  Best: idx={bi} σ_min={sigma_all[bi]:.4f} l*={final_lstars[bi]:.4f} "
-                      f"surf={surf_err[bi]*1000:.1f}mm col={max_col_viol[bi]*1000:.1f}mm")
+                      f"surf={surf_err[bi]*1000:.1f}mm col={max_col_viol[bi]*1000:.1f}mm "
+                      f"ds_back={ds_back_worst[bi]*1000:.1f}mm sc_sdf={sc_worst_sdf[bi]*1000:.1f}mm")
 
                 # Build result list
                 R_all = self._rot6d_to_matrix(self.rot6d)
@@ -3052,6 +3125,8 @@ class BatchedGraspOptimizer:
                         "act_dist": float(act_dist[ix]) if n_act else 0.0,
                         "surf_err": float(surf_err[ix]),
                         "min_col": float(cs_final[ix].min()),
+                        "max_col_viol": float(max_col_viol[ix]),
+                        "ds_back_worst": float(ds_back_worst[ix]),
                         "sigma_min": float(sigma_all[ix]),
                         "sc_min_dist": float(sc_worst_sdf[ix]),
                     })
