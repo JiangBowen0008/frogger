@@ -99,6 +99,40 @@ class BatchedSDF:
         )
         self.obj_center = (self.obj_bbox_min + self.obj_bbox_max) / 2
 
+    def add_clearance_volume(self, center, direction, radius=0.015, height=0.05):
+        """Add cylindrical no-go zone to SDF (solid obstacle)."""
+        center = np.asarray(center, dtype=np.float64)
+        direction = np.asarray(direction, dtype=np.float64)
+        direction = direction / np.linalg.norm(direction)
+        res = self.sdf_tensor.shape[2]
+        lin = [np.linspace(self.bbox_min[i], self.bbox_max[i], res) for i in range(3)]
+        gx, gy, gz = np.meshgrid(*lin, indexing="ij")
+        pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
+        delta = pts - center
+        proj = delta @ direction
+        perp = np.linalg.norm(delta - np.outer(proj, direction).reshape(-1, 3), axis=-1)
+        inside = (proj >= 0) & (proj <= height) & (perp <= radius)
+        if inside.any():
+            sdf_np = self.sdf_tensor[0, 0].cpu().numpy().ravel()
+            sdf_np[inside] = np.minimum(sdf_np[inside], -0.01)
+            self.sdf_tensor = torch.tensor(
+                sdf_np.reshape(res, res, res), dtype=torch.float32, device=self.sdf_tensor.device
+            ).unsqueeze(0).unsqueeze(0)
+            print(f"  Actuation clearance: {inside.sum()} voxels (r={radius*1000:.0f}mm h={height*1000:.0f}mm)")
+
+    def add_floor(self, z_min):
+        """Set SDF negative below z_min (table surface)."""
+        res = self.sdf_tensor.shape[2]
+        lin_z = np.linspace(self.bbox_min[2], self.bbox_max[2], res)
+        sdf_np = self.sdf_tensor[0, 0].cpu().numpy()
+        for zi, z in enumerate(lin_z):
+            if z < z_min:
+                sdf_np[:, :, zi] = np.minimum(sdf_np[:, :, zi], -0.01)
+        self.sdf_tensor = torch.tensor(
+            sdf_np, dtype=torch.float32, device=self.sdf_tensor.device
+        ).unsqueeze(0).unsqueeze(0)
+        print(f"  Floor at z={z_min*1000:.0f}mm")
+
     def query(self, points: torch.Tensor) -> torch.Tensor:
         """Differentiable SDF look-up.  points [B,N,3] -> [B,N]."""
         B, N, _ = points.shape

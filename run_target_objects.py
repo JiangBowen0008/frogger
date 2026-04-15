@@ -61,6 +61,10 @@ def run_object(name):
 
     try:
         sdf = BatchedSDF(mesh, X_WO, bounds_padding=0.15, resolution=128, device="cuda")
+        # Actuation clearance: 3cm diameter × 5cm tall cylinder (user spec)
+        sdf.add_clearance_volume(actuation_targets[0][0], actuation_targets[0][1],
+                                 radius=0.015, height=0.05)
+        sdf.add_floor(0.0)
         opt = BatchedGraspOptimizer(
             sdf, num_envs=NUM_ENVS, device="cuda",
             hand="rh", hand_type="leap", palm_contact=True,
