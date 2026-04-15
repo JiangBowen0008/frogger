@@ -2402,8 +2402,10 @@ class BatchedGraspOptimizer:
                 sfx_no_ds = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
                 sfx_all = [['bs', 'px', 'md', 'ds']] * 3 + [['mp', 'bs', 'px', 'ds']]
 
-                u_opt = self.u.detach().clone().requires_grad_(True)
-                opt_adam = torch.optim.Adam([u_opt], lr=0.005)
+                # Direct-q parameterization: optimize joint angles directly with clamp projection.
+                # Eliminates sigmoid gradient compression (14x weaker at joint limits).
+                q_opt = self._u2q(self.u).detach().clone().requires_grad_(True)
+                q_init = q_opt.detach().clone()  # for frozen-joint regularization
 
                 # Pre-compute support finger collision link names
                 prefixes_opt = ['if', 'mf', 'rf', 'th']
@@ -2444,15 +2446,15 @@ class BatchedGraspOptimizer:
 
                 if opt_variant in ("A", "B", "C"):
                     # ── Simple Adam loop (all variants A/B/C) ──
-                    opt_adam = torch.optim.Adam([u_opt], lr=0.005)
+                    opt_adam = torch.optim.Adam([q_opt], lr=0.003)
                     fc_start_step = 50
                     fc_weight = 1.0
                     mink_k = 10  # number of lowest SDF points for variants B/C
-                    print(f"  Variant {opt_variant} Adam optimization ({opt_steps} steps)")
+                    print(f"  Variant {opt_variant} Adam optimization ({opt_steps} steps, direct-q)")
 
                     for opt_step in range(opt_steps):
                         opt_adam.zero_grad()
-                        q_o = self._u2q(u_opt)
+                        q_o = q_opt
                         bT_o = self._base_T(self.pos.detach(), self.rot6d.detach())
                         fk_o = self.chain.forward_kinematics(q_o)
 
@@ -2699,18 +2701,21 @@ class BatchedGraspOptimizer:
                                 dist_to_act = torch.norm(tip - act_tip_actual, dim=-1)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(0.035 - dist_to_act) ** 2
 
-                        # Freeze non-support joints
-                        total_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
+                        # Freeze non-support joints (regularize back to initial values)
+                        total_loss += 100 * ((q_opt - q_init) ** 2 * (~opt_joint_mask).float()).sum(-1)
 
                         total_loss.mean().backward()
                         with torch.no_grad():
-                            u_opt.grad[~opt_joint_mask] = 0.0
+                            q_opt.grad[~opt_joint_mask] = 0.0
                         opt_adam.step()
+                        # Project onto joint limits
+                        with torch.no_grad():
+                            q_opt.clamp_(self.q_lo, self.q_lo + self.q_range)
 
                         # ── Logging + trajectory ──
                         if opt_step % 50 == 0:
                             with torch.no_grad():
-                                q_e = self._u2q(u_opt)
+                                q_e = q_opt
                                 bT_e = self._base_T(self.pos, self.rot6d)
                                 fk_e = self.chain.forward_kinematics(q_e)
                                 sup_sdf = []
@@ -2732,7 +2737,8 @@ class BatchedGraspOptimizer:
                                     })
 
                 else:
-                    # ── Original PGD optimization ──
+                    # ── Original PGD optimization (uses sigmoid u-space) ──
+                    u_opt = self.u.detach().clone().requires_grad_(True)
                     lr_fc = 0.01
                     lr_proj = 0.02
                     proj_iters = 2
@@ -2886,7 +2892,8 @@ class BatchedGraspOptimizer:
                                     })
 
                 with torch.no_grad():
-                    self.u = u_opt.detach().requires_grad_(True)
+                    # Convert direct-q back to u-space for consistency
+                    self.u = self._q2u(q_opt.detach()).requires_grad_(True)
 
                 # Rank by combined quality: low surface SDF + low collision + high σ_min
                 with torch.no_grad():
