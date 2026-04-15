@@ -2626,7 +2626,7 @@ class BatchedGraspOptimizer:
                         # Use box-box SDF directly — matches the feasibility metric.
                         # Only process opt_mask envs and skip distant pairs for efficiency.
                         # Computed every 10 steps to amortize cost.
-                        if hasattr(self, '_box_primitives') and opt_step % 10 == 0:
+                        if hasattr(self, '_box_primitives') and opt_step % 5 == 0:
                             _prefix_d = f"leap_{self.hand}_"
                             _adj_d = {
                                 ('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
@@ -2671,7 +2671,7 @@ class BatchedGraspOptimizer:
                                                     ci_w, ri_w, bi_h.unsqueeze(0).expand(B_d, -1),
                                                     cj_w, rj_w, bj_h.unsqueeze(0).expand(B_d, -1))
                                                 overlap = F.relu(-sd - 0.001)
-                                                sc_loss_d += 2000 * overlap ** 2
+                                                sc_loss_d += 5000 * overlap ** 2
                                 # Scatter back to full batch
                                 sc_loss_full = torch.zeros(B, device=dev)
                                 sc_loss_full[opt_idx_d] = sc_loss_d
