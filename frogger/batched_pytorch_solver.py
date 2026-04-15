@@ -2489,18 +2489,18 @@ class BatchedGraspOptimizer:
                                 s = torch.linalg.svdvals(W)[:, -1]
                                 sigma[group_mask] = s[group_mask].detach()
 
-                                # l* gradient every step (the authoritative FC metric)
-                                with torch.no_grad():
-                                    W_np = W.detach().cpu().numpy()
-                                    ls, al, la, nu = solve_min_weight_lp_batch(W_np)
-                                    dl_dW = min_weight_gradient_batch(W_np, ls, al, la, nu, device=dev)
-                                lstar_loss = -(dl_dW * W).sum(dim=(1, 2))
-                                valid = torch.tensor(ls > -0.99, device=dev)
-                                # l* as primary FC objective (weight 5.0)
-                                total_loss += (group_mask & valid).float() * fc_weight * 5.0 * lstar_loss
-                                # σ_min as fallback for envs where LP fails (weight 0.5)
-                                lp_failed = torch.tensor(ls <= -0.99, device=dev)
-                                total_loss += (group_mask & lp_failed).float() * fc_weight * 0.5 * (-s)
+                                # σ_min gradient (fast, every step)
+                                total_loss += group_mask.float() * fc_weight * 0.5 * (-s)
+
+                                # l* gradient every 5 steps (authoritative, slower)
+                                if opt_step % 5 == 0:
+                                    with torch.no_grad():
+                                        W_np = W.detach().cpu().numpy()
+                                        ls, al, la, nu = solve_min_weight_lp_batch(W_np)
+                                        dl_dW = min_weight_gradient_batch(W_np, ls, al, la, nu, device=dev)
+                                    lstar_loss = -(dl_dW * W).sum(dim=(1, 2))
+                                    valid = torch.tensor(ls > -0.99, device=dev)
+                                    total_loss += (group_mask & valid).float() * fc_weight * 3.0 * lstar_loss
 
                         # ── Section D: Inter-finger self-collision ──
                         # Directly optimize sc_min_d (same metric as feasibility check).
