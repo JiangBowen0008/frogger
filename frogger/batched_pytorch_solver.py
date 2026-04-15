@@ -2945,11 +2945,20 @@ class BatchedGraspOptimizer:
                         fi = self.amap_t[:, j]
                         act_dist = torch.norm(tp_final[torch.arange(B, device=dev), fi] - ap[j], dim=-1)
 
+                # ds deep penetration: worst SDF across ds collision points
+                ds_worst = torch.zeros(B, device=dev)
+                for li, (nm, _) in enumerate(self._col_data):
+                    if "_ds" not in nm: continue
+                    si, ei = self._col_link_ranges[li]
+                    ds_sdf = cs_final[:, si:ei].min(-1).values
+                    ds_worst = torch.minimum(ds_worst, ds_sdf)
+
                 # Feasibility: only candidates that passed opt_mask + quality checks
                 feasible = (opt_mask
                             & (surf_err < 0.008)  # 8mm surface
-                            & (max_col_viol < 0.003)  # 3mm collision margin
-                            & (sc_worst_sdf > -0.001)  # box-box SDF > -1mm (no overlap)
+                            & (max_col_viol < 0.003)  # 3mm non-ds collision margin
+                            & (ds_worst > -0.008)  # 8mm max ds penetration
+                            & (sc_worst_sdf > -0.001)  # box-box SDF > -1mm (no inter-finger overlap)
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
                     feasible = feasible & (act_dist < 0.010)  # 10mm actuation
