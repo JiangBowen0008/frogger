@@ -1089,8 +1089,31 @@ class BatchedGraspOptimizer:
         print(f"  Self-collision: {len(self._self_col_pairs)} pairs, {n_sc_pts} box pts "
               f"(separate from {sum(p.shape[0] for _, p in col_data)} collision pts)")
 
-        # Box-box SC pairs removed — too slow in Python loop (1700 pairs).
-        # The analytical box_box_sdf_batch is available for verification.
+        # Store per-link box primitives for feasibility SC check (box-box SDF).
+        # Not used in optimization loop (too slow for 1700 pairs per step),
+        # but used once per grasp in feasibility evaluation.
+        self._box_primitives = {}
+        for _le in _tree_sc.getroot().findall("link"):
+            _ln = _le.get("name")
+            if _ln not in self.collision_link_names: continue
+            boxes = []
+            for _col_elem in _le.findall("collision"):
+                _g = _col_elem.find("geometry")
+                if _g is None: continue
+                _b = _g.find("box")
+                if _b is None: continue
+                _sx, _sy, _sz = [float(x) for x in _b.get("size").split()]
+                _o = _col_elem.find("origin")
+                _p = np.array([float(x) for x in _o.get("xyz", "0 0 0").split()])
+                _rpy = np.array([float(x) for x in _o.get("rpy", "0 0 0").split()])
+                _R = ScipyR.from_euler("xyz", _rpy).as_matrix() if np.any(np.abs(_rpy) > 1e-6) else np.eye(3)
+                boxes.append((
+                    torch.tensor([*_p, 1.0], dtype=torch.float32, device=self.device),
+                    torch.tensor(_R, dtype=torch.float32, device=self.device),
+                    torch.tensor([_sx/2, _sy/2, _sz/2], dtype=torch.float32, device=self.device),
+                ))
+            if boxes:
+                self._box_primitives[_ln] = boxes
 
     def _precompute_collision_points_mesh(self):
         """Fallback: sample collision points from visual meshes (for Allegro)."""
@@ -2844,19 +2867,42 @@ class BatchedGraspOptimizer:
                 col_violation = F.relu(self._col_margins[non_ds_mask] - cs_final[:, non_ds_mask])
                 max_col_viol = col_violation.max(-1).values
 
-                # Self-collision: min distance + overlap fraction
-                sc_cp = self._get_sc_points(fk_final, bT_final)
-                sc_min_d = torch.full((B,), 1.0, device=dev)
-                sc_max_overlap = torch.zeros(B, device=dev)
-                if sc_cp is not None:
-                    for sc_i1, sc_i2 in self._self_col_pairs:
-                        d = torch.cdist(sc_cp[:, sc_i1], sc_cp[:, sc_i2])
-                        pair_min = d.reshape(B, -1).min(-1).values
-                        sc_min_d = torch.minimum(sc_min_d, pair_min)
-                        # Overlap fraction: % of A's points with nearest B within 10mm
-                        nn_d = d.min(dim=-1).values  # [B, n1]
-                        frac = (nn_d < 0.010).float().mean(dim=-1)  # [B]
-                        sc_max_overlap = torch.maximum(sc_max_overlap, frac)
+                # Self-collision: box-box SDF for accurate overlap detection
+                # The 40-point subsample is structurally incapable of detecting
+                # full link overlap. Box-box SDF is exact for box primitives.
+                sc_worst_sdf = torch.full((B,), 1.0, device=dev)
+                if hasattr(self, '_box_primitives'):
+                    _prefix = f"leap_{self.hand}_"
+                    _adj_feas = {
+                        ('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
+                        ('if_bs','if_px'),('if_px','if_md'),('if_md','if_ds'),
+                        ('mf_bs','mf_px'),('mf_px','mf_md'),('mf_md','mf_ds'),
+                        ('rf_bs','rf_px'),('rf_px','rf_md'),('rf_md','rf_ds'),
+                        ('th_mp','th_bs'),('th_bs','th_px'),('th_px','th_ds')}
+                    link_wT = {}
+                    for nm in self._box_primitives:
+                        if nm in fk_final:
+                            link_wT[nm] = bT_final @ fk_final[nm].get_matrix()
+                    for nm_i in self._box_primitives:
+                        if nm_i not in link_wT: continue
+                        for nm_j in self._box_primitives:
+                            if nm_j not in link_wT or nm_i >= nm_j: continue
+                            si = nm_i.replace(_prefix, '')
+                            sj = nm_j.replace(_prefix, '')
+                            if (si, sj) in _adj_feas or (sj, si) in _adj_feas: continue
+                            fi_f = si.split('_')[0]; fj_f = sj.split('_')[0]
+                            if fi_f == fj_f and fi_f != 'palm': continue
+                            # Check all box pairs between these two links
+                            for bi_c, bi_r, bi_h in self._box_primitives[nm_i]:
+                                for bj_c, bj_r, bj_h in self._box_primitives[nm_j]:
+                                    ci_w = (link_wT[nm_i] @ bi_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                    ri_w = link_wT[nm_i][:, :3, :3] @ bi_r.unsqueeze(0)
+                                    cj_w = (link_wT[nm_j] @ bj_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                    rj_w = link_wT[nm_j][:, :3, :3] @ bj_r.unsqueeze(0)
+                                    sd = box_box_sdf_batch(
+                                        ci_w, ri_w, bi_h.unsqueeze(0).expand(B, -1),
+                                        cj_w, rj_w, bj_h.unsqueeze(0).expand(B, -1))
+                                    sc_worst_sdf = torch.minimum(sc_worst_sdf, sd)
 
                 # Actuation distance
                 act_dist = torch.full((B,), 999.0, device=dev)
@@ -2869,8 +2915,7 @@ class BatchedGraspOptimizer:
                 feasible = (opt_mask
                             & (surf_err < 0.008)  # 8mm surface
                             & (max_col_viol < 0.003)  # 3mm collision margin
-                            & (sc_min_d > 0.001)  # 1mm self-collision min distance
-                            & (sc_max_overlap < 0.15)  # max 15% overlap between any link pair
+                            & (sc_worst_sdf > -0.001)  # box-box SDF > -1mm (no overlap)
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
                     feasible = feasible & (act_dist < 0.010)  # 10mm actuation
