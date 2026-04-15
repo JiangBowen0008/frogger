@@ -2667,11 +2667,27 @@ class BatchedGraspOptimizer:
                                                 cdist = (ci_w - cj_w).norm(dim=-1)
                                                 close = cdist < 0.040
                                                 if not close.any(): continue
-                                                sd = box_box_sdf_batch(
-                                                    ci_w, ri_w, bi_h.unsqueeze(0).expand(B_d, -1),
-                                                    cj_w, rj_w, bj_h.unsqueeze(0).expand(B_d, -1))
-                                                overlap = F.relu(-sd - 0.001)
-                                                sc_loss_d += 5000 * overlap ** 2
+                                                # Query all 27 sample points of box_j in box_i's frame
+                                                # and vice versa. Use SUM of violations (not just min)
+                                                # for stronger gradient signal from all overlapping points.
+                                                _sc_offsets = box_box_sdf_batch.__code__.co_consts  # can't easily reuse
+                                                # Just call box_sdf_batch directly for 27 points
+                                                hi = bi_h.unsqueeze(0).expand(B_d, -1)
+                                                hj = bj_h.unsqueeze(0).expand(B_d, -1)
+                                                # 8 corner points of box_j queried against box_i
+                                                corners_j = []
+                                                for sx in [-1, 1]:
+                                                    for sy in [-1, 1]:
+                                                        for sz in [-1, 1]:
+                                                            s = torch.tensor([sx, sy, sz], dtype=torch.float32, device=dev)
+                                                            local = s * hj  # [B_d, 3]
+                                                            world = cj_w + torch.bmm(rj_w, local.unsqueeze(-1)).squeeze(-1)
+                                                            corners_j.append(world)
+                                                pts_j = torch.stack(corners_j, dim=1)  # [B_d, 8, 3]
+                                                sdf_j_in_i = box_sdf_batch(pts_j, ci_w, ri_w, hi)  # [B_d, 8]
+                                                # Sum of violations (each penetrating corner contributes gradient)
+                                                viols = F.relu(-sdf_j_in_i - 0.001)  # [B_d, 8]
+                                                sc_loss_d += 5000 * (viols ** 2).sum(dim=1)
                                 # Scatter back to full batch
                                 sc_loss_full = torch.zeros(B, device=dev)
                                 sc_loss_full[opt_idx_d] = sc_loss_d
