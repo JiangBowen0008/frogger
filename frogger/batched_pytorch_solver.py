@@ -1817,59 +1817,45 @@ class BatchedGraspOptimizer:
                     self.pos.data[can_move] += step_size * best_dir[can_move]
                     total_shift[can_move] += step_size
 
-                # 3a) Collision step: minimize actuation finger link collision
-                u_col = self.u.detach().clone().requires_grad_(True)
-                opt_col = torch.optim.Adam([u_col], lr=0.02)
-                for col_s in range(5):
-                    opt_col.zero_grad()
-                    q_c = self._u2q(u_col)
-                    bT_c = self._base_T(self.pos.detach(), self.rot6d.detach())
-                    fk_c = self.chain.forward_kinematics(q_c)
-                    loss_c = torch.zeros(B, device=dev)
+                # 3) Joint actuation IK: simultaneously reach target AND avoid collision.
+                # Previously split into sequential collision-then-snap phases that
+                # fought each other. Joint optimization finds configurations where
+                # the finger routes AROUND the object body to reach the target.
+                u_act_ik = self.u.detach().clone().requires_grad_(True)
+                opt_act_ik = torch.optim.Adam([u_act_ik], lr=0.02)
+                for act_ik_step in range(30):
+                    opt_act_ik.zero_grad()
+                    q_ai = self._u2q(u_act_ik)
+                    bT_ai = self._base_T(self.pos.detach(), self.rot6d.detach())
+                    fk_ai = self.chain.forward_kinematics(q_ai)
+                    loss_ai = torch.zeros(B, device=dev)
                     for b_fi in range(4):
                         mask_fi = (self.amap_t[:, 0] == b_fi)
                         if not mask_fi.any(): continue
+                        # Target: fingertip on actuation point
+                        nm = self.tip_link_names[b_fi]
+                        wT = bT_ai @ fk_ai[nm].get_matrix()
+                        off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
+                        tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                        loss_ai += mask_fi.float() * 1000 * ((tp - act_pos) ** 2).sum(-1)
+                        if act_dir is not None:
+                            pad = -wT[:, :3, 0]
+                            loss_ai += mask_fi.float() * 100 * (1.0 - (pad * act_dir).sum(-1)) ** 2
+                        # Collision: penalize body links inside object
                         for suf in sfx_act[b_fi]:
                             lnm = f"leap_{self.hand}_{prefixes_act[b_fi]}_{suf}"
                             for cnm, lp in self._col_data:
-                                if cnm == lnm and lnm in fk_c:
-                                    lwT = bT_c @ fk_c[lnm].get_matrix()
+                                if cnm == lnm and lnm in fk_ai:
+                                    lwT = bT_ai @ fk_ai[lnm].get_matrix()
                                     lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                     lsdf = self.sdf.query(lwp)
-                                    loss_c += mask_fi.float() * 200 * F.relu(-lsdf).sum(-1)
-                    loss_c.mean().backward()
+                                    loss_ai += mask_fi.float() * 500 * F.relu(-lsdf).sum(-1)
+                    loss_ai.mean().backward()
                     with torch.no_grad():
-                        u_col.grad[~act_joint_mask] = 0.0
-                    opt_col.step()
+                        u_act_ik.grad[~act_joint_mask] = 0.0
+                    opt_act_ik.step()
                 with torch.no_grad():
-                    self.u = u_col.detach().requires_grad_(True)
-
-                # 3b) Hard re-project: snap actuation fingertip back to target
-                u_snap = self.u.detach().clone().requires_grad_(True)
-                opt_snap = torch.optim.Adam([u_snap], lr=0.05)
-                for snap_s in range(10):
-                    opt_snap.zero_grad()
-                    q_sn = self._u2q(u_snap)
-                    bT_sn = self._base_T(self.pos.detach(), self.rot6d.detach())
-                    fk_sn = self.chain.forward_kinematics(q_sn)
-                    loss_sn = torch.zeros(B, device=dev)
-                    for b_fi in range(4):
-                        mask_fi = (self.amap_t[:, 0] == b_fi)
-                        if not mask_fi.any(): continue
-                        nm = self.tip_link_names[b_fi]
-                        wT = bT_sn @ fk_sn[nm].get_matrix()
-                        off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
-                        tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                        loss_sn += mask_fi.float() * 1000 * ((tp - act_pos) ** 2).sum(-1)
-                        if act_dir is not None:
-                            pad = -wT[:, :3, 0]
-                            loss_sn += mask_fi.float() * 100 * (1.0 - (pad * act_dir).sum(-1)) ** 2
-                    loss_sn.mean().backward()
-                    with torch.no_grad():
-                        u_snap.grad[~act_joint_mask] = 0.0
-                    opt_snap.step()
-                with torch.no_grad():
-                    self.u = u_snap.detach().requires_grad_(True)
+                    self.u = u_act_ik.detach().requires_grad_(True)
 
             # Report
             with torch.no_grad():
