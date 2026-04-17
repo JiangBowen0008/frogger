@@ -1340,6 +1340,118 @@ class BatchedGraspOptimizer:
                     torch.tensor(idx2, dtype=torch.long, device=self.device),
                 ))
 
+    # -- per-stage metrics (for diagnostic) ----------------------------------
+    def _snap_metrics(self, tag):
+        """Record per-env feasibility metrics at this stage.
+
+        Stores arrays of [B] metrics so we can analyze trajectories later:
+        surf_err, ds_back_worst, ds_pad_worst, max_col_viol, sc_worst_sdf.
+        """
+        if not hasattr(self, '_metrics_log'):
+            self._metrics_log = {}
+        with torch.no_grad():
+            B = self.num_envs
+            dev = self.device
+            q = self._u2q(self.u)
+            bT = self._base_T(self.pos, self.rot6d)
+            fk = self.chain.forward_kinematics(q)
+            # Tip SDF at support finger tips (tip_offset point)
+            surf = torch.zeros(B, 4, device=dev)
+            for fi in range(4):
+                nm = self.tip_link_names[fi]
+                if nm not in fk: continue
+                wT = bT @ fk[nm].get_matrix()
+                off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                surf[:, fi] = self.sdf.query(tip.unsqueeze(1)).squeeze(1).abs()
+            # surf_err (excluding actuation finger) — the max among support fingers
+            if hasattr(self, 'amap_t'):
+                is_act = torch.zeros(B, 4, device=dev, dtype=torch.bool)
+                for b in range(B):
+                    is_act[b, int(self.amap[b, 0])] = True
+                surf_masked = torch.where(is_act, torch.zeros_like(surf), surf)
+                surf_err = surf_masked.max(dim=-1).values
+            else:
+                surf_err = surf.max(dim=-1).values
+            # Collision points
+            if hasattr(self, '_col_data'):
+                # Build cs per link
+                ds_back_worst = torch.zeros(B, device=dev)
+                ds_pad_worst = torch.zeros(B, device=dev)
+                max_col_viol = torch.zeros(B, device=dev)
+                for li, (nm, lp) in enumerate(self._col_data):
+                    if nm not in fk: continue
+                    lwT = bT @ fk[nm].get_matrix()
+                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                    lsdf = self.sdf.query(lwp)
+                    if "_ds" in nm:
+                        si, ei = self._col_link_ranges[li]
+                        back_m = self._ds_back_mask[si:ei]
+                        # Skip actuation finger's ds link per-env
+                        # Determine which finger this ds is
+                        prefixes_ds = ['if', 'mf', 'rf', 'th']
+                        ds_fi = next((pi for pi, p in enumerate(prefixes_ds) if f"_{p}_ds" in nm), None)
+                        not_act = (self.amap_t[:, 0] != ds_fi) if ds_fi is not None else torch.ones(B, dtype=torch.bool, device=dev)
+                        if back_m.any():
+                            b_sdf = lsdf[:, back_m].min(-1).values
+                            ds_back_worst = torch.where(not_act, torch.minimum(ds_back_worst, b_sdf), ds_back_worst)
+                        if (~back_m).any():
+                            p_sdf = lsdf[:, ~back_m].min(-1).values
+                            ds_pad_worst = torch.where(not_act, torch.minimum(ds_pad_worst, p_sdf), ds_pad_worst)
+                    else:
+                        # Non-ds: relu(-sdf) (no margin, stricter than feasibility -3mm)
+                        viol = F.relu(-lsdf).max(-1).values
+                        max_col_viol = torch.maximum(max_col_viol, viol)
+            else:
+                ds_back_worst = torch.zeros(B, device=dev)
+                ds_pad_worst = torch.zeros(B, device=dev)
+                max_col_viol = torch.zeros(B, device=dev)
+            # sc box-box SDF (only if box primitives exist)
+            sc_worst = torch.full((B,), 1.0, device=dev)
+            if hasattr(self, '_box_primitives'):
+                from collections import defaultdict
+                _prefix = f"leap_{self.hand}_"
+                _adj = {('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
+                        ('if_bs','if_px'),('if_px','if_md'),('if_md','if_ds'),
+                        ('mf_bs','mf_px'),('mf_px','mf_md'),('mf_md','mf_ds'),
+                        ('rf_bs','rf_px'),('rf_px','rf_md'),('rf_md','rf_ds'),
+                        ('th_mp','th_bs'),('th_bs','th_px'),('th_px','th_ds')}
+                link_wT = {}
+                for nm in self._box_primitives:
+                    if nm in fk:
+                        link_wT[nm] = bT @ fk[nm].get_matrix()
+                for nm_i in self._box_primitives:
+                    if nm_i not in link_wT: continue
+                    for nm_j in self._box_primitives:
+                        if nm_j not in link_wT or nm_i >= nm_j: continue
+                        si_ = nm_i.replace(_prefix, ''); sj_ = nm_j.replace(_prefix, '')
+                        if (si_, sj_) in _adj or (sj_, si_) in _adj: continue
+                        fi_ = si_.split('_')[0]; fj_ = sj_.split('_')[0]
+                        if fi_ == fj_ and fi_ != 'palm': continue
+                        for bi_c, bi_r, bi_h in self._box_primitives[nm_i]:
+                            for bj_c, bj_r, bj_h in self._box_primitives[nm_j]:
+                                ci_w = (link_wT[nm_i] @ bi_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                ri_w = link_wT[nm_i][:, :3, :3] @ bi_r.unsqueeze(0)
+                                cj_w = (link_wT[nm_j] @ bj_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                rj_w = link_wT[nm_j][:, :3, :3] @ bj_r.unsqueeze(0)
+                                sd = box_box_sdf_batch(ci_w, ri_w, bi_h.unsqueeze(0).expand(B, -1),
+                                                       cj_w, rj_w, bj_h.unsqueeze(0).expand(B, -1))
+                                sc_worst = torch.minimum(sc_worst, sd)
+            self._metrics_log[tag] = {
+                'surf_err': surf_err.cpu().numpy(),
+                'ds_back_worst': ds_back_worst.cpu().numpy(),
+                'ds_pad_worst': ds_pad_worst.cpu().numpy(),
+                'max_col_viol': max_col_viol.cpu().numpy(),
+                'sc_worst': sc_worst.cpu().numpy(),
+            }
+            s = self._metrics_log[tag]
+            import numpy as _np
+            print(f"  [METRICS {tag}] surf_err med={_np.median(s['surf_err'])*1000:.1f}mm "
+                  f"ds_back med={_np.median(s['ds_back_worst'])*1000:.1f}mm "
+                  f"ds_pad med={_np.median(s['ds_pad_worst'])*1000:.1f}mm "
+                  f"col_viol med={_np.median(s['max_col_viol'])*1000:.1f}mm "
+                  f"sc med={_np.median(s['sc_worst'])*1000:.1f}mm")
+
     # -- phase snapshot (for tracing optimisation) --------------------------
     def _snapshot(self, tag, idx=0):
         """Save a snapshot of a single environment's grasp state."""
@@ -1914,6 +2026,8 @@ class BatchedGraspOptimizer:
                     ns = (total_shift > 0.001).sum().item()
                     print(f"  Palm slide+reproj: {nc}/{B} back-clean, {ns} shifted")
 
+            self._snap_metrics("S2_after_act_ik_palm_slide")
+
         # Support finger curling + IK is done in optimize() after
         # filtering to grasps where actuation IK succeeded.
 
@@ -1995,6 +2109,7 @@ class BatchedGraspOptimizer:
         obj_c = torch.tensor(object_center, dtype=torch.float32, device=dev)
         self._obj_center = obj_c  # for palm orientation check in snapshots
         self._snapshot("after_init")
+        self._snap_metrics("S1_after_init")
 
         # ================================================================
         # Filter to actuation-successful candidates, then support finger IK
@@ -2184,6 +2299,18 @@ class BatchedGraspOptimizer:
                         below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
                         loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
 
+                        # Pad alignment: pad face (-X of tip link) should face the surface.
+                        # Without this, the single-point surface loss leaves the pad angled
+                        # INTO the object (pad tip SDF=-20mm while contact center at SDF=0).
+                        # RESTORED from commit 12b09e7 (was erroneously removed in 0b2c4c9).
+                        pad_dir = -wT[:, :3, 0]  # [B, 3] — pad push direction
+                        _, inward_n = self.sdf.query_with_normals(tp.unsqueeze(1))
+                        inward_n = inward_n[:, 0]  # [B, 3]
+                        # Want dot(pad_dir, inward_normal) ≈ 1 (pad faces INTO the surface normal).
+                        # Penalize when align < 0.7 (pad face not well aligned with surface normal).
+                        align = (pad_dir * inward_n).sum(-1)  # [B]
+                        loss_sup += sup_finger_mask[:, fi].float() * 500 * F.relu(0.7 - align) ** 2
+
                         # Actuation repulsion: ADDED on top of surface loss (not replacing)
                         dist_to_act_tip = torch.norm(tp - act_tip_pos, dim=-1)
                         dist_to_act_target = torch.norm(tp - ap[0], dim=-1) if ap is not None else dist_to_act_tip
@@ -2340,6 +2467,7 @@ class BatchedGraspOptimizer:
                           f"median={mean_sdf.median()*1000:.1f}mm")
 
         self._snapshot("after_support_ik")
+        self._snap_metrics("S3_after_support_ik")
 
         # ================================================================
         # Optimization: improve grasp quality on filtered candidates
@@ -2475,6 +2603,10 @@ class BatchedGraspOptimizer:
                     fc_weight = 1.0
                     mink_k = 10  # number of lowest SDF points for variants B/C
                     print(f"  Variant {opt_variant} Adam optimization ({opt_steps} steps, direct-q)")
+                    # Record q_opt into self.u so snap_metrics sees the right state
+                    with torch.no_grad():
+                        self.u = self._q2u(q_opt.detach()).requires_grad_(True)
+                    self._snap_metrics("S4_opt_step0")
 
                     for opt_step in range(opt_steps):
                         opt_adam.zero_grad()
@@ -2505,6 +2637,16 @@ class BatchedGraspOptimizer:
                                     tip_sdf_abs - 0.0015,
                                     tip_sdf ** 2 / 0.006)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * surf_loss
+
+                                # Pad alignment: pad face (-X) aligns with surface inward normal.
+                                # Single-point tip_sdf² alone pulls tip to surface but leaves
+                                # pad free to angle INTO the object. Alignment prevents this.
+                                pad_dir = -wT[:, :3, 0]  # [B, 3]
+                                _, inward_n = self.sdf.query_with_normals(tip.unsqueeze(1))
+                                inward_n = inward_n[:, 0]
+                                align = (pad_dir * inward_n).sum(-1)
+                                total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(0.7 - align) ** 2
+
                                 # Pad corners: penalize only DEEP pad penetration (>3mm).
                                 # Shallow penetration (<3mm) is acceptable — pad in contact with
                                 # surface naturally has small SDF variation. Heavy penalty on
@@ -2770,6 +2912,12 @@ class BatchedGraspOptimizer:
                         # Project onto joint limits
                         with torch.no_grad():
                             q_opt.clamp_(self.q_lo, self.q_lo + self.q_range)
+
+                        # Metrics snapshot at key checkpoints
+                        if opt_step in (50, 150, 299):
+                            with torch.no_grad():
+                                self.u = self._q2u(q_opt.detach()).requires_grad_(True)
+                            self._snap_metrics(f"S4_opt_step{opt_step+1}")
 
                         # ── Logging + trajectory ──
                         if opt_step % 50 == 0:
@@ -3369,6 +3517,11 @@ class BatchedGraspOptimizer:
                 os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
                 _torch.save(res, save_path)
                 print(f"  Results saved to {save_path}")
+                # Save per-stage metrics log for diagnostic analysis
+                if hasattr(self, '_metrics_log'):
+                    metrics_path = save_path.replace('.pt', '_metrics.pt')
+                    _torch.save(self._metrics_log, metrics_path)
+                    print(f"  Per-stage metrics saved to {metrics_path}")
             return res
 
         # No candidates passed entry criteria — return empty
