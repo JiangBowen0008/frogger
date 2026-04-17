@@ -2505,31 +2505,30 @@ class BatchedGraspOptimizer:
                                     tip_sdf_abs - 0.0015,
                                     tip_sdf ** 2 / 0.006)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * surf_loss
-                                # Pad corners (8 points covering full pad extent) must be OUTSIDE.
-                                # Pad lies in y-z plane at x=-10mm. Visual mesh: y=[-49.5, +7.9]mm,
-                                # z=[-2.8, +31.8]mm. Center at y=-32mm, z=+15mm. Spans ±17mm each way.
+                                # Pad corners: penalize only DEEP pad penetration (>3mm).
+                                # Shallow penetration (<3mm) is acceptable — pad in contact with
+                                # surface naturally has small SDF variation. Heavy penalty on
+                                # all pad points caused the optimizer to LIFT the pad entirely
+                                # (surf=21mm with pad=0mm — pad held above surface avoiding penalty).
                                 center_off = self.tip_offsets[fi]
                                 pad_corners = [
-                                    torch.tensor([0.0,  0.017,  0.017], device=dev),  # heel,+z
-                                    torch.tensor([0.0,  0.017, -0.017], device=dev),  # heel,-z
-                                    torch.tensor([0.0, -0.017,  0.017], device=dev),  # tip,+z
-                                    torch.tensor([0.0, -0.017, -0.017], device=dev),  # tip,-z
-                                    torch.tensor([0.0,  0.017,  0.0],   device=dev),  # heel,center-z
-                                    torch.tensor([0.0, -0.017,  0.0],   device=dev),  # tip,center-z
-                                    torch.tensor([0.0,  0.0,    0.017], device=dev),  # center-y,+z
-                                    torch.tensor([0.0,  0.0,   -0.017], device=dev),  # center-y,-z
+                                    torch.tensor([0.0,  0.017,  0.017], device=dev),
+                                    torch.tensor([0.0,  0.017, -0.017], device=dev),
+                                    torch.tensor([0.0, -0.017,  0.017], device=dev),
+                                    torch.tensor([0.0, -0.017, -0.017], device=dev),
+                                    torch.tensor([0.0,  0.017,  0.0],   device=dev),
+                                    torch.tensor([0.0, -0.017,  0.0],   device=dev),
+                                    torch.tensor([0.0,  0.0,    0.017], device=dev),
+                                    torch.tensor([0.0,  0.0,   -0.017], device=dev),
                                 ]
                                 for delta in pad_corners:
                                     ph = torch.cat([center_off + delta, torch.ones(1, device=dev)])
                                     pw = (wT @ ph.unsqueeze(-1)).squeeze(-1)[:, :3]
                                     p_sdf = self.sdf.query(pw.unsqueeze(1)).squeeze(1)
-                                    # Linear-to-quadratic loss: linear for deep pen (strong signal),
-                                    # quadratic for shallow (smooth gradient near boundary).
-                                    pad_abs = F.relu(-p_sdf)  # 0 if outside
-                                    pad_pen_loss = torch.where(pad_abs > 0.003,
-                                        pad_abs - 0.0015,        # linear beyond 3mm
-                                        pad_abs ** 2 / 0.006)   # quadratic within 3mm
-                                    total_loss += sup_finger_mask_opt[:, fi].float() * 3000 * pad_pen_loss
+                                    # Only penalize beyond 3mm (preserve -5mm feasibility margin).
+                                    # Quadratic for smooth gradient when deep.
+                                    deep_pen = F.relu(-p_sdf - 0.003)
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 2000 * deep_pen ** 2
 
                         elif opt_variant in ("B", "C"):
                             # Min-k unified: for ds links, query ALL collision points,
@@ -3161,22 +3160,24 @@ class BatchedGraspOptimizer:
                 # Composite ranking: l* first (the authoritative FC metric), then σ_min
                 # Grasps with l*>0 are strictly preferred over l*=-1
                 has_lstar = final_lstars_t > 0
-                # Infeasible-grasp rank penalizes ALL collision violations, not just
-                # surface/non-ds. Otherwise the top-10 saved grasps are selected for
-                # surface+body quality while ignoring pad penetration / SC overlap.
+                # Infeasible-grasp rank penalizes ALL collision violations + low sigma.
+                # Without sigma weight, grasps with σ=0 (no FC — useless) could outrank
+                # σ>0.03 grasps if their geometric penalties were lower.
                 ds_pad_viol = F.relu(-0.005 - ds_pad_worst)   # 0 if pass, positive if fail
                 ds_back_viol = F.relu(-0.003 - ds_back_worst)
                 sc_viol = F.relu(-0.001 - sc_worst_sdf)
+                sigma_viol = F.relu(0.01 - sigma_all)  # viol if σ<0.01
                 infeas_penalty = (5.0 * surf_err + 10.0 * max_col_viol
                                   + 10.0 * ds_pad_viol + 15.0 * ds_back_viol
-                                  + 10.0 * sc_viol)
+                                  + 10.0 * sc_viol + 50.0 * sigma_viol)
                 rank_score = torch.where(
                     feasible & has_lstar,
                     10.0 + final_lstars_t + 0.3 * wrap_quality,  # l*>0 grasps rank highest
                     torch.where(
                         feasible,
                         sigma_all + 0.3 * wrap_quality,  # feasible but no l*
-                        torch.tensor(-10.0, device=dev) + sigma_all - infeas_penalty,
+                        # Boost sigma 10x so σ=0.05 vs σ=0 is a 0.5 difference
+                        torch.tensor(-10.0, device=dev) + 10.0 * sigma_all - infeas_penalty,
                     ),
                 )
                 order = rank_score.argsort(descending=True)
