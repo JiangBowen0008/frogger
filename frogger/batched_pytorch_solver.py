@@ -2505,25 +2505,31 @@ class BatchedGraspOptimizer:
                                     tip_sdf_abs - 0.0015,
                                     tip_sdf ** 2 / 0.006)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * surf_loss
-                                # Heel + pad tip + z-edges: pad corners should be OUTSIDE surface.
-                                # Pad lies in y-z plane at x=-10mm. Pad center at y=-32mm for
-                                # fingers, y=-35mm for thumb. Pad extends y=[-49.5, +7.9]mm and
-                                # z=[-2.8, +31.8]mm in link frame (visual mesh extent).
-                                # Sample the 4 corners of the pad face (y±15mm, z±13mm from center).
+                                # Pad corners (8 points covering full pad extent) must be OUTSIDE.
+                                # Pad lies in y-z plane at x=-10mm. Visual mesh: y=[-49.5, +7.9]mm,
+                                # z=[-2.8, +31.8]mm. Center at y=-32mm, z=+15mm. Spans ±17mm each way.
                                 center_off = self.tip_offsets[fi]
                                 pad_corners = [
-                                    torch.tensor([0.0,  0.015,  0.013], device=dev),  # heel+z+
-                                    torch.tensor([0.0,  0.015, -0.013], device=dev),  # heel+z-
-                                    torch.tensor([0.0, -0.015,  0.013], device=dev),  # tip+z+
-                                    torch.tensor([0.0, -0.015, -0.013], device=dev),  # tip+z-
+                                    torch.tensor([0.0,  0.017,  0.017], device=dev),  # heel,+z
+                                    torch.tensor([0.0,  0.017, -0.017], device=dev),  # heel,-z
+                                    torch.tensor([0.0, -0.017,  0.017], device=dev),  # tip,+z
+                                    torch.tensor([0.0, -0.017, -0.017], device=dev),  # tip,-z
+                                    torch.tensor([0.0,  0.017,  0.0],   device=dev),  # heel,center-z
+                                    torch.tensor([0.0, -0.017,  0.0],   device=dev),  # tip,center-z
+                                    torch.tensor([0.0,  0.0,    0.017], device=dev),  # center-y,+z
+                                    torch.tensor([0.0,  0.0,   -0.017], device=dev),  # center-y,-z
                                 ]
                                 for delta in pad_corners:
                                     ph = torch.cat([center_off + delta, torch.ones(1, device=dev)])
                                     pw = (wT @ ph.unsqueeze(-1)).squeeze(-1)[:, :3]
                                     p_sdf = self.sdf.query(pw.unsqueeze(1)).squeeze(1)
-                                    # Penalize only if inside (SDF < 0); outside is fine
-                                    pad_pen = F.relu(-p_sdf) ** 2
-                                    total_loss += sup_finger_mask_opt[:, fi].float() * 3000 * pad_pen
+                                    # Linear-to-quadratic loss: linear for deep pen (strong signal),
+                                    # quadratic for shallow (smooth gradient near boundary).
+                                    pad_abs = F.relu(-p_sdf)  # 0 if outside
+                                    pad_pen_loss = torch.where(pad_abs > 0.003,
+                                        pad_abs - 0.0015,        # linear beyond 3mm
+                                        pad_abs ** 2 / 0.006)   # quadratic within 3mm
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 3000 * pad_pen_loss
 
                         elif opt_variant in ("B", "C"):
                             # Min-k unified: for ds links, query ALL collision points,
