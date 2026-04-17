@@ -2446,22 +2446,40 @@ class BatchedGraspOptimizer:
 
                         total_loss = torch.zeros(B, device=dev)
 
-                        # ── Section A: Surface loss ──
+                        # ── Section A: Surface loss (multi-point pad contact) ──
+                        # Single-point tip_offset caused pad to angle INTO surfaces
+                        # (contact center at SDF=0 but pad tip 20mm inside). Now use
+                        # 3 points on the pad line: heel, center, tip. Contact center
+                        # must be at SDF=0; heel/tip must be OUTSIDE (SDF>=0). This
+                        # enforces the pad to lie flat against the surface.
                         if opt_variant == "A":
-                            # Original: SDF(tip_offset)^2 for each support finger
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 nm = self.tip_link_names[fi]
                                 wT = bT_o @ fk_o[nm].get_matrix()
+                                # Center contact point (existing tip_offset)
                                 off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
                                 tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                                 tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
-                                # Huber-like: |SDF| when far (strong pull), SDF² when close (smooth)
+                                # Huber: pulls center to surface (SDF=0)
                                 tip_sdf_abs = tip_sdf.abs()
                                 surf_loss = torch.where(tip_sdf_abs > 0.003,
-                                    tip_sdf_abs - 0.0015,  # linear beyond 3mm
-                                    tip_sdf ** 2 / 0.006)  # quadratic within 3mm, continuous
+                                    tip_sdf_abs - 0.0015,
+                                    tip_sdf ** 2 / 0.006)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * surf_loss
+                                # Heel + pad tip: should be OUTSIDE surface (SDF >= 0).
+                                # Offsets relative to tip_offset along pad's y-direction
+                                # (pad extends in -y from contact; y=+5mm for heel, y=-25mm for tip).
+                                center_off = self.tip_offsets[fi]
+                                heel_off = center_off + torch.tensor([0.0, 0.015, 0.0], device=dev)
+                                pad_tip_off = center_off + torch.tensor([0.0, -0.025, 0.0], device=dev)
+                                for po in (heel_off, pad_tip_off):
+                                    ph = torch.cat([po, torch.ones(1, device=dev)])
+                                    pw = (wT @ ph.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                    p_sdf = self.sdf.query(pw.unsqueeze(1)).squeeze(1)
+                                    # Penalize only if inside (SDF < 0); outside is fine
+                                    pad_pen = F.relu(-p_sdf) ** 2
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 2000 * pad_pen
 
                         elif opt_variant in ("B", "C"):
                             # Min-k unified: for ds links, query ALL collision points,
