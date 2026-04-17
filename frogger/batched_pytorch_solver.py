@@ -2347,7 +2347,10 @@ class BatchedGraspOptimizer:
                                         lwp = (lwT @ clp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
                                         col_pen = F.relu(-lsdf).sum(-1)
-                                        loss_sup += sup_finger_mask[:, fi].float() * 50 * col_pen
+                                        # Weight raised 50→500 to match pad alignment strength.
+                                        # Alignment at weight 500 was forcing finger rotation
+                                        # that pushed body into the object. Col needs to push back.
+                                        loss_sup += sup_finger_mask[:, fi].float() * 500 * col_pen
                             elif suf == 'ds':
                                 # Fingertip ds: back-side only (pad wrapping is expected).
                                 for ci_ik, (cnm, clp) in enumerate(self._col_data):
