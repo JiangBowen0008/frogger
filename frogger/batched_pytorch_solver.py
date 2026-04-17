@@ -100,25 +100,51 @@ class BatchedSDF:
         self.obj_center = (self.obj_bbox_min + self.obj_bbox_max) / 2
 
     def add_clearance_volume(self, center, direction, radius=0.015, height=0.05):
-        """Add cylindrical no-go zone to SDF (solid obstacle)."""
-        center = np.asarray(center, dtype=np.float64)
-        direction = np.asarray(direction, dtype=np.float64)
-        direction = direction / np.linalg.norm(direction)
+        """Store cylindrical no-go zone as SEPARATE SDF (for support fingers only).
+
+        Actuation finger must be able to enter this region to reach the trigger.
+        Support fingers should treat it as solid. Store center/direction/geometry
+        so query_with_clearance() can add the clearance SDF on demand.
+        """
+        self._clearance_center = torch.tensor(center, dtype=torch.float32, device=self.sdf_tensor.device)
+        d = np.asarray(direction, dtype=np.float64)
+        d = d / np.linalg.norm(d)
+        self._clearance_dir = torch.tensor(d, dtype=torch.float32, device=self.sdf_tensor.device)
+        self._clearance_radius = float(radius)
+        self._clearance_height = float(height)
+        # Report voxel count for sanity (not actually modifying SDF)
         res = self.sdf_tensor.shape[2]
         lin = [np.linspace(self.bbox_min[i], self.bbox_max[i], res) for i in range(3)]
         gx, gy, gz = np.meshgrid(*lin, indexing="ij")
         pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
-        delta = pts - center
-        proj = delta @ direction
-        perp = np.linalg.norm(delta - np.outer(proj, direction).reshape(-1, 3), axis=-1)
+        delta = pts - np.asarray(center, dtype=np.float64)
+        proj = delta @ d
+        perp = np.linalg.norm(delta - np.outer(proj, d).reshape(-1, 3), axis=-1)
         inside = (proj >= 0) & (proj <= height) & (perp <= radius)
-        if inside.any():
-            sdf_np = self.sdf_tensor[0, 0].cpu().numpy().ravel()
-            sdf_np[inside] = np.minimum(sdf_np[inside], -0.01)
-            self.sdf_tensor = torch.tensor(
-                sdf_np.reshape(res, res, res), dtype=torch.float32, device=self.sdf_tensor.device
-            ).unsqueeze(0).unsqueeze(0)
-            print(f"  Actuation clearance: {inside.sum()} voxels (r={radius*1000:.0f}mm h={height*1000:.0f}mm)")
+        print(f"  Actuation clearance (separate, support-only): "
+              f"{inside.sum()} voxels (r={radius*1000:.0f}mm h={height*1000:.0f}mm)")
+
+    def _clearance_sdf(self, points: torch.Tensor) -> torch.Tensor:
+        """Signed distance to the clearance cylinder (positive outside, negative inside).
+
+        points [B,N,3] -> [B,N]. Returns +inf if no clearance defined.
+        """
+        if not hasattr(self, '_clearance_center'):
+            return torch.full(points.shape[:-1], float('inf'), device=points.device)
+        delta = points - self._clearance_center
+        proj = (delta * self._clearance_dir).sum(-1)  # [B,N]
+        perp_vec = delta - proj.unsqueeze(-1) * self._clearance_dir
+        perp = perp_vec.norm(dim=-1)  # [B,N]
+        # Distance to cylinder: outside if perp > r or proj < 0 or proj > h
+        # For a finite cylinder, SDF is:
+        #   - Inside cylinder: negative (max of -(r-perp), -proj, -(h-proj))
+        #   - Outside: positive radial distance or axial distance
+        # Simple approximation: SDF = max(perp - r, -proj, proj - h)
+        # - Inside when perp<r AND 0<proj<h: max of three negatives = closest face (negative)
+        # - Outside: at least one positive
+        sdf = torch.maximum(perp - self._clearance_radius,
+                            torch.maximum(-proj, proj - self._clearance_height))
+        return sdf
 
     def add_floor(self, z_min):
         """Set SDF negative below z_min (table surface)."""
@@ -133,8 +159,14 @@ class BatchedSDF:
         ).unsqueeze(0).unsqueeze(0)
         print(f"  Floor at z={z_min*1000:.0f}mm")
 
-    def query(self, points: torch.Tensor) -> torch.Tensor:
-        """Differentiable SDF look-up.  points [B,N,3] -> [B,N]."""
+    def query(self, points: torch.Tensor, include_clearance: bool = True) -> torch.Tensor:
+        """Differentiable SDF look-up.  points [B,N,3] -> [B,N].
+
+        include_clearance=True (default): merges the actuation clearance zone
+        into the SDF so support fingers treat it as solid.
+        include_clearance=False: returns the pure object SDF (use for the
+        actuation finger, which must enter the clearance region).
+        """
         B, N, _ = points.shape
         norm = 2.0 * (points - self.bbox_min_t) / self.range_t - 1.0
         # grid_sample expects (w, h, d) = (Z, Y, X) for tensor stored as [D=X, H=Y, W=Z]
@@ -145,7 +177,12 @@ class BatchedSDF:
             align_corners=True,
             padding_mode="border",
         )
-        return out.view(B, N)
+        obj_sdf = out.view(B, N)
+        if include_clearance and hasattr(self, '_clearance_center'):
+            # Merge: minimum of object SDF and clearance SDF (union of solids)
+            cl = self._clearance_sdf(points)
+            return torch.minimum(obj_sdf, cl)
+        return obj_sdf
 
     def query_with_normals(self, points: torch.Tensor):
         """SDF look-up returning (sdf_values [B,N], inward_normals [B,N,3]).
@@ -1682,7 +1719,8 @@ class BatchedGraspOptimizer:
                             if cnm == lnm and lnm in fk_ik:
                                 lwT = bT_ik @ fk_ik[lnm].get_matrix()
                                 lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                lsdf = self.sdf.query(lwp)
+                                # Actuation finger must enter clearance region to reach trigger
+                                lsdf = self.sdf.query(lwp, include_clearance=False)
                                 loss_ik += mask_fi.float() * 100 * F.relu(-lsdf).sum(-1)
 
                 # Don't change non-actuation joints
@@ -1775,9 +1813,9 @@ class BatchedGraspOptimizer:
                     palm_sdf_back = torch.where(pts_bx < 0.020, palm_sdf, torch.ones_like(palm_sdf))
                     min_sdf = palm_sdf_back.min(dim=-1).values
 
-                    # Add actuation finger collision
+                    # Add actuation finger collision (ignore clearance zone — that's where it goes)
                     for mask_fi, wp in act_pts_list:
-                        act_sdf = self.sdf.query(wp).min(dim=-1).values  # [B]
+                        act_sdf = self.sdf.query(wp, include_clearance=False).min(dim=-1).values  # [B]
                         # Only affect envs where this finger is actuation
                         min_sdf = torch.where(mask_fi, torch.minimum(min_sdf, act_sdf), min_sdf)
 
@@ -1801,12 +1839,12 @@ class BatchedGraspOptimizer:
                         ts = self.sdf.query(tpp)
                         tbx = ((tpp - tp.unsqueeze(1)) * R_s[:, :, 0].unsqueeze(1)).sum(-1)
                         test_min = torch.where(tbx < 0.020, ts, torch.ones_like(ts)).min(-1).values
-                        # Actuation finger SDF
+                        # Actuation finger SDF (ignore clearance — act finger belongs there)
                         for mask_fi, wp_orig in act_pts_list:
                             # wp moves with base position
                             delta = step_size * td
                             wp_shifted = wp_orig + delta.unsqueeze(1)
-                            act_s = self.sdf.query(wp_shifted).min(-1).values
+                            act_s = self.sdf.query(wp_shifted, include_clearance=False).min(-1).values
                             test_min = torch.where(mask_fi, torch.minimum(test_min, act_s), test_min)
                         imp = test_min - min_sdf
                         better = imp > best_imp
@@ -1841,14 +1879,14 @@ class BatchedGraspOptimizer:
                         if act_dir is not None:
                             pad = -wT[:, :3, 0]
                             loss_ai += mask_fi.float() * 100 * (1.0 - (pad * act_dir).sum(-1)) ** 2
-                        # Collision: penalize body links inside object
+                        # Collision: penalize body links inside object (ignore clearance zone)
                         for suf in sfx_act[b_fi]:
                             lnm = f"leap_{self.hand}_{prefixes_act[b_fi]}_{suf}"
                             for cnm, lp in self._col_data:
                                 if cnm == lnm and lnm in fk_ai:
                                     lwT = bT_ai @ fk_ai[lnm].get_matrix()
                                     lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                    lsdf = self.sdf.query(lwp)
+                                    lsdf = self.sdf.query(lwp, include_clearance=False)
                                     loss_ai += mask_fi.float() * 500 * F.relu(-lsdf).sum(-1)
                     loss_ai.mean().backward()
                     with torch.no_grad():
@@ -2467,19 +2505,25 @@ class BatchedGraspOptimizer:
                                     tip_sdf_abs - 0.0015,
                                     tip_sdf ** 2 / 0.006)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * surf_loss
-                                # Heel + pad tip: should be OUTSIDE surface (SDF >= 0).
-                                # Offsets relative to tip_offset along pad's y-direction
-                                # (pad extends in -y from contact; y=+5mm for heel, y=-25mm for tip).
+                                # Heel + pad tip + z-edges: pad corners should be OUTSIDE surface.
+                                # Pad lies in y-z plane at x=-10mm. Pad center at y=-32mm for
+                                # fingers, y=-35mm for thumb. Pad extends y=[-49.5, +7.9]mm and
+                                # z=[-2.8, +31.8]mm in link frame (visual mesh extent).
+                                # Sample the 4 corners of the pad face (y±15mm, z±13mm from center).
                                 center_off = self.tip_offsets[fi]
-                                heel_off = center_off + torch.tensor([0.0, 0.015, 0.0], device=dev)
-                                pad_tip_off = center_off + torch.tensor([0.0, -0.025, 0.0], device=dev)
-                                for po in (heel_off, pad_tip_off):
-                                    ph = torch.cat([po, torch.ones(1, device=dev)])
+                                pad_corners = [
+                                    torch.tensor([0.0,  0.015,  0.013], device=dev),  # heel+z+
+                                    torch.tensor([0.0,  0.015, -0.013], device=dev),  # heel+z-
+                                    torch.tensor([0.0, -0.015,  0.013], device=dev),  # tip+z+
+                                    torch.tensor([0.0, -0.015, -0.013], device=dev),  # tip+z-
+                                ]
+                                for delta in pad_corners:
+                                    ph = torch.cat([center_off + delta, torch.ones(1, device=dev)])
                                     pw = (wT @ ph.unsqueeze(-1)).squeeze(-1)[:, :3]
                                     p_sdf = self.sdf.query(pw.unsqueeze(1)).squeeze(1)
                                     # Penalize only if inside (SDF < 0); outside is fine
                                     pad_pen = F.relu(-p_sdf) ** 2
-                                    total_loss += sup_finger_mask_opt[:, fi].float() * 2000 * pad_pen
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 3000 * pad_pen
 
                         elif opt_variant in ("B", "C"):
                             # Min-k unified: for ds links, query ALL collision points,
