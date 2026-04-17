@@ -3157,7 +3157,29 @@ class BatchedGraspOptimizer:
                 # Tip positions + collision points
                 tp_final, cp_final, tip_x_final = self._get_points(fk_final, bT_final)
                 ts_final = self.sdf.query(tp_final)
-                cs_final = self.sdf.query(cp_final)
+                # Object-only SDF (no clearance). Clearance is enforced per-finger below
+                # because the actuation finger body IS supposed to be in the clearance zone.
+                cs_final_obj = self.sdf.query(cp_final, include_clearance=False)
+                cs_final_cl  = self.sdf._clearance_sdf(cp_final) if hasattr(self.sdf, '_clearance_center') else torch.full_like(cs_final_obj, float('inf'))
+                # Per-point mask: True if point belongs to the ACTUATION finger's body
+                # (these points are allowed inside the clearance zone).
+                # Non-act points use min(obj, cl) so they're pushed out of clearance.
+                act_point_mask = torch.zeros(B, cp_final.shape[1], device=dev, dtype=torch.bool)
+                prefixes_cs = ['if', 'mf', 'rf', 'th']
+                for li_cs, (nm_cs, _) in enumerate(self._col_data):
+                    si_cs, ei_cs = self._col_link_ranges[li_cs]
+                    # Determine which finger this link belongs to
+                    link_fi = next((pi for pi, p in enumerate(prefixes_cs) if f"_{p}_" in nm_cs), None)
+                    if link_fi is None: continue
+                    # Envs where this finger is the actuation finger
+                    is_act_env = (self.amap_t[:, 0] == link_fi)  # [B]
+                    # Act finger points → don't apply clearance
+                    act_point_mask[:, si_cs:ei_cs] = is_act_env.unsqueeze(1)
+                cs_final = torch.where(
+                    act_point_mask,
+                    cs_final_obj,                             # act finger: object-only
+                    torch.minimum(cs_final_obj, cs_final_cl)  # others: object ∪ clearance
+                )
 
                 # FC from 3 support fingertips + palm per actuation group
                 all_tips_final = tp_final[:, :4]  # [B, 4, 3]
