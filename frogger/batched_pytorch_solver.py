@@ -3111,18 +3111,30 @@ class BatchedGraspOptimizer:
                 # be inside (that's finger-through-object insertion).
                 # Pad-side (y < -15mm): tolerant — shallow wrapping on curved surfaces is OK,
                 # but deep penetration (>5mm) means the pad is piercing the surface.
+                # Compute ds collision per-link, excluding the actuation finger's ds link
+                # per env (its pad is supposed to be at the trigger / inside clearance).
                 ds_back_worst = torch.zeros(B, device=dev)
                 ds_pad_worst = torch.zeros(B, device=dev)
+                prefixes_ds = ['if', 'mf', 'rf', 'th']
                 for li, (nm, _) in enumerate(self._col_data):
                     if "_ds" not in nm: continue
+                    # Which finger does this ds belong to?
+                    ds_fi = next((pi for pi, p in enumerate(prefixes_ds)
+                                  if f"_{p}_ds" in nm), None)
+                    if ds_fi is None: continue
+                    # Mask: envs where this is NOT the actuation finger
+                    not_act = (self.amap_t[:, 0] != ds_fi)  # [B]
                     si, ei = self._col_link_ranges[li]
                     back_mask_li = self._ds_back_mask[si:ei]
                     if back_mask_li.any():
                         ds_back_sdf = cs_final[:, si:ei][:, back_mask_li].min(-1).values
-                        ds_back_worst = torch.minimum(ds_back_worst, ds_back_sdf)
+                        # Only update for support envs
+                        ds_back_worst = torch.where(
+                            not_act, torch.minimum(ds_back_worst, ds_back_sdf), ds_back_worst)
                     if (~back_mask_li).any():
                         ds_pad_sdf = cs_final[:, si:ei][:, ~back_mask_li].min(-1).values
-                        ds_pad_worst = torch.minimum(ds_pad_worst, ds_pad_sdf)
+                        ds_pad_worst = torch.where(
+                            not_act, torch.minimum(ds_pad_worst, ds_pad_sdf), ds_pad_worst)
 
                 # Feasibility: only candidates that passed opt_mask + quality checks
                 feasible = (opt_mask
