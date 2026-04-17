@@ -3161,13 +3161,22 @@ class BatchedGraspOptimizer:
                 # Composite ranking: l* first (the authoritative FC metric), then σ_min
                 # Grasps with l*>0 are strictly preferred over l*=-1
                 has_lstar = final_lstars_t > 0
+                # Infeasible-grasp rank penalizes ALL collision violations, not just
+                # surface/non-ds. Otherwise the top-10 saved grasps are selected for
+                # surface+body quality while ignoring pad penetration / SC overlap.
+                ds_pad_viol = F.relu(-0.005 - ds_pad_worst)   # 0 if pass, positive if fail
+                ds_back_viol = F.relu(-0.003 - ds_back_worst)
+                sc_viol = F.relu(-0.001 - sc_worst_sdf)
+                infeas_penalty = (5.0 * surf_err + 10.0 * max_col_viol
+                                  + 10.0 * ds_pad_viol + 15.0 * ds_back_viol
+                                  + 10.0 * sc_viol)
                 rank_score = torch.where(
                     feasible & has_lstar,
                     10.0 + final_lstars_t + 0.3 * wrap_quality,  # l*>0 grasps rank highest
                     torch.where(
                         feasible,
                         sigma_all + 0.3 * wrap_quality,  # feasible but no l*
-                        torch.tensor(-10.0, device=dev) + sigma_all - 5.0 * surf_err - 10.0 * max_col_viol,
+                        torch.tensor(-10.0, device=dev) + sigma_all - infeas_penalty,
                     ),
                 )
                 order = rank_score.argsort(descending=True)
