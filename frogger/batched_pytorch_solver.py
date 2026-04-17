@@ -2494,23 +2494,29 @@ class BatchedGraspOptimizer:
                                         lsdf = self.sdf.query(lwp)
                                         total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
 
-                            # B2: Fingertip ds back-side collision only.
-                            # Pad-side points (y < -15mm in link frame) wrap around
-                            # curved surfaces by design — penalizing them fights surface contact.
-                            # Only back-side points indicate actual finger-through-object.
+                            # B2: Fingertip ds collision — back-side strict, pad-side tolerant.
+                            # Back: 1mm contact allowed, heavy penalty beyond.
+                            # Pad: 3mm wrapping allowed on curved surfaces, penalty beyond.
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 for ci, cnm in sup_col_idx_ds[fi]:
                                     lp = self._col_data[ci][1]
-                                    if cnm in fk_o:
-                                        si, ei = self._col_link_ranges[ci]
-                                        back_m = self._ds_back_mask[si:ei]
-                                        if not back_m.any(): continue
-                                        lwT = bT_o @ fk_o[cnm].get_matrix()
-                                        lwp = (lwT @ lp[back_m].T)[:, :3, :].transpose(1, 2)
-                                        lsdf = self.sdf.query(lwp)
-                                        worst_pen = F.relu(-lsdf - 0.001).max(-1).values
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * worst_pen ** 2
+                                    if cnm not in fk_o: continue
+                                    si, ei = self._col_link_ranges[ci]
+                                    back_m = self._ds_back_mask[si:ei]
+                                    lwT = bT_o @ fk_o[cnm].get_matrix()
+                                    # Back-side: strict (1mm contact threshold)
+                                    if back_m.any():
+                                        lwp_b = (lwT @ lp[back_m].T)[:, :3, :].transpose(1, 2)
+                                        lsdf_b = self.sdf.query(lwp_b)
+                                        pen_back = F.relu(-lsdf_b - 0.001).max(-1).values
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * pen_back ** 2
+                                    # Pad-side: tolerant (3mm wrap allowance)
+                                    if (~back_m).any():
+                                        lwp_p = (lwT @ lp[~back_m].T)[:, :3, :].transpose(1, 2)
+                                        lsdf_p = self.sdf.query(lwp_p)
+                                        pen_pad = F.relu(-lsdf_p - 0.003).max(-1).values
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * pen_pad ** 2
 
                         elif opt_variant in ("B", "C"):
                             # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
@@ -3038,9 +3044,13 @@ class BatchedGraspOptimizer:
                         fi = self.amap_t[:, j]
                         act_dist = torch.norm(tp_final[torch.arange(B, device=dev), fi] - ap[j], dim=-1)
 
-                # ds back-side penetration: only check back/side points (y > -15mm in link frame).
-                # Pad-side points (y < -15mm) wrap around curved surfaces by design.
+                # ds penetration: check BOTH back-side (strict) and pad-side (tolerant).
+                # Back-side (y > -15mm): strict threshold — back of fingertip should never
+                # be inside (that's finger-through-object insertion).
+                # Pad-side (y < -15mm): tolerant — shallow wrapping on curved surfaces is OK,
+                # but deep penetration (>5mm) means the pad is piercing the surface.
                 ds_back_worst = torch.zeros(B, device=dev)
+                ds_pad_worst = torch.zeros(B, device=dev)
                 for li, (nm, _) in enumerate(self._col_data):
                     if "_ds" not in nm: continue
                     si, ei = self._col_link_ranges[li]
@@ -3048,12 +3058,16 @@ class BatchedGraspOptimizer:
                     if back_mask_li.any():
                         ds_back_sdf = cs_final[:, si:ei][:, back_mask_li].min(-1).values
                         ds_back_worst = torch.minimum(ds_back_worst, ds_back_sdf)
+                    if (~back_mask_li).any():
+                        ds_pad_sdf = cs_final[:, si:ei][:, ~back_mask_li].min(-1).values
+                        ds_pad_worst = torch.minimum(ds_pad_worst, ds_pad_sdf)
 
                 # Feasibility: only candidates that passed opt_mask + quality checks
                 feasible = (opt_mask
                             & (surf_err < 0.008)  # 8mm surface
                             & (max_col_viol < 0.003)  # 3mm non-ds collision margin
-                            & (ds_back_worst > -0.005)  # 5mm back-side ds pen (catches insertion, ignores pad wrapping)
+                            & (ds_back_worst > -0.003)  # 3mm back-side ds pen (strict: back should not penetrate)
+                            & (ds_pad_worst > -0.005)  # 5mm pad-side ds pen (allow shallow wrap, catch insertion)
                             & (sc_worst_sdf > -0.001)  # box-box SDF > -1mm (no inter-finger overlap)
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
@@ -3084,16 +3098,18 @@ class BatchedGraspOptimizer:
                 n_lstar = has_lstar.sum().item()
                 n_surf_ok = (surf_err < 0.005).sum().item()
                 n_col_ok = (max_col_viol < 0.002).sum().item()
-                n_ds_ok = (ds_back_worst > -0.005).sum().item()
+                n_back_ok = (ds_back_worst > -0.003).sum().item()
+                n_pad_ok = (ds_pad_worst > -0.005).sum().item()
                 n_sc_ok = (sc_worst_sdf > -0.001).sum().item()
                 print(f"\n  === Optimization Results ===")
                 print(f"  {n_feasible}/{n_opt} feasible | l*>0: {n_lstar} | σ>0.01: {n_fc} | "
                       f"surf<5mm: {n_surf_ok} | col<2mm: {n_col_ok} | "
-                      f"ds_back<5mm: {n_ds_ok} | sc>-1mm: {n_sc_ok}")
+                      f"back>-3: {n_back_ok} | pad>-5: {n_pad_ok} | sc>-1: {n_sc_ok}")
                 bi = order[0].item()
                 print(f"  Best: idx={bi} σ_min={sigma_all[bi]:.4f} l*={final_lstars[bi]:.4f} "
                       f"surf={surf_err[bi]*1000:.1f}mm col={max_col_viol[bi]*1000:.1f}mm "
-                      f"ds_back={ds_back_worst[bi]*1000:.1f}mm sc_sdf={sc_worst_sdf[bi]*1000:.1f}mm")
+                      f"ds_back={ds_back_worst[bi]*1000:.1f}mm ds_pad={ds_pad_worst[bi]*1000:.1f}mm "
+                      f"sc_sdf={sc_worst_sdf[bi]*1000:.1f}mm")
 
                 # Build result list
                 R_all = self._rot6d_to_matrix(self.rot6d)
@@ -3120,6 +3136,7 @@ class BatchedGraspOptimizer:
                         "min_col": float(cs_final[ix].min()),
                         "max_col_viol": float(max_col_viol[ix]),
                         "ds_back_worst": float(ds_back_worst[ix]),
+                        "ds_pad_worst": float(ds_pad_worst[ix]),
                         "sigma_min": float(sigma_all[ix]),
                         "sc_min_dist": float(sc_worst_sdf[ix]),
                     })
@@ -3164,6 +3181,26 @@ class BatchedGraspOptimizer:
                         _lpts.append(grid)
                     if _lpts:
                         _verify_pts[_ln] = np.vstack(_lpts)
+
+                # Add visual mesh surface samples for ds links (URDF boxes
+                # stop at y=-20mm, pad tip extends to y=-49.5mm — those points
+                # are critical for detecting fingertip insertion).
+                for _li_v, (_lnv, _ptsv) in enumerate(self._col_data):
+                    if "_ds" not in _lnv: continue
+                    _si, _ei = self._col_link_ranges[_li_v]
+                    # Only visual mesh samples (not the URDF box grid part).
+                    # Visual samples were appended after the box grid.
+                    _n_urdf_box = sum(1 for _cel in _tree_v.getroot().findall("link")
+                                      if _cel.get("name") == _lnv
+                                      for _cc in _cel.findall("collision")
+                                      for _g in [_cc.find("geometry")] if _g is not None
+                                      for _b in [_g.find("box")] if _b is not None)
+                    # Take pad-side samples (y < -15mm) to extend coverage past URDF boxes
+                    _pts_np = _ptsv[:, :3].cpu().numpy()
+                    _back = self._ds_back_mask[_si:_ei].cpu().numpy()
+                    _pad_pts = _pts_np[~_back].astype(np.float32)
+                    if len(_pad_pts) > 0 and _lnv in _verify_pts:
+                        _verify_pts[_lnv] = np.vstack([_verify_pts[_lnv], _pad_pts])
 
                 _adj = {('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
                         ('if_bs','if_px'),('if_px','if_md'),('if_md','if_ds'),
