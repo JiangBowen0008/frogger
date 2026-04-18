@@ -248,20 +248,63 @@ def box_sdf_batch(query_pts, box_centers, box_rotations, box_half_extents):
 
 
 def box_box_sdf_batch(centers_A, rots_A, half_A, centers_B, rots_B, half_B):
-    """Signed distance between two OBBs using SAT-inspired approach.
+    """Analytic signed distance between two OBBs via the Separating Axis Theorem.
 
-    Queries strategic points of each box (center, 8 corners, 6 face centers,
-    12 edge midpoints = 27 points) against the other box's SDF.
-    This catches vertex-face, edge-face, and edge-edge overlaps.
+    For each of 15 candidate axes (3 face normals of A, 3 of B, 9 edge-edge
+    cross-products), compute:
+        sign_sep(n) = |(c_B - c_A) · n|  -  h_A_proj(n)  -  h_B_proj(n)
+    SDF = max over axes of sign_sep(n).
+      - Positive: boxes separated; the axis witnessing the tightest gap wins.
+      - Negative: boxes overlap; the axis witnessing the shallowest overlap wins
+        (i.e., the negative penetration depth along the easiest-to-separate axis).
+    Differentiable w.r.t. centers, rotations, half-extents.
 
     Args:
         centers_A, centers_B: [B, 3]
-        rots_A, rots_B: [B, 3, 3]
+        rots_A, rots_B: [B, 3, 3] — columns are box axes
         half_A, half_B: [B, 3]
 
     Returns:
-        sdf: [B] signed distance (negative = overlapping)
+        sdf: [B] signed distance (negative = overlapping).
     """
+    B = centers_A.shape[0]
+    dev = centers_A.device
+    a_axes = [rots_A[:, :, i] for i in range(3)]
+    b_axes = [rots_B[:, :, i] for i in range(3)]
+    delta = centers_B - centers_A
+
+    def sep_on_axis(n, valid_mask=None):
+        # sign_sep(n) = |delta · n| - half-extent projections onto n.
+        proj_A = (half_A * torch.stack([(a_axes[i] * n).sum(-1).abs() for i in range(3)], dim=-1)).sum(-1)
+        proj_B = (half_B * torch.stack([(b_axes[i] * n).sum(-1).abs() for i in range(3)], dim=-1)).sum(-1)
+        center_dist = (delta * n).sum(-1).abs()
+        sep = center_dist - proj_A - proj_B
+        if valid_mask is not None:
+            # Invalidate axes where the cross product was ~0 (parallel edges).
+            # Set their sep to a large negative so they never win the max.
+            sep = torch.where(valid_mask, sep, torch.full_like(sep, -1e9))
+        return sep
+
+    # Face normals (always valid).
+    sdf = sep_on_axis(a_axes[0])
+    for ax in a_axes[1:] + b_axes:
+        sdf = torch.maximum(sdf, sep_on_axis(ax))
+
+    # Edge-edge cross products (mask out zero-length axes from parallel edges).
+    eps_parallel = 1e-6
+    for i in range(3):
+        for j in range(3):
+            c = torch.cross(a_axes[i], b_axes[j], dim=-1)
+            cn = c.norm(dim=-1, keepdim=True)
+            valid = (cn.squeeze(-1) > eps_parallel)
+            n = c / cn.clamp(min=eps_parallel)
+            sdf = torch.maximum(sdf, sep_on_axis(n, valid))
+    return sdf
+
+
+# Legacy sampling-based version kept for reference / ablation.
+def box_box_sdf_sampled(centers_A, rots_A, half_A, centers_B, rots_B, half_B):
+    """Old sampling-based box-box SDF (27 pts per box queried against other)."""
     B = centers_A.shape[0]
     dev = centers_A.device
 
