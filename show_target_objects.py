@@ -131,7 +131,7 @@ def load_object(name):
     # Match solver: 20mm clearance cylinder (must match run_target_objects.py)
     if "act_pos" in data and "act_dir" in data:
         data["sdf"].add_clearance_volume(data["act_pos"], data["act_dir"],
-                                         radius=0.020, height=0.05)
+                                         radius=0.020, height=0.03)
     data["sdf"].add_floor(0.0)
     data["opt"] = BatchedGraspOptimizer(data["sdf"], num_envs=1, device="cuda",
                                         hand="rh", hand_type="leap", palm_contact=True)

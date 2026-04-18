@@ -61,9 +61,10 @@ def run_object(name):
 
     try:
         sdf = BatchedSDF(mesh, X_WO, bounds_padding=0.15, resolution=128, device="cuda")
-        # Actuation clearance: 4cm diameter × 5cm tall cylinder
+        # Actuation clearance: 4cm diameter × 3cm tall cylinder (shorter to avoid
+        # penalising support-finger contacts on the opposite side of thin handles).
         sdf.add_clearance_volume(actuation_targets[0][0], actuation_targets[0][1],
-                                 radius=0.020, height=0.05)
+                                 radius=0.020, height=0.03)
         sdf.add_floor(0.0)
         opt = BatchedGraspOptimizer(
             sdf, num_envs=NUM_ENVS, device="cuda",

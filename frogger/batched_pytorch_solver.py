@@ -125,49 +125,18 @@ class BatchedSDF:
               f"{inside.sum()} voxels (r={radius*1000:.0f}mm h={height*1000:.0f}mm)")
 
     def _clearance_sdf(self, points: torch.Tensor) -> torch.Tensor:
-        """Signed distance to the clearance cylinder, clipped to the OUTSIDE of
-        the object. Positive = no obstacle, negative = obstacle (clearance zone).
-
-        Rationale: the clearance cylinder is a "no-go" region for support fingers,
-        but only on the APPROACH side of the trigger. For a thin handle whose
-        actuation cylinder passes THROUGH to the opposite face, we don't want to
-        penalize support fingers contacting that opposite face.
-
-        So: clearance is "inside cylinder AND outside object".
-        SDF of intersection(A, B) where each is negative inside = max(sdf_A, sdf_B).
-          - sdf_A = cylinder_sdf       (negative inside cylinder)
-          - sdf_B = -object_sdf        (negative outside object; i.e. we want
-                                         the clearance to only apply in air)
-
-        Object SDF here is read from self.sdf_tensor (object + floor baked in);
-        floor-below regions are treated as "inside the world", which is fine —
-        no support finger should be below the floor anyway.
-
-        points [B,N,3] -> [B,N]. Returns +inf if no clearance defined.
+        """Signed distance to the clearance cylinder (positive outside, negative
+        inside).  points [B,N,3] -> [B,N]. Returns +inf if no clearance defined.
         """
         if not hasattr(self, '_clearance_center'):
             return torch.full(points.shape[:-1], float('inf'), device=points.device)
         delta = points - self._clearance_center
-        proj = (delta * self._clearance_dir).sum(-1)  # [B,N]
+        proj = (delta * self._clearance_dir).sum(-1)
         perp_vec = delta - proj.unsqueeze(-1) * self._clearance_dir
-        perp = perp_vec.norm(dim=-1)  # [B,N]
-        cyl_sdf = torch.maximum(perp - self._clearance_radius,
-                                torch.maximum(-proj, proj - self._clearance_height))
-
-        # Query object+floor SDF (no recursion — bypass query()'s clearance merge
-        # since that would call this function again).
-        B, N, _ = points.shape
-        norm = 2.0 * (points - self.bbox_min_t) / self.range_t - 1.0
-        norm_grid = norm[..., [2, 1, 0]]
-        obj_sdf = F.grid_sample(
-            self.sdf_tensor.expand(B, -1, -1, -1, -1),
-            norm_grid.view(B, N, 1, 1, 3),
-            align_corners=True, padding_mode="border",
-        ).view(B, N)
-
-        # Intersection: clearance active iff inside cylinder AND outside object.
-        # The -obj_sdf term is negative where obj_sdf > 0 (outside object).
-        return torch.maximum(cyl_sdf, -obj_sdf)
+        perp = perp_vec.norm(dim=-1)
+        # Finite cylinder SDF approximation.
+        return torch.maximum(perp - self._clearance_radius,
+                             torch.maximum(-proj, proj - self._clearance_height))
 
     def add_floor(self, z_min):
         """Set SDF negative below z_min (table surface). Baked into SDF grid directly
