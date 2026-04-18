@@ -172,6 +172,46 @@ def show(obj_name=None, stage=None, grasp_idx=None):
         faces=np.asarray(obj.faces, dtype=np.int32),
         color=(180, 180, 180), opacity=0.6)
 
+    # Clearance cylinder (where support fingers must stay out of).
+    # Built as a triangulated open cylinder, 32 segments.
+    if "act_pos" in data and "act_dir" in data:
+        center = np.asarray(data["act_pos"], dtype=np.float32)
+        axis = np.asarray(data["act_dir"], dtype=np.float32)
+        axis /= (np.linalg.norm(axis) + 1e-9)
+        radius = 0.020   # must match solver + runner
+        height = 0.030
+        # Find two vectors perpendicular to axis
+        ref = np.array([1, 0, 0], dtype=np.float32) if abs(axis[0]) < 0.9 else np.array([0, 1, 0], dtype=np.float32)
+        u_vec = np.cross(axis, ref); u_vec /= np.linalg.norm(u_vec) + 1e-9
+        v_vec = np.cross(axis, u_vec)
+        segments = 32
+        ring_bottom = []
+        ring_top = []
+        for i in range(segments):
+            a = 2 * np.pi * i / segments
+            p_bot = center + radius * (np.cos(a) * u_vec + np.sin(a) * v_vec)
+            p_top = p_bot + height * axis
+            ring_bottom.append(p_bot); ring_top.append(p_top)
+        verts = np.array(ring_bottom + ring_top, dtype=np.float32)
+        # Side triangles
+        faces = []
+        for i in range(segments):
+            j = (i + 1) % segments
+            a, b, c, d = i, j, segments + j, segments + i   # bot_i, bot_j, top_j, top_i
+            faces.append([a, b, c])
+            faces.append([a, c, d])
+        # Cap the top and bottom (so it's a filled cylinder when rendered)
+        top_center_idx = len(verts)
+        bot_center_idx = top_center_idx + 1
+        verts = np.vstack([verts, (center + height * axis).reshape(1, 3), center.reshape(1, 3)])
+        for i in range(segments):
+            j = (i + 1) % segments
+            faces.append([segments + i, segments + j, top_center_idx])
+            faces.append([j, i, bot_center_idx])
+        faces = np.array(faces, dtype=np.int32)
+        server.scene.add_mesh_simple("/clearance", vertices=verts, faces=faces,
+                                     color=(240, 180, 60), opacity=0.25)
+
     # Get stage data
     stage_names = list(data["stages"].keys())
     if stage not in data["stages"]:

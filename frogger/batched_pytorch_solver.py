@@ -2532,11 +2532,24 @@ class BatchedGraspOptimizer:
                             if self.amap[b, 0] == fi:
                                 worst_act_link[b] = torch.minimum(worst_act_link[b], lsdf[b])
 
+                # Palm collision check — palm is frozen through main opt, so if it's
+                # in the object at entry, nothing can fix it later. Gate at -3mm.
+                worst_palm = torch.zeros(B, device=dev)
+                for cnm, lp in self._col_data:
+                    if "palm" not in cnm or cnm not in fk_filt: continue
+                    lwT = bT_filt @ fk_filt[cnm].get_matrix()
+                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                    worst_palm = torch.minimum(worst_palm, self.sdf.query(lwp).min(-1).values)
+
                 opt_mask = ((act_d < 0.010) & (tip_sdf_mean < 0.015)
-                           & (worst_sup_link > -0.005) & (worst_act_link > -0.010))
+                           & (worst_sup_link > -0.005)
+                           & (worst_act_link > -0.010)
+                           & (worst_palm > -0.003))
                 n_opt = opt_mask.sum().item()
                 n_act_filtered = ((worst_act_link <= -0.010) & (act_d < 0.010)).sum().item()
-                print(f"  Optimization candidates: {n_opt}/{B} ({n_act_filtered} filtered by act collision)")
+                n_palm_filtered = ((worst_palm <= -0.003) & (act_d < 0.010)).sum().item()
+                print(f"  Optimization candidates: {n_opt}/{B} "
+                      f"({n_act_filtered} act_col, {n_palm_filtered} palm_col)")
 
             if n_opt > 0:
                 # Build support masks
