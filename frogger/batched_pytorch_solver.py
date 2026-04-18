@@ -3165,29 +3165,30 @@ class BatchedGraspOptimizer:
                 # Tip positions + collision points
                 tp_final, cp_final, tip_x_final = self._get_points(fk_final, bT_final)
                 ts_final = self.sdf.query(tp_final)
-                # Object-only SDF (no clearance). Clearance is enforced per-finger below
-                # because the actuation finger body IS supposed to be in the clearance zone.
-                cs_final_obj = self.sdf.query(cp_final, include_clearance=False)
-                cs_final_cl  = self.sdf._clearance_sdf(cp_final) if hasattr(self.sdf, '_clearance_center') else torch.full_like(cs_final_obj, float('inf'))
-                # Per-point mask: True if point belongs to the ACTUATION finger's body
-                # (these points are allowed inside the clearance zone).
-                # Non-act points use min(obj, cl) so they're pushed out of clearance.
+                # Object+floor SDF only (no clearance). Used for all object collision checks.
+                cs_final = self.sdf.query(cp_final, include_clearance=False)
+                # Separate clearance SDF for per-finger enforcement.
+                cs_final_cl = (self.sdf._clearance_sdf(cp_final)
+                               if hasattr(self.sdf, '_clearance_center')
+                               else torch.full_like(cs_final, float('inf')))
+                # Per-point mask: True if point belongs to the ACTUATION finger.
+                # Only SUPPORT finger points are checked against clearance (they
+                # must NEVER enter — stricter than object check, no margin).
                 act_point_mask = torch.zeros(B, cp_final.shape[1], device=dev, dtype=torch.bool)
                 prefixes_cs = ['if', 'mf', 'rf', 'th']
                 for li_cs, (nm_cs, _) in enumerate(self._col_data):
                     si_cs, ei_cs = self._col_link_ranges[li_cs]
-                    # Determine which finger this link belongs to
                     link_fi = next((pi for pi, p in enumerate(prefixes_cs) if f"_{p}_" in nm_cs), None)
                     if link_fi is None: continue
-                    # Envs where this finger is the actuation finger
-                    is_act_env = (self.amap_t[:, 0] == link_fi)  # [B]
-                    # Act finger points → don't apply clearance
+                    is_act_env = (self.amap_t[:, 0] == link_fi)
                     act_point_mask[:, si_cs:ei_cs] = is_act_env.unsqueeze(1)
-                cs_final = torch.where(
-                    act_point_mask,
-                    cs_final_obj,                             # act finger: object-only
-                    torch.minimum(cs_final_obj, cs_final_cl)  # others: object ∪ clearance
-                )
+                # Clearance penetration for support points: min across all support points.
+                # "Support" = not actuation finger. Palm is also considered support.
+                sup_point_mask = ~act_point_mask  # [B, N_pts]
+                # For each env, find worst clearance SDF among its support points.
+                # Set non-support clearance to +inf so they don't affect min.
+                cl_for_sup = torch.where(sup_point_mask, cs_final_cl, torch.full_like(cs_final_cl, float('inf')))
+                sup_clearance_worst = cl_for_sup.min(dim=-1).values  # [B]
 
                 # FC from 3 support fingertips + palm per actuation group
                 all_tips_final = tp_final[:, :4]  # [B, 4, 3]
@@ -3322,13 +3323,17 @@ class BatchedGraspOptimizer:
                         ds_pad_worst = torch.where(
                             not_act, torch.minimum(ds_pad_worst, ds_pad_sdf), ds_pad_worst)
 
-                # Feasibility: only candidates that passed opt_mask + quality checks
+                # Feasibility: only candidates that passed opt_mask + quality checks.
+                # NOTE: ds_pad/ds_back/max_col_viol now use OBJECT-ONLY SDF (cs_final above).
+                # Support finger clearance entry is checked separately with NO margin
+                # (support must never enter the actuation clearance zone).
                 feasible = (opt_mask
                             & (surf_err < 0.008)  # 8mm surface
-                            & (max_col_viol < 0.003)  # 3mm non-ds collision margin
-                            & (ds_back_worst > -0.003)  # 3mm back-side ds pen (strict: back should not penetrate)
-                            & (ds_pad_worst > -0.005)  # 5mm pad-side ds pen (allow shallow wrap, catch insertion)
-                            & (sc_worst_sdf > -0.001)  # box-box SDF > -1mm (no inter-finger overlap)
+                            & (max_col_viol < 0.003)  # 3mm non-ds object collision margin
+                            & (ds_back_worst > -0.003)  # 3mm back-side ds pen
+                            & (ds_pad_worst > -0.005)  # 5mm pad-side ds pen
+                            & (sup_clearance_worst >= 0.0)  # support MUST NOT enter clearance
+                            & (sc_worst_sdf > -0.001)  # box-box SDF > -1mm
                             & (sigma_all > 0.01))  # force closure
                 if n_act:
                     feasible = feasible & (act_dist < 0.010)  # 10mm actuation
