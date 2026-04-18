@@ -2129,9 +2129,24 @@ class BatchedGraspOptimizer:
                     off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
                     tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                     act_dists += mask_fi.float() * torch.norm(tp - ap[0], dim=-1)
-                good = act_dists < 0.010
+
+                # Palm collision check — palm is frozen from here onward
+                # (palm slide stage 3 was the last chance to move it).
+                # Reject grasps where palm is more than 3mm inside the object.
+                worst_palm_init = torch.zeros(B, device=dev)
+                for cnm, lp in self._col_data:
+                    if "palm" not in cnm or cnm not in fk_check: continue
+                    lwT = bT_check @ fk_check[cnm].get_matrix()
+                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                    worst_palm_init = torch.minimum(
+                        worst_palm_init, self.sdf.query(lwp).min(-1).values)
+
+                good = (act_dists < 0.010) & (worst_palm_init > -0.003)
                 n_good = good.sum().item()
-                print(f"  Actuation filter: {n_good}/{B} passed (<10mm)")
+                n_act_ok = (act_dists < 0.010).sum().item()
+                n_palm_fail = ((act_dists < 0.010) & (worst_palm_init <= -0.003)).sum().item()
+                print(f"  Actuation filter: {n_good}/{B} passed "
+                      f"({n_act_ok} reached target, {n_palm_fail} rejected for palm collision)")
 
             if n_good > 0:
                 # Diversify support finger CMC to avoid the actuation finger.
@@ -2532,24 +2547,11 @@ class BatchedGraspOptimizer:
                             if self.amap[b, 0] == fi:
                                 worst_act_link[b] = torch.minimum(worst_act_link[b], lsdf[b])
 
-                # Palm collision check — palm is frozen through main opt, so if it's
-                # in the object at entry, nothing can fix it later. Gate at -3mm.
-                worst_palm = torch.zeros(B, device=dev)
-                for cnm, lp in self._col_data:
-                    if "palm" not in cnm or cnm not in fk_filt: continue
-                    lwT = bT_filt @ fk_filt[cnm].get_matrix()
-                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                    worst_palm = torch.minimum(worst_palm, self.sdf.query(lwp).min(-1).values)
-
                 opt_mask = ((act_d < 0.010) & (tip_sdf_mean < 0.015)
-                           & (worst_sup_link > -0.005)
-                           & (worst_act_link > -0.010)
-                           & (worst_palm > -0.003))
+                           & (worst_sup_link > -0.005) & (worst_act_link > -0.010))
                 n_opt = opt_mask.sum().item()
                 n_act_filtered = ((worst_act_link <= -0.010) & (act_d < 0.010)).sum().item()
-                n_palm_filtered = ((worst_palm <= -0.003) & (act_d < 0.010)).sum().item()
-                print(f"  Optimization candidates: {n_opt}/{B} "
-                      f"({n_act_filtered} act_col, {n_palm_filtered} palm_col)")
+                print(f"  Optimization candidates: {n_opt}/{B} ({n_act_filtered} filtered by act collision)")
 
             if n_opt > 0:
                 # Build support masks
