@@ -347,123 +347,206 @@ def show(obj_name=None, stage=None, grasp_idx=None):
     server.scene.add_icosphere("/markers/x_tip", radius=0.004,
         color=(255, 0, 0), position=x_tip.astype(np.float32))
 
-    # Build metrics text with explicit pass/fail per criterion
+    # ---------------------------------------------------------------------
+    # Diagnostic panel for a dexterous grasp.
+    # Aesthetic: engineering telemetry — verdict up top, prose diagnosis for
+    # failures, aligned code blocks for scanning numbers, no redundancy.
+    # MDX-safe: no "<digit" / ">digit" patterns (parsed as JSX tags).
+    # ---------------------------------------------------------------------
+
     # Thresholds (must match solver's feasibility check)
     TH = {
-        'surf':    (0.008,  '<'),   # surf_err < 8mm
-        'col':     (0.003,  '<'),   # max_col_viol < 3mm
-        'back':    (-0.003, '>'),   # ds_back_worst > -3mm
-        'pad':     (-0.005, '>'),   # ds_pad_worst > -5mm
-        'sc':      (-0.001, '>'),   # sc_min_dist > -1mm
-        'sigma':   (0.01,   '>'),   # σ_min > 0.01
-        'act':     (0.010,  '<'),   # act_dist < 10mm
-        'pen':     (5.0,    '<'),   # mesh_pen_pct < 5%
-        'sc_pts':  (0.0005, '>'),   # sc_worst > 0.5mm
+        'surf':   (0.008,  '<'),   # fingertip distance from surface
+        'col':    (0.003,  '<'),   # hand body object penetration
+        'back':   (-0.003, '>'),   # fingertip back-side penetration
+        'pad':    (-0.005, '>'),   # fingertip pad-side penetration
+        'sc':     (-0.001, '>'),   # box-box inter-finger overlap
+        'sigma':  (0.01,   '>'),   # min singular value of wrench matrix
+        'act':    (0.010,  '<'),   # actuation tip distance to target
+        'pen':    (5.0,    '<'),   # verification penetration percentage
+        'sc_pts': (0.0005, '>'),   # point-cloud self-collision distance
     }
 
-    # Friendly metric labels
-    NAMES = {
-        'surf':   'surface',
-        'col':    'body collision',
-        'back':   'ds back',
-        'pad':    'ds pad',
-        'sc':     'self-collision (box-box)',
-        'sigma':  'sigma (×1000)',
-        'act':    'actuation dist',
-        'pen':    'verify penetration',
-        'sc_pts': 'self-collision (points)',
-    }
+    # Raw fields
+    sigma     = g.get("sigma_min", 0)
+    lstar     = g.get("l_star", -1)
+    feasible  = g.get("feasible", False)
+    surf_err  = g.get("surf_err", 0)
+    act_dist  = g.get("act_dist", None)
+    col_viol  = g.get("max_col_viol", None)
+    ds_back   = g.get("ds_back_worst", None)
+    ds_pad    = g.get("ds_pad_worst", None)
+    sc        = g.get("sc_min_dist", None)
+    pen       = g.get("mesh_pen_pct", None)
+    sc_pts    = g.get("sc_worst", None)
+    act_fi    = g.get("act_finger", 0)
+    act_short = FINGER_LABELS[act_fi] if act_fi < 4 else f'F{act_fi}'
+    act_full  = {'IF': 'index', 'MF': 'middle', 'RF': 'ring', 'TH': 'thumb'}.get(act_short, '?')
 
-    def check(name, val, unit='mm'):
-        if val is None: return None
+    def passes(name, val):
+        if val is None: return True
         thresh, op = TH[name]
-        thresh_display = thresh*(1 if unit == "%" else 1000)
-        if op == '<':
-            ok = val < thresh
-            cmp_t = f'lt {thresh_display:.1f}'
-        else:
-            ok = val > thresh
-            cmp_t = f'gt {thresh_display:.1f}'
-        disp = val*(1 if unit == '%' else 1000)
-        tag = '[PASS]' if ok else '[FAIL]'
-        label = NAMES.get(name, name)
-        # Aligned plain text for code block (monospace)
-        return ok, f"{tag:<6} {label:<24} {disp:>+7.2f} {unit:<2} need {cmp_t}"
+        return (val < thresh) if op == '<' else (val > thresh)
 
-    # Collect fields
-    sigma = g.get("sigma_min", 0)
-    lstar = g.get("l_star", -1)
-    feasible = g.get("feasible", False)
-    surf_err = g.get("surf_err", 0)
-    act_dist = g.get("act_dist", None)
-    col_viol = g.get("max_col_viol", None)
-    ds_back = g.get("ds_back_worst", None)
-    ds_pad  = g.get("ds_pad_worst", None)
-    sc      = g.get("sc_min_dist", None)
-    pen     = g.get("mesh_pen_pct", None)
-    sc_pts  = g.get("sc_worst", None)
-    act_fi  = g.get("act_finger", 0)
+    # Terse fragment describing a failing criterion — just the numeric fact.
+    def reason_for(name, val):
+        if name == 'surf':
+            return f"fingertips {val*1000:.1f} mm from surface (limit 8)"
+        if name == 'col':
+            return f"body links {val*1000:.1f} mm into object (limit 3)"
+        if name == 'back':
+            return f"fingertip back {abs(val)*1000:.1f} mm into object (limit 3)"
+        if name == 'pad':
+            return f"fingertip pad {abs(val)*1000:.1f} mm into object (limit 5)"
+        if name == 'sc':
+            return f"inter-finger overlap {abs(val)*1000:.1f} mm (limit 1)"
+        if name == 'sigma':
+            return f"σ_min {val:.4f} (limit 0.01)"
+        if name == 'act':
+            return f"actuation tip {val*1000:.1f} mm from trigger (limit 10)"
+        if name == 'pen':
+            return f"{val:.1f}% URDF points inside object (limit 5)"
+        if name == 'sc_pts':
+            return f"point self-col {val*1000:.2f} mm (limit 0.5)"
+        return f"{name} = {val}"
 
-    # Per-criterion check
-    checks = []
-    checks.append(check('surf', surf_err))
-    if col_viol is not None: checks.append(check('col', col_viol))
-    if ds_back is not None:  checks.append(check('back', ds_back))
-    if ds_pad  is not None:  checks.append(check('pad', ds_pad))
-    if sc      is not None:  checks.append(check('sc', sc))
-    checks.append(check('sigma', sigma))
-    if act_dist is not None: checks.append(check('act', act_dist))
-    if pen is not None:      checks.append(check('pen', pen, unit='%'))
-    if sc_pts is not None:   checks.append(check('sc_pts', sc_pts))
-    checks = [c for c in checks if c is not None]
+    # Human-readable link name
+    def friendly_link(short_name):
+        segments = {'bs': 'base link', 'px': 'proximal', 'md': 'middle',
+                    'ds': 'fingertip', 'mp': 'MCP link'}
+        parts = {'if': 'index', 'mf': 'middle', 'rf': 'ring', 'th': 'thumb'}
+        if short_name == 'palm':
+            return 'palm'
+        f, s = short_name.split('_', 1)
+        return f"{parts.get(f, f)} {segments.get(s, s)}"
 
-    # Feasibility banner (safe chars only — no "<digit" which breaks MDX)
+    # Split each link's reasons into object-vs-env and self-collision buckets
+    def split_reasons(reasons):
+        obj_entries = []   # (link, detail) — collision with object/floor
+        self_entries = []  # (link, detail) — in clearance / inter-finger
+        for r in reasons:
+            k, v = r.split("=")
+            mm = abs(float(v.replace("mm", "")))
+            if k == "obj":
+                obj_entries.append(f"{mm:.1f} mm into object")
+            elif k == "floor":
+                obj_entries.append(f"{mm:.1f} mm below table")
+            elif k == "clear":
+                self_entries.append(f"{mm:.1f} mm into actuation clearance")
+        return obj_entries, self_entries
+
+    # --- Compose panel ---------------------------------------------------
+    # Header (title + verdict) goes ABOVE the controls in a separate widget.
     tag = '✅ FEASIBLE' if feasible else '❌ INFEASIBLE'
-    act_label = FINGER_LABELS[act_fi] if act_fi < 4 else f'F{act_fi}'
+    header_lines = [
+        f"### {obj_name} · grasp {grasp_idx}",
+        "",
+        f"**{tag}**",
+    ]
+    header_md.content = "\n".join(header_lines)
+
+    # Rest of the panel (below the controls)
     lines = []
-    lines.append(f"### {obj_name} — grasp {grasp_idx}")
-    lines.append("")
-    lines.append(f"**{tag}**")
-    lines.append("")
-    lines.append("```")
-    lines.append(f"sigma_min        {sigma:>+10.4f}")
-    lines.append(f"l_star           {lstar:>+10.4f}")
-    lines.append(f"actuation finger {act_label:>10}")
-    lines.append(f"stage            {stage:>10}")
-    lines.append(f"env              {target_env:>10}")
-    lines.append("```")
-    lines.append("")
 
-    # Criteria (code block, monospace aligned)
-    lines.append("### Criteria")
-    lines.append("```")
-    for ok, msg in checks:
-        lines.append(msg)
-    lines.append("```")
-    lines.append("")
+    # 3 — Diagnosis (prose, only if something is wrong)
+    # Failure severity order — most impactful first
+    order = ['pad', 'back', 'col', 'sc', 'surf', 'sigma', 'act', 'pen', 'sc_pts']
+    checks_map = {'pad': ds_pad, 'back': ds_back, 'col': col_viol, 'sc': sc,
+                  'surf': surf_err, 'sigma': sigma, 'act': act_dist,
+                  'pen': pen, 'sc_pts': sc_pts}
+    fails = [n for n in order if n in checks_map and checks_map[n] is not None
+             and not passes(n, checks_map[n])]
 
-    # Failure reasons — only when infeasible, lists just the failing criteria
-    fail_msgs = [msg for ok, msg in checks if not ok]
-    if not feasible and fail_msgs:
-        lines.append("### Failure reasons")
-        lines.append("```")
-        for msg in fail_msgs:
-            lines.append(msg)
-        lines.append("```")
+    # Treat ℓ* ≤ 0 as a semantic failure (no true force closure) even when
+    # the feasibility check only requires σ_min > 0.01. This matters for the
+    # reader — a grasp can pass σ while still not force-closing.
+    lstar_fail = lstar <= 0
+
+    if not feasible or lstar_fail:
+        lines.append("**Diagnosis**")
+        lines.append("")
+        for nm in fails:
+            lines.append(f"- {reason_for(nm, checks_map[nm])}")
+        if lstar_fail and 'sigma' not in fails:
+            lines.append(f"- ℓ\\* = {lstar:+.2f}")
         lines.append("")
 
-    # Red links
+    # 4 — Key metrics block (monospace, aligned, pass/fail tag, all values)
+    def row(name, val, label, unit='mm'):
+        if val is None:
+            return f"{label:<20}    —"
+        ok = passes(name, val)
+        disp = val * (1 if unit == '%' else 1000)
+        flag = 'ok  ' if ok else 'FAIL'
+        return f"{label:<20}   {disp:>+7.2f} {unit:<2}   [{flag}]"
+
+    lines.append("**Metrics**")
+    lines.append("```")
+    # Always show: target contact + stability
+    lines.append(f"{'actuation finger':<20}   {act_full:>10}")
+    lines.append(f"{'actuation target':<20}   {act_dist*1000 if act_dist is not None else 0:>+7.2f} mm   " +
+                 (f"[ok  ]" if passes('act', act_dist) else "[FAIL]"))
+    lines.append(f"{'sigma (stability)':<20}   {sigma:>7.4f}      " +
+                 (f"[ok  ]" if passes('sigma', sigma) else "[FAIL]"))
+    lines.append(f"{'l_star (force cl.)':<20}   {lstar:>+7.4f}      " +
+                 ("[ok  ]" if lstar > 0 else "[FAIL]"))
+    lines.append("")
+    lines.append(f"{'surface reach':<20}   {surf_err*1000:>+7.2f} mm   " +
+                 (f"[ok  ]" if passes('surf', surf_err) else "[FAIL]"))
+    if col_viol is not None:
+        lines.append(row('col', col_viol, 'body object col'))
+    if ds_back is not None:
+        lines.append(row('back', ds_back, 'fingertip back'))
+    if ds_pad is not None:
+        lines.append(row('pad', ds_pad, 'fingertip pad'))
+    if sc is not None:
+        lines.append(row('sc', sc, 'inter-finger gap'))
+    lines.append("")
+    if pen is not None:
+        lines.append(row('pen', pen, 'verify penetration', unit='%'))
+    if sc_pts is not None:
+        lines.append(row('sc_pts', sc_pts, 'point self-col'))
+    lines.append("```")
+    lines.append("")
+
+    # 5 — Per-link collisions split into object vs self buckets
     bad_links = [(nm, ls) for nm, ls in link_status.items() if ls[3]]
-    if bad_links:
-        lines.append("### Colliding links")
+    obj_rows = []   # (name, details) — vs object/floor
+    self_rows = []  # (name, details) — vs other hand parts / clearance zone
+    for nm, (obj, cl, fl, _, reasons) in bad_links:
+        short = nm.replace("leap_rh_", "")
+        nice = friendly_link(short)
+        obj_r, self_r = split_reasons(reasons)
+        if obj_r:
+            obj_rows.append((nice, ', '.join(obj_r)))
+        if self_r:
+            self_rows.append((nice, ', '.join(self_r)))
+
+    # Inter-finger box-box overlap (sc metric) is conceptually self-collision
+    # but does NOT tie to a single link; report it separately if it fails.
+    if sc is not None and not passes('sc', sc):
+        self_rows.append(('inter-finger (box-box)', f"{abs(sc)*1000:.1f} mm overlap"))
+
+    if obj_rows:
+        lines.append("**Object collisions**")
         lines.append("```")
-        for nm, (obj, cl, fl, _, reasons) in bad_links:
-            short = nm.replace("leap_rh_", "")
-            lines.append(f"{short:<10}  {', '.join(reasons)}")
+        longest = max(len(n) for n, _ in obj_rows) + 2
+        for name, detail in obj_rows:
+            lines.append(f"{name:<{longest}} {detail}")
         lines.append("```")
         lines.append("")
 
-    # Stage trajectory
+    if self_rows:
+        lines.append("**Self-collisions**")
+        lines.append("```")
+        longest = max(len(n) for n, _ in self_rows) + 2
+        for name, detail in self_rows:
+            lines.append(f"{name:<{longest}} {detail}")
+        lines.append("```")
+        lines.append("")
+
+    # 6 — Stage evolution (code block, aligned)
+    stage_map = {'a_init': 'init', 'b_support_ik': 'support IK', 'c_optimized': 'optimized'}
     stage_match = []
     for sn in stage_names:
         sd = data["stages"][sn]
@@ -476,9 +559,10 @@ def show(obj_name=None, stage=None, grasp_idx=None):
             s = match.get("sigma_min", 0)
             l = match.get("l_star", -1)
             se = match.get("surf_err", 0)
-            stage_match.append(f"{sn:<14}  sigma={s:.4f}  l_star={l:+.4f}  surf={se*1000:.1f}mm")
+            label = stage_map.get(sn, sn)
+            stage_match.append(f"{label:<14}   σ={s:.4f}   l*={l:>+7.4f}   tip={se*1000:>5.1f} mm")
     if stage_match:
-        lines.append("### Stage trajectory")
+        lines.append("**Stage evolution**")
         lines.append("```")
         for s in stage_match:
             lines.append(s)
@@ -492,19 +576,21 @@ def show(obj_name=None, stage=None, grasp_idx=None):
 
 # GUI
 with server.gui.add_folder("Grasp Browser"):
-    info_md = server.gui.add_markdown("")
+    # Top: title + verdict (always a quick glance)
+    header_md = server.gui.add_markdown("")
+    # Controls directly under the verdict
     obj_dd = server.gui.add_dropdown("Object", options=available_objects, initial_value=available_objects[0])
-
     # Stage options (will update when object changes)
     data0 = load_object(available_objects[0])
     stage_opts = list(data0["stages"].keys())
     stage_dd = server.gui.add_dropdown("Stage", options=stage_opts if stage_opts else ["none"],
                                         initial_value=stage_opts[-1] if stage_opts else "none")
-
     gi_slider = server.gui.add_slider("Grasp", min=0, max=9, step=1, initial_value=0)
     btn_prev = server.gui.add_button("< Prev")
     btn_next = server.gui.add_button("Next >")
     show_col_cb = server.gui.add_checkbox("Show collision points", initial_value=False)
+    # Below controls: the detailed diagnosis / metrics / collisions / stages
+    info_md = server.gui.add_markdown("")
 
 @show_col_cb.on_update
 def _(_):
