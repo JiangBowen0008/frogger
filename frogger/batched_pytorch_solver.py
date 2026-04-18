@@ -2606,10 +2606,12 @@ class BatchedGraspOptimizer:
                     act_fi = self.amap[b, 0]
                     for fi in range(4):
                         if fi != act_fi:
-                            # Optimize MCP, PIP, DIP (joints 1-3). Freeze CMC (joint 0).
-                            # CMC controls finger spread — init places it to avoid actuation.
-                            # Optimizing CMC undoes the spreading within ~10 steps.
-                            opt_joint_mask[b, fi*4+1:fi*4+4] = True
+                            # Unfreeze CMC too — needed so fingers can slide
+                            # laterally (abduct/adduct) to resolve side-to-side
+                            # collisions with neighbouring support fingers.
+                            # The SC loss + actuation-clearance gate should now
+                            # contain the drift that froze CMC was mitigating.
+                            opt_joint_mask[b, fi*4:fi*4+4] = True
                             sup_finger_mask_opt[b, fi] = True
 
                 prefixes_opt = ['if', 'mf', 'rf', 'th']
@@ -2888,7 +2890,7 @@ class BatchedGraspOptimizer:
                         # Use box-box SDF directly — matches the feasibility metric.
                         # Only process opt_mask envs and skip distant pairs for efficiency.
                         # Computed every 10 steps to amortize cost.
-                        if hasattr(self, '_box_primitives') and opt_step % 5 == 0:
+                        if hasattr(self, '_box_primitives'):
                             _prefix_d = f"leap_{self.hand}_"
                             _adj_d = {
                                 ('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
