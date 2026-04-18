@@ -73,10 +73,12 @@ def load_object(name):
     data = {"name": name, "stages": {}, "sdf": None, "opt": None}
 
     # Load stages
+    # NOTE: stage names must NOT start with digits — viser's markdown CSS fails
+    # with "Unexpected character `1/2/3` before name" errors otherwise.
     stage_files = {
-        "1_init": "stage_after_init.pt",
-        "2_support_ik": "stage_after_support_ik.pt",
-        "3_optimized": "stage_after_optimization.pt",
+        "a_init": "stage_after_init.pt",
+        "b_support_ik": "stage_after_support_ik.pt",
+        "c_optimized": "stage_after_optimization.pt",
     }
     for sname, fname in stage_files.items():
         path = os.path.join(obj_dir, fname)
@@ -90,7 +92,7 @@ def load_object(name):
         if grasps:
             feas = [g for g in grasps if g.get("feasible", False)]
             infeas = [g for g in grasps if not g.get("feasible", False)]
-            data["stages"]["3_optimized"] = feas + infeas  # feasible first
+            data["stages"]["c_optimized"] = feas + infeas  # feasible first
 
     # Load metadata
     meta_path = os.path.join(obj_dir, "meta.pt")
@@ -122,27 +124,24 @@ def load_object(name):
         data["act_pos"] = np.array(c["pos"], dtype=np.float32) + data["offset"]
         data["act_dir"] = np.array(c["dir"], dtype=np.float32)
 
-    # Build SDF + optimizer for metrics
+    # Build SDF + optimizer for metrics (no try/except — let errors surface)
     obj_raw = trimesh.load(data["mesh_path"], force="mesh")
     X_WO = np.eye(4); X_WO[:3, 3] = data["offset"]
-    try:
-        data["sdf"] = BatchedSDF(obj_raw, X_WO, resolution=128, device="cuda")
-        # Match solver: 20mm clearance cylinder (must match run_target_objects.py)
-        if "act_pos" in data and "act_dir" in data:
-            data["sdf"].add_clearance_volume(data["act_pos"], data["act_dir"],
-                                             radius=0.020, height=0.05)
-        data["sdf"].add_floor(0.0)
-        data["opt"] = BatchedGraspOptimizer(data["sdf"], num_envs=1, device="cuda",
-                                            hand="rh", hand_type="leap", palm_contact=True)
-    except Exception as e:
-        print(f"  Warning: SDF/optimizer failed for {name}: {e}")
+    data["sdf"] = BatchedSDF(obj_raw, X_WO, resolution=128, device="cuda")
+    # Match solver: 20mm clearance cylinder (must match run_target_objects.py)
+    if "act_pos" in data and "act_dir" in data:
+        data["sdf"].add_clearance_volume(data["act_pos"], data["act_dir"],
+                                         radius=0.020, height=0.05)
+    data["sdf"].add_floor(0.0)
+    data["opt"] = BatchedGraspOptimizer(data["sdf"], num_envs=1, device="cuda",
+                                        hand="rh", hand_type="leap", palm_contact=True)
 
     obj_cache[name] = data
     return data
 
 
 current_obj = [available_objects[0]]
-current_stage = ["3_optimized"]
+current_stage = ["c_optimized"]
 current_grasp = [0]
 show_col_pts = [False]  # toggleable debug overlay
 
@@ -310,11 +309,8 @@ def show(obj_name=None, stage=None, grasp_idx=None):
                 colors=all_colors, point_size=0.002, point_shape="circle")
     else:
         # Clear point cloud if toggled off
-        try:
-            server.scene.add_point_cloud("/col_pts", points=np.zeros((1,3), dtype=np.float32),
-                colors=np.array([[0,0,0]], dtype=np.uint8), point_size=0.0001)
-        except Exception:
-            pass
+        server.scene.add_point_cloud("/col_pts", points=np.zeros((1,3), dtype=np.float32),
+            colors=np.array([[0,0,0]], dtype=np.uint8), point_size=0.0001)
 
     # Actuation target
     if "act_pos" in data:
@@ -370,13 +366,13 @@ def show(obj_name=None, stage=None, grasp_idx=None):
         thresh, op = TH[name]
         if op == '<':
             ok = val < thresh
-            cmp = f'<{thresh*(1 if unit == "%" else 1000):.1f}'
+            cmp_t = f'{op}{thresh*(1 if unit == "%" else 1000):.1f}{unit}'
         else:
             ok = val > thresh
-            cmp = f'>{thresh*(1 if unit == "%" else 1000):.1f}'
+            cmp_t = f'{op}{thresh*(1 if unit == "%" else 1000):.1f}{unit}'
         disp = val*(1 if unit == '%' else 1000)
-        tag = '✓' if ok else '✗'
-        return ok, f"  {tag} {name:<8} {disp:+6.2f}{unit}  (need {cmp}{unit})"
+        tag = 'PASS' if ok else 'FAIL'
+        return ok, f"[{tag}] {name}: {disp:+.2f}{unit} (need {cmp_t})"
 
     # Collect fields
     sigma = g.get("sigma_min", 0)
@@ -405,36 +401,42 @@ def show(obj_name=None, stage=None, grasp_idx=None):
     if sc_pts is not None:   checks.append(check('sc_pts', sc_pts))
     checks = [c for c in checks if c is not None]
 
-    # Feasibility banner
-    tag = '✅ FEASIBLE' if feasible else '❌ INFEASIBLE'
-    lines = [f"### {obj_name} / Grasp {grasp_idx} / env {target_env} / {stage}"]
-    lines.append(f"**{tag}** | σ_min={sigma:.4f} | l*={lstar:+.4f} | act_finger={FINGER_LABELS[act_fi] if act_fi < 4 else f'F{act_fi}'}")
+    # Feasibility banner — avoid markdown heading (###) which auto-generates CSS
+    # ids from content; forward-slashes and digits in the heading text break viser's
+    # markdown renderer. Use plain bold text instead.
+    tag = 'FEASIBLE' if feasible else 'INFEASIBLE'
+    lines = []
+    lines.append(f"**{obj_name}** | grasp {grasp_idx} | env {target_env} | stage {stage}")
+    lines.append("")
+    lines.append(f"**{tag}**")
+    lines.append("")
+    lines.append(f"- sigma = {sigma:.4f}")
+    lines.append(f"- lstar = {lstar:+.4f}")
+    lines.append(f"- act finger = {FINGER_LABELS[act_fi] if act_fi < 4 else f'F{act_fi}'}")
     lines.append("")
 
-    # Criteria block (all checks with pass/fail)
-    lines.append("**Criteria:**")
-    lines.append("```")
+    # Criteria
+    lines.append("**Criteria**")
     for ok, msg in checks:
-        lines.append(msg)
-    lines.append("```")
+        lines.append(f"- {msg}")
+    lines.append("")
 
-    # Failure reasons (if infeasible)
-    fail_reasons = [msg.strip() for ok, msg in checks if not ok]
+    # Failure reasons (only if infeasible — avoid duplication when all pass)
+    fail_reasons = [msg for ok, msg in checks if not ok]
     if not feasible and fail_reasons:
-        lines.append("**Failure reasons:**")
+        lines.append("**Failure reasons**")
         for r in fail_reasons:
             lines.append(f"- {r}")
         lines.append("")
 
-    # Per-link breakdown (which link is red and WHY?)
+    # Red links
     bad_links = [(nm, ls) for nm, ls in link_status.items() if ls[3]]
     if bad_links:
-        lines.append("**Red links (reasons):**")
-        lines.append("```")
+        lines.append("**Red links (reasons)**")
         for nm, (obj, cl, fl, _, reasons) in bad_links:
             short = nm.replace("leap_rh_", "")
-            lines.append(f"  {short:<10} {', '.join(reasons)}")
-        lines.append("```")
+            lines.append(f"- {short}: {', '.join(reasons)}")
+        lines.append("")
 
     # Stage comparison
     stage_match = []
@@ -449,15 +451,15 @@ def show(obj_name=None, stage=None, grasp_idx=None):
             s = match.get("sigma_min", 0)
             l = match.get("l_star", -1)
             se = match.get("surf_err", 0)
-            stage_match.append(f"  {sn}: σ={s:.4f}  l*={l:+.4f}  surf={se*1000:.1f}mm")
+            stage_match.append(f"- {sn}: sigma={s:.4f}, lstar={l:+.4f}, surf={se*1000:.1f}mm")
     if stage_match:
-        lines.append("**Stage trajectory:**")
-        lines.append("```")
+        lines.append("**Stage trajectory**")
         for s in stage_match:
             lines.append(s)
-        lines.append("```")
 
-    info_md.content = "\n".join(lines)
+    content = "\n".join(lines)
+    info_md.content = content
+    print(f"[VISER] info_md updated, len={len(content)}")
 
 
 # GUI
@@ -528,7 +530,4 @@ def _(_):
 show()
 print(f"http://localhost:{PORT}")
 print(f"Objects: {', '.join(available_objects)}")
-try:
-    while True: time.sleep(1)
-except KeyboardInterrupt:
-    pass
+while True: time.sleep(1)
