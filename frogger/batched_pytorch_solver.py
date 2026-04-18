@@ -147,7 +147,10 @@ class BatchedSDF:
         return sdf
 
     def add_floor(self, z_min):
-        """Set SDF negative below z_min (table surface)."""
+        """Set SDF negative below z_min (table surface). Baked into SDF grid directly
+        so all collision queries see the floor as solid. Also stored separately for
+        viser's floor plane drawing."""
+        self._floor_z = float(z_min)
         res = self.sdf_tensor.shape[2]
         lin_z = np.linspace(self.bbox_min[2], self.bbox_max[2], res)
         sdf_np = self.sdf_tensor[0, 0].cpu().numpy()
@@ -157,15 +160,21 @@ class BatchedSDF:
         self.sdf_tensor = torch.tensor(
             sdf_np, dtype=torch.float32, device=self.sdf_tensor.device
         ).unsqueeze(0).unsqueeze(0)
-        print(f"  Floor at z={z_min*1000:.0f}mm")
+        print(f"  Floor at z={z_min*1000:.0f}mm (baked into SDF)")
+
+    def _floor_sdf(self, points: torch.Tensor) -> torch.Tensor:
+        """Signed distance to floor (z=floor_z). Positive above, negative below.
+        Used only for separated reporting (e.g., viser). Not used in query()."""
+        if not hasattr(self, '_floor_z'):
+            return torch.full(points.shape[:-1], float('inf'), device=points.device)
+        return points[..., 2] - self._floor_z
 
     def query(self, points: torch.Tensor, include_clearance: bool = True) -> torch.Tensor:
         """Differentiable SDF look-up.  points [B,N,3] -> [B,N].
 
         include_clearance=True (default): merges the actuation clearance zone
         into the SDF so support fingers treat it as solid.
-        include_clearance=False: returns the pure object SDF (use for the
-        actuation finger, which must enter the clearance region).
+        Floor is ALWAYS included (baked into SDF grid).
         """
         B, N, _ = points.shape
         norm = 2.0 * (points - self.bbox_min_t) / self.range_t - 1.0
@@ -179,7 +188,6 @@ class BatchedSDF:
         )
         obj_sdf = out.view(B, N)
         if include_clearance and hasattr(self, '_clearance_center'):
-            # Merge: minimum of object SDF and clearance SDF (union of solids)
             cl = self._clearance_sdf(points)
             return torch.minimum(obj_sdf, cl)
         return obj_sdf
