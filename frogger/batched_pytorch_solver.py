@@ -22,6 +22,20 @@ from typing import Optional, List, Tuple
 from scipy.optimize import linprog as scipy_linprog
 import time
 
+# Ablation toggles. Set FROGGER_NO_MULTI=1 to force single-assignment IK,
+# FROGGER_NO_BASE=1 to freeze base pose during main opt. Defaults (both on)
+# are the current best configuration.
+_DISABLE_MULTI_ASSIGN = bool(int(os.environ.get("FROGGER_NO_MULTI", "0")))
+_DISABLE_BASE_UNFREEZE = bool(int(os.environ.get("FROGGER_NO_BASE", "0")))
+
+# Two-phase IK: phase 1 runs pos-only for N1 steps (no dir/col interference,
+# gives pos the gradient space it needs), phase 2 runs full pos+dir+col for
+# N2 steps with 10× pos weight to preserve the reach achieved in phase 1.
+# Off by default. Enable with FROGGER_IK_TWO_PHASE=1.
+_IK_TWO_PHASE = bool(int(os.environ.get("FROGGER_IK_TWO_PHASE", "0")))
+_IK_PHASE1_STEPS = int(os.environ.get("FROGGER_IK_PH1", "100"))
+_IK_PHASE2_STEPS = int(os.environ.get("FROGGER_IK_PH2", "50"))
+
 
 # ---------------------------------------------------------------------------
 # SDF grid
@@ -1819,6 +1833,10 @@ class BatchedGraspOptimizer:
             for b in range(B):
                 self.amap[b] = [0]
         self.amap_t = torch.tensor(self.amap, dtype=torch.long, device=dev)
+        if hasattr(self, '_stage_times'):
+            import time as _t
+            if dev == "cuda": torch.cuda.synchronize()
+            self._stage_times["_t_act_ik"] = _t.time()
 
         # ================================================================
         # Actuation finger IK: position + pad direction
@@ -1830,86 +1848,161 @@ class BatchedGraspOptimizer:
                 act_dir = F.normalize(
                     torch.tensor(act_directions[0], dtype=torch.float32, device=dev), dim=0)
 
-            # Optimize ONLY actuation finger joints (palm stays fixed).
-            u_act = self.u.detach().clone().requires_grad_(True)
-            opt_act = torch.optim.Adam([u_act], lr=0.05)
+            # Multi-assignment IK: each env tries all 4 actuation finger
+            # assignments and keeps the one that reaches the target closest.
+            # Per env, instead of committing to amap=(b%4) we give each base
+            # pose 4 shots at finding a finger that can reach the target.
+            # Expected: candidate pool grows substantially for objects where
+            # only specific fingers work from any given base pose (e.g.
+            # hot_glue_gun with 4/4000 in single-assignment mode).
+            # Toggle off with FROGGER_NO_MULTI=1 for baseline ablation.
+            trial_fis = [None] if _DISABLE_MULTI_ASSIGN else list(range(4))
+            u_init_all = self.u.detach().clone()
 
-            # Mask: only the actuation finger's 4 joints per env
-            act_joint_mask = torch.zeros(B, 16, device=dev, dtype=torch.bool)
-            for b in range(B):
-                fi = self.amap[b, 0]
-                act_joint_mask[b, fi*4:fi*4+4] = True
+            best_u_full = u_init_all.clone()
+            best_act_dist = torch.full((B,), float('inf'), device=dev)
+            best_score = torch.full((B,), float('inf'), device=dev)
+            best_fi = torch.zeros(B, device=dev, dtype=torch.long)
 
-            for ik_step in range(150):
-                opt_act.zero_grad()
-                q_ik = self._u2q(u_act)
-                bT_ik = self._base_T(self.pos.detach(), self.rot6d.detach())
-                fk_ik = self.chain.forward_kinematics(q_ik)
+            prefixes_ik = ['if', 'mf', 'rf', 'th']
+            sfx_ik = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
 
-                loss_ik = torch.zeros(B, device=dev)
-                for b_fi in range(4):
-                    mask_fi = (self.amap_t[:, 0] == b_fi)
-                    if not mask_fi.any():
-                        continue
-                    nm = self.tip_link_names[b_fi]
-                    wT_tip = bT_ik @ fk_ik[nm].get_matrix()
-                    off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
-                    tip_pos = (wT_tip @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                    tip_pad_dir = -wT_tip[:, :3, 0]  # -x of tip link = pad push direction
+            for trial_fi in trial_fis:
+                # trial_fi=None → keep per-env amap; otherwise all envs try trial_fi.
+                u_act = u_init_all.clone().requires_grad_(True)
+                opt_act = torch.optim.Adam([u_act], lr=0.05)
+                act_joint_mask = torch.zeros(B, 16, device=dev, dtype=torch.bool)
+                if trial_fi is not None:
+                    act_joint_mask[:, trial_fi*4:trial_fi*4+4] = True
+                    fi_list = [trial_fi]  # only this finger contributes
+                else:
+                    # Per-env: each env keeps its existing amap
+                    for b in range(B):
+                        fi_b = int(self.amap[b, 0])
+                        act_joint_mask[b, fi_b*4:fi_b*4+4] = True
+                    fi_list = list(range(4))  # loop all so every env sees its own
 
-                    pos_err = ((tip_pos - act_pos) ** 2).sum(-1)
-                    loss_ik += mask_fi.float() * 500 * pos_err
+                # Total IK budget = phase1 + phase2 (two-phase) or 150 (single).
+                # Two-phase rationale: pipeline-IK pos_loss stagnates when dir+col
+                # (30-50× larger at init) dominate Adam's gradient budget. Phase 1
+                # uses pure pos loss to let tip reach target; phase 2 adds dir+col
+                # with 10× pos weight to preserve reach while refining.
+                # Single-phase IK with rebalanced losses (same fix we applied
+                # to support IK): linear distance, softplus-smooth facing loss,
+                # mean-over-points collision. Two-phase was a workaround for
+                # the loss-balance bug; now that the balance is correct we
+                # don't need the phase split.
+                total_ik_steps = 150
 
-                    if act_dir is not None:
-                        cos_align = (tip_pad_dir * act_dir).sum(-1)
-                        dir_err = (1.0 - cos_align) ** 2
-                        loss_ik += mask_fi.float() * 50 * dir_err
+                for ik_step in range(total_ik_steps):
+                    opt_act.zero_grad()
+                    q_ik = self._u2q(u_act)
+                    bT_ik = self._base_T(self.pos.detach(), self.rot6d.detach())
+                    fk_ik = self.chain.forward_kinematics(q_ik)
 
-                    # Actuation finger link collision (exclude ds = fingertip on surface)
-                    prefixes_ik = ['if', 'mf', 'rf', 'th']
-                    sfx_ik = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
-                    for suf in sfx_ik[b_fi]:
-                        lnm = f"leap_{self.hand}_{prefixes_ik[b_fi]}_{suf}"
-                        for cnm, lp in self._col_data:
-                            if cnm == lnm and lnm in fk_ik:
-                                lwT = bT_ik @ fk_ik[lnm].get_matrix()
-                                lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                # Actuation finger must enter clearance region to reach trigger
-                                lsdf = self.sdf.query(lwp, include_clearance=False)
-                                loss_ik += mask_fi.float() * 100 * F.relu(-lsdf).sum(-1)
+                    loss_ik = torch.zeros(B, device=dev)
+                    for fi_this in fi_list:
+                        if trial_fi is not None:
+                            mask_fi = torch.ones(B, device=dev)
+                        else:
+                            mask_fi = (self.amap_t[:, 0] == fi_this).float()
+                            if mask_fi.sum() == 0: continue
+                        nm = self.tip_link_names[fi_this]
+                        off_h = torch.cat([self.tip_offsets[fi_this], torch.ones(1, device=dev)])
+                        wT_tip = bT_ik @ fk_ik[nm].get_matrix()
+                        tip_pos = (wT_tip @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                        tip_pad_dir = -wT_tip[:, :3, 0]
 
-                # Don't change non-actuation joints
-                non_act_reg = ((u_act - self.u.detach()) ** 2 * (~act_joint_mask).float()).sum(-1)
-                loss_ik += 100 * non_act_reg
+                        # Linear distance (constant gradient magnitude) so pos
+                        # loss can compete with aux losses when tip is far.
+                        pos_dist = torch.norm(tip_pos - act_pos, dim=-1)
+                        loss_ik += mask_fi * 500 * pos_dist
+                        if act_dir is not None:
+                            # Direction matters more for actuation (finger must
+                            # PUSH in the right direction to trigger the
+                            # mechanism). Use a smooth threshold at cos>0.5 —
+                            # near-zero when reasonably aligned, grows smoothly
+                            # as alignment degrades.
+                            cos_align = (tip_pad_dir * act_dir).sum(-1)
+                            bad_face = F.softplus((0.5 - cos_align) * 10) / 10
+                            loss_ik += mask_fi * 50 * bad_face ** 2
 
-                loss_ik.mean().backward()
+                        # Mean-over-points collision (not sum) so col doesn't
+                        # dominate pos through point-count amplification.
+                        for suf in sfx_ik[fi_this]:
+                            lnm = f"leap_{self.hand}_{prefixes_ik[fi_this]}_{suf}"
+                            for cnm, lp in self._col_data:
+                                if cnm == lnm and lnm in fk_ik:
+                                    lwT = bT_ik @ fk_ik[lnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    lsdf = self.sdf.query(lwp, include_clearance=False)
+                                    loss_ik += mask_fi * 100 * F.relu(-lsdf).mean(-1)
+
+                    non_act_reg = ((u_act - u_init_all) ** 2 * (~act_joint_mask).float()).sum(-1)
+                    loss_ik += 100 * non_act_reg
+                    loss_ik.mean().backward()
+                    with torch.no_grad():
+                        u_act.grad[~act_joint_mask] = 0.0
+                    opt_act.step()
+
+                # Score this trial per env. In single-assign mode we only have
+                # one trial so scoring is moot — just commit.
                 with torch.no_grad():
-                    u_act.grad[~act_joint_mask] = 0.0
-                opt_act.step()
+                    q_trial = self._u2q(u_act.detach())
+                    bT_trial = self._base_T(self.pos, self.rot6d)
+                    fk_trial = self.chain.forward_kinematics(q_trial)
 
-            with torch.no_grad():
-                self.u = u_act.detach().requires_grad_(True)
+                    trial_dist = torch.zeros(B, device=dev)
+                    for fi_this in fi_list:
+                        if trial_fi is not None:
+                            mask_fi = torch.ones(B, device=dev, dtype=torch.bool)
+                        else:
+                            mask_fi = (self.amap_t[:, 0] == fi_this)
+                            if not mask_fi.any(): continue
+                        nm = self.tip_link_names[fi_this]
+                        off_h = torch.cat([self.tip_offsets[fi_this], torch.ones(1, device=dev)])
+                        wT_tip_f = bT_trial @ fk_trial[nm].get_matrix()
+                        tip_pos_f = (wT_tip_f @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                        d = torch.norm(tip_pos_f - act_pos, dim=-1)
+                        trial_dist = torch.where(mask_fi, d, trial_dist)
 
-            # Report IK success
+                    palm_worst = torch.zeros(B, device=dev)
+                    for cnm_p, lp_p in self._col_data:
+                        if cnm_p != self.palm_link or cnm_p not in fk_trial: continue
+                        lwT_p = bT_trial @ fk_trial[cnm_p].get_matrix()
+                        lwp_p = (lwT_p @ lp_p.T)[:, :3, :].transpose(1, 2)
+                        palm_worst = self.sdf.query(lwp_p, include_clearance=False).min(-1).values
+                        break
+
+                    # Palm-aware: reject trials with palm penetration >3mm.
+                    palm_pen = F.relu(-palm_worst - 0.003)
+                    trial_score = trial_dist + 10.0 * palm_pen
+
+                    fi_tensor = (torch.full((B,), trial_fi, device=dev, dtype=torch.long)
+                                 if trial_fi is not None else self.amap_t[:, 0])
+                    improved = trial_score < best_score
+                    best_score = torch.where(improved, trial_score, best_score)
+                    best_u_full = torch.where(improved.unsqueeze(-1), u_act.detach(), best_u_full)
+                    best_act_dist = torch.where(improved, trial_dist, best_act_dist)
+                    best_fi = torch.where(improved, fi_tensor, best_fi)
+
+            # Commit best assignment per env
             with torch.no_grad():
-                q_ik_final = self._u2q(self.u)
-                bT_final = self._base_T(self.pos, self.rot6d)
-                fk_final = self.chain.forward_kinematics(q_ik_final)
-                act_dists = torch.zeros(B, device=dev)
-                for b_fi in range(4):
-                    mask_fi = (self.amap_t[:, 0] == b_fi)
-                    if not mask_fi.any(): continue
-                    nm = self.tip_link_names[b_fi]
-                    wT_tip = bT_final @ fk_final[nm].get_matrix()
-                    off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
-                    tip_pos = (wT_tip @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                    act_dists += mask_fi.float() * torch.norm(tip_pos - act_pos, dim=-1)
+                self.u = best_u_full.clone().requires_grad_(True)
+                self.amap[:, 0] = best_fi.cpu().numpy()
+                self.amap_t = torch.from_numpy(self.amap).to(dev)
+
+            # Report IK success (using the chosen assignment)
+            with torch.no_grad():
+                act_dists = best_act_dist
                 n_close = (act_dists < 0.010).sum().item()
                 n_vclose = (act_dists < 0.005).sum().item()
-                print(f"  Actuation IK: {n_vclose}/{B} within 5mm, "
-                      f"{n_close}/{B} within 10mm, "
-                      f"median={act_dists.median()*1000:.1f}mm")
-                # Sort envs by actuation distance so best are saved first
+                # Distribution of chosen assignments
+                assign_counts = [int((best_fi == fi).sum().item()) for fi in range(4)]
+                print(f"  Actuation IK (multi-assign): {n_vclose}/{B} within 5mm, "
+                      f"{n_close}/{B} within 10mm, median={act_dists.median()*1000:.1f}mm")
+                print(f"    assignment counts: if={assign_counts[0]} mf={assign_counts[1]} "
+                      f"rf={assign_counts[2]} th={assign_counts[3]}")
                 self._act_sort_order = act_dists.argsort()
 
         # ================================================================
@@ -2030,11 +2123,14 @@ class BatchedGraspOptimizer:
                         wT = bT_ai @ fk_ai[nm].get_matrix()
                         off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
                         tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                        loss_ai += mask_fi.float() * 1000 * ((tp - act_pos) ** 2).sum(-1)
+                        # Linear pos (was (tp-act)².sum — quadratic stagnates far)
+                        loss_ai += mask_fi.float() * 1000 * torch.norm(tp - act_pos, dim=-1)
                         if act_dir is not None:
                             pad = -wT[:, :3, 0]
-                            loss_ai += mask_fi.float() * 100 * (1.0 - (pad * act_dir).sum(-1)) ** 2
-                        # Collision: penalize body links inside object (ignore clearance zone)
+                            cos_align = (pad * act_dir).sum(-1)
+                            bad_face = F.softplus((0.5 - cos_align) * 10) / 10
+                            loss_ai += mask_fi.float() * 100 * bad_face ** 2
+                        # Collision: mean (was sum — sum-over-~400-pts amplifies)
                         for suf in sfx_act[b_fi]:
                             lnm = f"leap_{self.hand}_{prefixes_act[b_fi]}_{suf}"
                             for cnm, lp in self._col_data:
@@ -2042,7 +2138,7 @@ class BatchedGraspOptimizer:
                                     lwT = bT_ai @ fk_ai[lnm].get_matrix()
                                     lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                     lsdf = self.sdf.query(lwp, include_clearance=False)
-                                    loss_ai += mask_fi.float() * 500 * F.relu(-lsdf).sum(-1)
+                                    loss_ai += mask_fi.float() * 500 * F.relu(-lsdf).mean(-1)
                     loss_ai.mean().backward()
                     with torch.no_grad():
                         u_act_ik.grad[~act_joint_mask] = 0.0
@@ -2070,6 +2166,10 @@ class BatchedGraspOptimizer:
                     print(f"  Palm slide+reproj: {nc}/{B} back-clean, {ns} shifted")
 
             self._snap_metrics("S2_after_act_ik_palm_slide")
+            if hasattr(self, '_stage_times') and "_t_act_ik" in self._stage_times:
+                import time as _t
+                if dev == "cuda": torch.cuda.synchronize()
+                self._stage_times["stage_act_ik_and_slide"] = _t.time() - self._stage_times["_t_act_ik"]
 
         # Support finger curling + IK is done in optimize() after
         # filtering to grasps where actuation IK succeeded.
@@ -2105,6 +2205,16 @@ class BatchedGraspOptimizer:
         """
         n_act = len(actuation_targets)
         B, dev = self.num_envs, self.device
+        # Stage timing: torch.cuda.synchronize before each time.time() so we
+        # attribute GPU wait time to the right stage. Saved on self._stage_times.
+        self._stage_times = {}
+        def _tick(label):
+            if dev == "cuda": torch.cuda.synchronize()
+            self._stage_times[label] = time.time()
+        def _tock(label, start_label):
+            if dev == "cuda": torch.cuda.synchronize()
+            self._stage_times[label] = time.time() - self._stage_times[start_label]
+        _tick("_t0")
         nc = (4 + len(self.tip_offsets) - 4) if self.palm_contact else 4  # 4 fingers + N palm pts
         m = nc * ns  # total basis wrenches
 
@@ -2127,8 +2237,11 @@ class BatchedGraspOptimizer:
         # Extract actuation positions and directions for biased init
         act_pos_list = [t[0] for t in actuation_targets] if n_act else None
         act_dir_list = [t[1] for t in actuation_targets] if n_act else None
+        _tick("_t_init")
         self._init(object_center, n_act=n_act,
                    act_positions=act_pos_list, act_directions=act_dir_list)
+        _tock("stage_init", "_t_init")
+        _tick("_t_filt_supIK")
 
         # Precompute friction cone primitive forces
         F_prim = compute_primitive_forces_torch(ns, mu, device=dev)  # [3, ns]
@@ -2159,11 +2272,22 @@ class BatchedGraspOptimizer:
         # ================================================================
         if n_act and hasattr(self, '_act_sort_order'):
             with torch.no_grad():
-                # Keep only grasps where actuation finger reached within 10mm
+                # Stage-4 hard gate: palm and actuation finger are FIXED after
+                # this point (for variant A; for variant P base translates but
+                # relative geometry is fixed). All palm+act-finger constraints
+                # must pass here because main opt can't fix them.
                 q_check = self._u2q(self.u)
                 bT_check = self._base_T(self.pos, self.rot6d)
                 fk_check = self.chain.forward_kinematics(q_check)
+
                 act_dists = torch.zeros(B, device=dev)
+                # Act direction alignment per env (cos between pad and act_dir)
+                act_dir_align = torch.ones(B, device=dev)
+                # Worst SDF over actuation finger's non-ds links (bs, px, md).
+                # ds is contact surface — expected to touch or enter clearance.
+                act_link_worst = torch.zeros(B, device=dev)
+                prefixes_f4 = ['if', 'mf', 'rf', 'th']
+                sfx_f4 = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
                 for b_fi in range(4):
                     mask_fi = (self.amap_t[:, 0] == b_fi)
                     if not mask_fi.any(): continue
@@ -2172,10 +2296,27 @@ class BatchedGraspOptimizer:
                     off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
                     tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                     act_dists += mask_fi.float() * torch.norm(tp - ap[0], dim=-1)
+                    # Direction: pad faces -x in tip frame
+                    if ad is not None and ad[0] is not None:
+                        pad_dir = -wT[:, :3, 0]
+                        cos_a = (pad_dir * ad[0].unsqueeze(0)).sum(-1)
+                        act_dir_align = torch.where(mask_fi, cos_a, act_dir_align)
+                    # Non-ds link collision (exclude clearance — act finger
+                    # may legitimately enter the clearance zone).
+                    for suf in sfx_f4[b_fi]:
+                        lnm = f"leap_{self.hand}_{prefixes_f4[b_fi]}_{suf}"
+                        if lnm not in fk_check: continue
+                        for cnm, lp in self._col_data:
+                            if cnm != lnm: continue
+                            lwT = bT_check @ fk_check[lnm].get_matrix()
+                            lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                            lmin = self.sdf.query(lwp, include_clearance=False).min(-1).values
+                            # Accumulate worst (most negative) per env
+                            act_link_worst = torch.where(
+                                mask_fi & (lmin < act_link_worst), lmin, act_link_worst)
 
-                # Palm collision check — palm is frozen from here onward
-                # (palm slide stage 3 was the last chance to move it).
-                # Reject grasps where palm is more than 3mm inside the object.
+                # Palm check — includes clearance (palm MUST NOT enter the
+                # actuation clearance zone; that's support/act-finger territory).
                 worst_palm_init = torch.zeros(B, device=dev)
                 for cnm, lp in self._col_data:
                     if "palm" not in cnm or cnm not in fk_check: continue
@@ -2184,12 +2325,25 @@ class BatchedGraspOptimizer:
                     worst_palm_init = torch.minimum(
                         worst_palm_init, self.sdf.query(lwp).min(-1).values)
 
-                good = (act_dists < 0.010) & (worst_palm_init > -0.003)
+                # Hard gate: every palm + actuation constraint that main opt
+                # cannot fix. Thresholds:
+                #   act_dist < 10mm     (position reach)
+                #   act_dir_align > 0.80 (≤37° misalignment — grasp unusable otherwise)
+                #   act_link_worst > -3mm (non-ds finger not buried in object)
+                #   worst_palm_init > -3mm (palm not inside object or clearance)
+                pass_pos   = act_dists < 0.010
+                pass_dir   = act_dir_align > 0.80
+                pass_acol  = act_link_worst > -0.003
+                pass_palm  = worst_palm_init > -0.003
+                good = pass_pos & pass_dir & pass_acol & pass_palm
                 n_good = good.sum().item()
-                n_act_ok = (act_dists < 0.010).sum().item()
-                n_palm_fail = ((act_dists < 0.010) & (worst_palm_init <= -0.003)).sum().item()
+                n_act_ok = pass_pos.sum().item()
+                n_dir_fail = (pass_pos & ~pass_dir).sum().item()
+                n_acol_fail = (pass_pos & pass_dir & ~pass_acol).sum().item()
+                n_palm_fail = (pass_pos & pass_dir & pass_acol & ~pass_palm).sum().item()
                 print(f"  Actuation filter: {n_good}/{B} passed "
-                      f"({n_act_ok} reached target, {n_palm_fail} rejected for palm collision)")
+                      f"({n_act_ok} pos-ok; -{n_dir_fail} dir, -{n_acol_fail} act-col, "
+                      f"-{n_palm_fail} palm)")
 
             if n_good > 0:
                 # Diversify support finger CMC to avoid the actuation finger.
@@ -2292,6 +2446,10 @@ class BatchedGraspOptimizer:
                     for fi in range(4):
                         finger_targets[fi] = finger_targets_all[fi]
 
+                if hasattr(self, '_stage_times'):
+                    import time as _t
+                    if dev == "cuda": torch.cuda.synchronize()
+                    self._stage_times["_t_supIK_loop"] = _t.time()
                 for ik_step in range(400):
                     opt_sup.zero_grad()
                     q_ik = self._u2q(u_sup)
@@ -2352,23 +2510,29 @@ class BatchedGraspOptimizer:
                         tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                         tp_sdf = self.sdf.query(tp.unsqueeze(1)).squeeze(1)
 
-                        # Surface seeking: ALWAYS active (never replaced by repulsion)
-                        sdf_loss = tp_sdf ** 2
+                        # Surface seeking: ALWAYS active (never replaced by repulsion).
+                        # Linear in |sdf| — quadratic form had vanishing gradient
+                        # far from surface (500×0.02²=0.2 at 20mm); pad/col losses
+                        # dominated and pos stagnated. Linear keeps gradient
+                        # magnitude constant with distance so it can compete.
+                        sdf_loss = tp_sdf.abs()  # was: tp_sdf ** 2
                         below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
                         loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
 
-                        # Pad alignment: pad face (-X of tip link) should face the surface.
-                        # Without this, the single-point surface loss leaves the pad angled
-                        # INTO the object (pad tip SDF=-20mm while contact center at SDF=0).
-                        # RESTORED from commit 12b09e7 (was erroneously removed in 0b2c4c9).
+                        # Pad orientation: only penalize pad FACING AWAY from
+                        # the surface (align<0). Fine alignment (align>0.95) is
+                        # main opt's job — during support IK the tip is still
+                        # 10-40mm from surface and demanding tight alignment
+                        # wastes gradient budget that should go to pos.
                         pad_dir = -wT[:, :3, 0]  # [B, 3] — pad push direction
                         _, inward_n = self.sdf.query_with_normals(tp.unsqueeze(1))
                         inward_n = inward_n[:, 0]  # [B, 3]
-                        # Tight target: align > 0.95 (cos 18°). Below that a 17mm peripheral
-                        # pad point sees >5mm dip below tangent plane. Previous threshold 0.7
-                        # (cos 45°) left ~8mm of pad pen unpunished.
                         align = (pad_dir * inward_n).sum(-1)
-                        loss_sup += sup_finger_mask[:, fi].float() * 500 * F.relu(0.95 - align) ** 2
+                        # Smooth softplus form (vs relu's kink at align=0):
+                        # ≈0 for align>0.3 (faced correctly), smooth through 0,
+                        # grows quadratically for align<0 (facing away).
+                        bad_face = F.softplus(-align * 10) / 10
+                        loss_sup += sup_finger_mask[:, fi].float() * 500 * bad_face ** 2
 
                         # Actuation repulsion: ADDED on top of surface loss (not replacing)
                         dist_to_act_tip = torch.norm(tp - act_tip_pos, dim=-1)
@@ -2377,13 +2541,14 @@ class BatchedGraspOptimizer:
                         too_close = (dist_to_act < 0.040) & sup_finger_mask[:, fi]
                         loss_sup += too_close.float() * 500 * F.relu(0.040 - dist_to_act) ** 2
 
-                        # Guide support fingers toward spread target positions
-                        # Strong for first half of IK (guidance), fade for second half (surface takes over)
+                        # Guide support fingers toward spread target positions.
+                        # Linear distance (was squared) so gradient stays meaningful
+                        # when tip is 30-50mm from target.
                         if fi in finger_targets:
                             target = finger_targets[fi]
                             target_w = 100 * max(0, 1 - ik_step / 200)  # 100 → 0 over 200 steps
                             if target_w > 1:
-                                loss_sup += sup_finger_mask[:, fi].float() * target_w * ((tp - target) ** 2).sum(-1)
+                                loss_sup += sup_finger_mask[:, fi].float() * target_w * torch.norm(tp - target, dim=-1)
 
                     # Support finger link collision + below-object penalty
                     prefixes = ['if', 'mf', 'rf', 'th']
@@ -2397,18 +2562,18 @@ class BatchedGraspOptimizer:
                                 lp = (bT_ik @ fk_ik[ln].get_matrix())[:, :3, 3]
                                 below = F.relu(self._obj_z_min - lp[:, 2]) ** 2
                                 loss_sup += sup_finger_mask[:, fi].float() * 1000 * below
-                            # Link collision: non-ds links penalize any penetration,
-                            # ds links allow 3mm contact but penalize deep penetration
+                            # Link collision: non-ds links penalize any penetration.
+                            # Use MEAN over points instead of sum — sum over ~400
+                            # points/link amplified penetration penalty 400× vs
+                            # pad alignment, crowding out surface gradient. Mean
+                            # normalizes the scale so all losses are same order.
                             if suf in ('bs', 'px', 'md', 'mp'):
                                 for cnm, clp in self._col_data:
                                     if cnm == ln and ln in fk_ik:
                                         lwT = bT_ik @ fk_ik[ln].get_matrix()
                                         lwp = (lwT @ clp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
-                                        col_pen = F.relu(-lsdf).sum(-1)
-                                        # Weight raised 50→500 to match pad alignment strength.
-                                        # Alignment at weight 500 was forcing finger rotation
-                                        # that pushed body into the object. Col needs to push back.
+                                        col_pen = F.relu(-lsdf).mean(-1)  # was .sum(-1)
                                         loss_sup += sup_finger_mask[:, fi].float() * 500 * col_pen
                             elif suf == 'ds':
                                 # Fingertip ds: back-side only (pad wrapping is expected).
@@ -2507,6 +2672,10 @@ class BatchedGraspOptimizer:
                         u_sup.grad[~sup_joint_mask] = 0.0
                     opt_sup.step()
 
+                if hasattr(self, '_stage_times') and "_t_supIK_loop" in self._stage_times:
+                    import time as _t
+                    if dev == "cuda": torch.cuda.synchronize()
+                    self._stage_times["stage_supIK_loop"] = _t.time() - self._stage_times["_t_supIK_loop"]
                 with torch.no_grad():
                     self.u = u_sup.detach().requires_grad_(True)
 
@@ -2575,7 +2744,12 @@ class BatchedGraspOptimizer:
                             if self.amap[b, 0] != fi:
                                 worst_sup_link[b] = torch.minimum(worst_sup_link[b], lsdf[b])
 
-                # Also check actuation finger link collision (not just support)
+                # Also check actuation finger link collision (not just support).
+                # Use include_clearance=False: the actuation finger legitimately
+                # enters the clearance cylinder to reach the trigger. Previously
+                # we used the default (include_clearance=True), which treated
+                # act-finger-in-clearance as collision, over-filtering hot_glue
+                # et al. where the thumb reaches deep into the trigger recess.
                 worst_act_link = torch.zeros(B, device=dev)
                 for fi in range(4):
                     for cnm, lp in self._col_data:
@@ -2586,7 +2760,7 @@ class BatchedGraspOptimizer:
                         if not is_act_link or cnm not in fk_filt: continue
                         lwT = bT_filt @ fk_filt[cnm].get_matrix()
                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                        lsdf = self.sdf.query(lwp).min(-1).values
+                        lsdf = self.sdf.query(lwp, include_clearance=False).min(-1).values
                         for b in range(B):
                             if self.amap[b, 0] == fi:
                                 worst_act_link[b] = torch.minimum(worst_act_link[b], lsdf[b])
@@ -2606,10 +2780,16 @@ class BatchedGraspOptimizer:
                     act_fi = self.amap[b, 0]
                     for fi in range(4):
                         if fi != act_fi:
-                            # MCP, PIP, DIP only. CMC stays frozen: unfreezing
-                            # let fingers drift away (surf 20-47mm everywhere
-                            # in ablation). CMC spread is fixed by init.
-                            opt_joint_mask[b, fi*4+1:fi*4+4] = True
+                            if opt_variant == "P":
+                                # Projected gradient descent: CMC free.
+                                # Hard surface projection after each Adam step
+                                # prevents the lateral drift seen without projection.
+                                opt_joint_mask[b, fi*4:fi*4+4] = True
+                            else:
+                                # MCP, PIP, DIP only. CMC stays frozen: unfreezing
+                                # let fingers drift away (surf 20-47mm everywhere
+                                # in ablation). CMC spread is fixed by init.
+                                opt_joint_mask[b, fi*4+1:fi*4+4] = True
                             sup_finger_mask_opt[b, fi] = True
 
                 prefixes_opt = ['if', 'mf', 'rf', 'th']
@@ -2658,13 +2838,36 @@ class BatchedGraspOptimizer:
                         if cnm == cnm_ds:
                             sup_col_idx_ds[fi].append((ci, cnm))
 
-                if opt_variant in ("A", "B", "C"):
-                    # ── Simple Adam loop (all variants A/B/C) ──
-                    opt_adam = torch.optim.Adam([q_opt], lr=0.003)
+                if opt_variant in ("A", "B", "C", "P"):
+                    # ── Simple Adam loop (all variants A/B/C/P) ──
+                    # Variant P additionally projects onto the surface constraint
+                    # after each Adam step (hard constraint on fingertip contact)
+                    # AND unfreezes base pose (translation+rotation) so the whole
+                    # hand can translate/rotate to resolve collision, SC and
+                    # act_dist close-misses that joint-only opt can't budge.
+                    if opt_variant == "P" and not _DISABLE_BASE_UNFREEZE:
+                        pos_opt = self.pos.detach().clone().requires_grad_(True)
+                        rot6d_opt = self.rot6d.detach().clone().requires_grad_(True)
+                        pos_init = pos_opt.detach().clone()
+                        rot6d_init = rot6d_opt.detach().clone()
+                        # Base pose LRs chosen so a full 300-step optimisation
+                        # can move the base at most a few cm / few degrees
+                        # (hard-capped by the regularizer, not LR alone).
+                        opt_adam = torch.optim.Adam([
+                            {"params": [q_opt], "lr": 0.003},
+                            {"params": [pos_opt], "lr": 0.0003},    # sub-mm / step
+                            {"params": [rot6d_opt], "lr": 0.0005},  # ~0.03° / step
+                        ])
+                    else:
+                        pos_opt = None
+                        rot6d_opt = None
+                        opt_adam = torch.optim.Adam([q_opt], lr=0.003)
                     fc_start_step = 50
                     fc_weight = 1.0
                     mink_k = 10  # number of lowest SDF points for variants B/C
                     print(f"  Variant {opt_variant} Adam optimization ({opt_steps} steps, direct-q)")
+                    _tock("stage_filt_supIK", "_t_filt_supIK")
+                    _tick("_t_mainopt")
                     # Record q_opt into self.u so snap_metrics sees the right state
                     with torch.no_grad():
                         self.u = self._q2u(q_opt.detach()).requires_grad_(True)
@@ -2673,7 +2876,10 @@ class BatchedGraspOptimizer:
                     for opt_step in range(opt_steps):
                         opt_adam.zero_grad()
                         q_o = q_opt
-                        bT_o = self._base_T(self.pos.detach(), self.rot6d.detach())
+                        if opt_variant == "P" and pos_opt is not None:
+                            bT_o = self._base_T(pos_opt, rot6d_opt)
+                        else:
+                            bT_o = self._base_T(self.pos.detach(), self.rot6d.detach())
                         fk_o = self.chain.forward_kinematics(q_o)
 
                         total_loss = torch.zeros(B, device=dev)
@@ -2684,7 +2890,7 @@ class BatchedGraspOptimizer:
                         # 3 points on the pad line: heel, center, tip. Contact center
                         # must be at SDF=0; heel/tip must be OUTSIDE (SDF>=0). This
                         # enforces the pad to lie flat against the surface.
-                        if opt_variant == "A":
+                        if opt_variant in ("A", "P"):
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 nm = self.tip_link_names[fi]
@@ -2752,8 +2958,12 @@ class BatchedGraspOptimizer:
                                     total_loss += sup_finger_mask_opt[:, fi].float() * 200 * (topk_sdf ** 2).sum(dim=1)
 
                         # ── Section B: Collision loss ──
-                        if opt_variant == "A":
-                            # B1: relu(-SDF) for non-ds links
+                        if opt_variant in ("A", "P"):
+                            # B1: mean(relu(-SDF)) for non-ds links.
+                            # Sum-over-points (original) amplified col loss 200-600×
+                            # depending on link point-count, crowding out surface
+                            # gradient. Mean normalizes across links so each link
+                            # contributes comparably.
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 for ci, cnm in sup_col_idx[fi]:
@@ -2762,7 +2972,7 @@ class BatchedGraspOptimizer:
                                         lwT = bT_o @ fk_o[cnm].get_matrix()
                                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).mean(-1)
 
                             # B2: Fingertip ds collision — back-side strict, pad-side tolerant.
                             # Back: 1mm contact allowed, heavy penalty beyond.
@@ -2786,7 +2996,21 @@ class BatchedGraspOptimizer:
                                         lwp_p = (lwT @ lp[~back_m].T)[:, :3, :].transpose(1, 2)
                                         lsdf_p = self.sdf.query(lwp_p)
                                         pen_pad = F.relu(-lsdf_p - 0.003).max(-1).values
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * pen_pad ** 2
+                                        # Mixed quadratic-then-linear penalty:
+                                        # quadratic near threshold for smooth
+                                        # gradient, linear when deep (>5mm over
+                                        # threshold) so optimizer has a real
+                                        # force to pull pad out of object.
+                                        # Observed on flashlight: ds_pad_worst
+                                        # = -11.7mm failed feasibility, but the
+                                        # pure-quadratic loss was 0.038 — too
+                                        # weak to create any recovery gradient.
+                                        pad_loss = torch.where(
+                                            pen_pad < 0.005,
+                                            500 * pen_pad ** 2,
+                                            500 * 0.005 * (2 * pen_pad - 0.005),
+                                        )
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * pad_loss
 
                         elif opt_variant in ("B", "C"):
                             # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
@@ -2963,8 +3187,84 @@ class BatchedGraspOptimizer:
                                 dist_to_act = torch.norm(tip - act_tip_actual, dim=-1)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(0.035 - dist_to_act) ** 2
 
+                        # ── Section F: Support-in-clearance penalty ──
+                        # Feasibility rejects any grasp where a support-finger
+                        # point enters the actuation clearance cylinder. Main
+                        # opt had no loss enforcing this; envs could silently
+                        # drift into clearance and then fail feasibility.
+                        if hasattr(self.sdf, '_clearance_center'):
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                for ci, cnm in sup_col_idx[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm not in fk_o: continue
+                                    lwT = bT_o @ fk_o[cnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    cl_sdf = self.sdf._clearance_sdf(lwp)  # [B, N]
+                                    # Penalize any point with cl_sdf<0 (inside clearance).
+                                    # Mean for consistency with B1 rebalance.
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-cl_sdf).mean(-1)
+                                # Also check support ds links (fingertip)
+                                for ci, cnm in sup_col_idx_ds[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm not in fk_o: continue
+                                    lwT = bT_o @ fk_o[cnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    cl_sdf = self.sdf._clearance_sdf(lwp)
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-cl_sdf).mean(-1)
+
                         # Freeze non-support joints (regularize back to initial values)
                         total_loss += 100 * ((q_opt - q_init) ** 2 * (~opt_joint_mask).float()).sum(-1)
+
+                        if opt_variant == "P" and pos_opt is not None:
+                            # Base losses apply ONLY to opt_mask envs. Otherwise
+                            # the Adam optimiser happily drifts the base pose for
+                            # inactive envs (their non-masked gradients still land
+                            # on pos_opt/rot6d_opt since those are shared leaves).
+                            om_f = opt_mask.float()
+                            # Base regularizer: strong spring toward init pose.
+                            total_loss += om_f * 5000 * ((pos_opt - pos_init) ** 2).sum(-1)
+                            total_loss += om_f * 5000 * ((rot6d_opt - rot6d_init) ** 2).sum(-1)
+
+                            # Act-tip tracking: base unfreeze moves the hand
+                            # rigidly; without this, the act tip drifts off
+                            # the target and the grasp fails the feasibility
+                            # gate (act_dist<10mm). Flashlight observed drift
+                            # 15-40mm even with quadratic-5000 penalty —
+                            # quadratic's gradient is too weak when far.
+                            # Use hinge: small quadratic pull everywhere for
+                            # smooth gradient + strong linear penalty past
+                            # 10mm to pull hand back below the gate threshold.
+                            if n_act and ap is not None:
+                                act_tip_w = torch.zeros(B, 3, device=dev)
+                                for act_fi in range(4):
+                                    amask = (self.amap_t[:, 0] == act_fi)
+                                    if not amask.any(): continue
+                                    anm = self.tip_link_names[act_fi]
+                                    awT = bT_o @ fk_o[anm].get_matrix()
+                                    aoff_h = torch.cat([self.tip_offsets[act_fi], torch.ones(1, device=dev)])
+                                    atp = (awT @ aoff_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                    act_tip_w = torch.where(amask.unsqueeze(-1), atp, act_tip_w)
+                                act_dist_world = torch.norm(act_tip_w - ap[0].unsqueeze(0), dim=-1)
+                                # Quadratic near target (weak, smooth)
+                                total_loss += om_f * 1000 * act_dist_world ** 2
+                                # Hinge: linear penalty past 10mm threshold
+                                excess = F.relu(act_dist_world - 0.010)
+                                total_loss += om_f * 10000 * excess
+
+                            # Palm collision: previously palm was frozen after
+                            # stage-4 gate so no main-opt loss tracked it. With
+                            # base unfrozen the palm can now move — guard it.
+                            palm_nm = self.palm_link
+                            if palm_nm in fk_o:
+                                for ci, (cnm, lp) in enumerate(self._col_data):
+                                    if cnm != palm_nm: continue
+                                    lwT = bT_o @ fk_o[cnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    lsdf = self.sdf.query(lwp, include_clearance=False)
+                                    # Heavy penalty: palm-through-object is the
+                                    # most egregious failure the user called out.
+                                    total_loss += om_f * 2000 * F.relu(-lsdf).max(-1).values ** 2
 
                         total_loss.mean().backward()
                         with torch.no_grad():
@@ -2974,17 +3274,60 @@ class BatchedGraspOptimizer:
                         with torch.no_grad():
                             q_opt.clamp_(self.q_lo, self.q_lo + self.q_range)
 
+                        # ── Projection: re-attach fingertips to the object surface ──
+                        # After the Adam step (which can move fingers laterally to
+                        # improve FC/SC/pad objectives) we project each support tip
+                        # back onto SDF=0 by running a few SGD iterations on pure
+                        # surface loss. This is projected-gradient descent: hard
+                        # surface constraint, soft objective. Only variant P does
+                        # this — it's the whole point of P.
+                        if opt_variant == "P":
+                            proj_iters = 3
+                            proj_lr = 0.03
+                            for _proj_it in range(proj_iters):
+                                q_opt.grad = None
+                                if pos_opt is not None and pos_opt.grad is not None: pos_opt.grad = None
+                                if rot6d_opt is not None and rot6d_opt.grad is not None: rot6d_opt.grad = None
+                                # Use detached base — projection only touches joints.
+                                if pos_opt is not None:
+                                    bT_p = self._base_T(pos_opt.detach(), rot6d_opt.detach())
+                                else:
+                                    bT_p = self._base_T(self.pos.detach(), self.rot6d.detach())
+                                fk_p = self.chain.forward_kinematics(q_opt)
+                                proj_loss = torch.zeros(B, device=dev)
+                                for fi in range(4):
+                                    if not sup_finger_mask_opt[:, fi].any(): continue
+                                    nm = self.tip_link_names[fi]
+                                    wT = bT_p @ fk_p[nm].get_matrix()
+                                    off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
+                                    tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                    tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
+                                    proj_loss += sup_finger_mask_opt[:, fi].float() * tip_sdf ** 2
+                                proj_loss.mean().backward()
+                                with torch.no_grad():
+                                    g = q_opt.grad
+                                    g[~opt_joint_mask] = 0.0
+                                    q_opt.data -= proj_lr * g
+                                    q_opt.clamp_(self.q_lo, self.q_lo + self.q_range)
+                            q_opt.grad = None
+
                         # Metrics snapshot at key checkpoints
                         if opt_step in (50, 150, 299):
                             with torch.no_grad():
                                 self.u = self._q2u(q_opt.detach()).requires_grad_(True)
+                                if opt_variant == "P" and pos_opt is not None:
+                                    self.pos = pos_opt.detach().clone().requires_grad_(True)
+                                    self.rot6d = rot6d_opt.detach().clone().requires_grad_(False)
                             self._snap_metrics(f"S4_opt_step{opt_step+1}")
 
                         # ── Logging + trajectory ──
                         if opt_step % 50 == 0:
                             with torch.no_grad():
                                 q_e = q_opt
-                                bT_e = self._base_T(self.pos, self.rot6d)
+                                if opt_variant == "P" and pos_opt is not None:
+                                    bT_e = self._base_T(pos_opt, rot6d_opt)
+                                else:
+                                    bT_e = self._base_T(self.pos, self.rot6d)
                                 fk_e = self.chain.forward_kinematics(q_e)
                                 sup_sdf = []
                                 for fi in range(4):
@@ -3162,6 +3505,10 @@ class BatchedGraspOptimizer:
                 with torch.no_grad():
                     # Convert direct-q back to u-space for consistency
                     self.u = self._q2u(q_opt.detach()).requires_grad_(True)
+                    # Write back optimised base pose so downstream FK sees it.
+                    if pos_opt is not None and rot6d_opt is not None:
+                        self.pos = pos_opt.detach().clone().requires_grad_(True)
+                        self.rot6d = rot6d_opt.detach().clone().requires_grad_(False)
 
                 # Rank by combined quality: low surface SDF + low collision + high σ_min
                 with torch.no_grad():
@@ -3201,6 +3548,8 @@ class BatchedGraspOptimizer:
                     self._final_order = self._opt_quality_order.clone()
                     top5 = self._opt_quality_order[:5]
                     print(f"  Top 5 quality scores: {[f'{rank_score[i].item():.2f}' for i in top5]}")
+                _tock("stage_main_opt", "_t_mainopt")
+                _tick("_t_feas")
 
                 self._snapshot("after_optimization")
 
@@ -3254,6 +3603,11 @@ class BatchedGraspOptimizer:
 
                 sigma_all = torch.zeros(B, device=dev)
                 final_lstars = np.full(B, -1.0)
+                # Seed tp_fc with a dummy (all tips + palm) so wrap_dirs below
+                # still has something to reference when no opt_mask envs exist.
+                _fc_seed = [all_tips_final[:, fi] for fi in range(3)]
+                if palm_pt_final is not None: _fc_seed.append(palm_pt_final)
+                tp_fc = torch.stack(_fc_seed, dim=1)
                 for act_fi in range(4):
                     group = opt_mask & (self.amap_t[:, 0] == act_fi)
                     if not group.any(): continue
@@ -3610,6 +3964,23 @@ class BatchedGraspOptimizer:
                     metrics_path = save_path.replace('.pt', '_metrics.pt')
                     _torch.save(self._metrics_log, metrics_path)
                     print(f"  Per-stage metrics saved to {metrics_path}")
+            _tock("stage_feas_eval", "_t_feas")
+            _tock("total", "_t0")
+            if "stage_init" in self._stage_times:
+                t_init = self._stage_times.get("stage_init", 0)
+                t_act = self._stage_times.get("stage_act_ik_and_slide", 0)
+                t_filt = self._stage_times.get("stage_filt_supIK", 0)
+                t_sup_loop = self._stage_times.get("stage_supIK_loop", 0)
+                t_filt_only = max(0, t_filt - t_sup_loop)
+                t_main = self._stage_times.get("stage_main_opt", 0)
+                t_feas = self._stage_times.get("stage_feas_eval", 0)
+                t_total = self._stage_times.get("total", 0)
+                t_palm = t_init - t_act
+                t_other = t_total - t_init - t_filt - t_main - t_feas
+                print(f"  [TIMING] palm_init={t_palm:.1f}s  act_ik={t_act:.1f}s  "
+                      f"filt={t_filt_only:.1f}s  supIK_400={t_sup_loop:.1f}s  "
+                      f"main_opt={t_main:.1f}s  feas={t_feas:.1f}s  "
+                      f"other={t_other:.1f}s  total={t_total:.1f}s")
             return res
 
         # No candidates passed entry criteria — return empty
