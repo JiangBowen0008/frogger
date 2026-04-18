@@ -2364,10 +2364,11 @@ class BatchedGraspOptimizer:
                         pad_dir = -wT[:, :3, 0]  # [B, 3] — pad push direction
                         _, inward_n = self.sdf.query_with_normals(tp.unsqueeze(1))
                         inward_n = inward_n[:, 0]  # [B, 3]
-                        # Want dot(pad_dir, inward_normal) ≈ 1 (pad faces INTO the surface normal).
-                        # Penalize when align < 0.7 (pad face not well aligned with surface normal).
-                        align = (pad_dir * inward_n).sum(-1)  # [B]
-                        loss_sup += sup_finger_mask[:, fi].float() * 500 * F.relu(0.7 - align) ** 2
+                        # Tight target: align > 0.95 (cos 18°). Below that a 17mm peripheral
+                        # pad point sees >5mm dip below tangent plane. Previous threshold 0.7
+                        # (cos 45°) left ~8mm of pad pen unpunished.
+                        align = (pad_dir * inward_n).sum(-1)
+                        loss_sup += sup_finger_mask[:, fi].float() * 500 * F.relu(0.95 - align) ** 2
 
                         # Actuation repulsion: ADDED on top of surface loss (not replacing)
                         dist_to_act_tip = torch.norm(tp - act_tip_pos, dim=-1)
@@ -2700,13 +2701,12 @@ class BatchedGraspOptimizer:
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * surf_loss
 
                                 # Pad alignment: pad face (-X) aligns with surface inward normal.
-                                # Single-point tip_sdf² alone pulls tip to surface but leaves
-                                # pad free to angle INTO the object. Alignment prevents this.
-                                pad_dir = -wT[:, :3, 0]  # [B, 3]
+                                # Tight threshold 0.95 (cos 18°); 45° slop left 5-8mm peripheral pen.
+                                pad_dir = -wT[:, :3, 0]
                                 _, inward_n = self.sdf.query_with_normals(tip.unsqueeze(1))
                                 inward_n = inward_n[:, 0]
                                 align = (pad_dir * inward_n).sum(-1)
-                                total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(0.7 - align) ** 2
+                                total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(0.95 - align) ** 2
 
                                 # Pad corners: penalize only DEEP pad penetration (>3mm).
                                 # Shallow penetration (<3mm) is acceptable — pad in contact with
