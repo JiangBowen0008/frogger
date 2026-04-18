@@ -361,18 +361,34 @@ def show(obj_name=None, stage=None, grasp_idx=None):
         'sc_pts':  (0.0005, '>'),   # sc_worst > 0.5mm
     }
 
+    # Friendly metric labels
+    NAMES = {
+        'surf':   'surface',
+        'col':    'body collision',
+        'back':   'ds back',
+        'pad':    'ds pad',
+        'sc':     'self-collision (box-box)',
+        'sigma':  'sigma (×1000)',
+        'act':    'actuation dist',
+        'pen':    'verify penetration',
+        'sc_pts': 'self-collision (points)',
+    }
+
     def check(name, val, unit='mm'):
         if val is None: return None
         thresh, op = TH[name]
+        thresh_display = thresh*(1 if unit == "%" else 1000)
         if op == '<':
             ok = val < thresh
-            cmp_t = f'{op}{thresh*(1 if unit == "%" else 1000):.1f}{unit}'
+            cmp_t = f'lt {thresh_display:.1f}'
         else:
             ok = val > thresh
-            cmp_t = f'{op}{thresh*(1 if unit == "%" else 1000):.1f}{unit}'
+            cmp_t = f'gt {thresh_display:.1f}'
         disp = val*(1 if unit == '%' else 1000)
-        tag = 'PASS' if ok else 'FAIL'
-        return ok, f"[{tag}] {name}: {disp:+.2f}{unit} (need {cmp_t})"
+        tag = '[PASS]' if ok else '[FAIL]'
+        label = NAMES.get(name, name)
+        # Aligned plain text for code block (monospace)
+        return ok, f"{tag:<6} {label:<24} {disp:>+7.2f} {unit:<2} need {cmp_t}"
 
     # Collect fields
     sigma = g.get("sigma_min", 0)
@@ -401,44 +417,53 @@ def show(obj_name=None, stage=None, grasp_idx=None):
     if sc_pts is not None:   checks.append(check('sc_pts', sc_pts))
     checks = [c for c in checks if c is not None]
 
-    # Feasibility banner — avoid markdown heading (###) which auto-generates CSS
-    # ids from content; forward-slashes and digits in the heading text break viser's
-    # markdown renderer. Use plain bold text instead.
-    tag = 'FEASIBLE' if feasible else 'INFEASIBLE'
+    # Feasibility banner (safe chars only — no "<digit" which breaks MDX)
+    tag = '✅ FEASIBLE' if feasible else '❌ INFEASIBLE'
+    act_label = FINGER_LABELS[act_fi] if act_fi < 4 else f'F{act_fi}'
     lines = []
-    lines.append(f"**{obj_name}** | grasp {grasp_idx} | env {target_env} | stage {stage}")
+    lines.append(f"### {obj_name} — grasp {grasp_idx}")
     lines.append("")
     lines.append(f"**{tag}**")
     lines.append("")
-    lines.append(f"- sigma = {sigma:.4f}")
-    lines.append(f"- lstar = {lstar:+.4f}")
-    lines.append(f"- act finger = {FINGER_LABELS[act_fi] if act_fi < 4 else f'F{act_fi}'}")
+    lines.append("```")
+    lines.append(f"sigma_min        {sigma:>+10.4f}")
+    lines.append(f"l_star           {lstar:>+10.4f}")
+    lines.append(f"actuation finger {act_label:>10}")
+    lines.append(f"stage            {stage:>10}")
+    lines.append(f"env              {target_env:>10}")
+    lines.append("```")
     lines.append("")
 
-    # Criteria
-    lines.append("**Criteria**")
+    # Criteria (code block, monospace aligned)
+    lines.append("### Criteria")
+    lines.append("```")
     for ok, msg in checks:
-        lines.append(f"- {msg}")
+        lines.append(msg)
+    lines.append("```")
     lines.append("")
 
-    # Failure reasons (only if infeasible — avoid duplication when all pass)
-    fail_reasons = [msg for ok, msg in checks if not ok]
-    if not feasible and fail_reasons:
-        lines.append("**Failure reasons**")
-        for r in fail_reasons:
-            lines.append(f"- {r}")
+    # Failure reasons — only when infeasible, lists just the failing criteria
+    fail_msgs = [msg for ok, msg in checks if not ok]
+    if not feasible and fail_msgs:
+        lines.append("### Failure reasons")
+        lines.append("```")
+        for msg in fail_msgs:
+            lines.append(msg)
+        lines.append("```")
         lines.append("")
 
     # Red links
     bad_links = [(nm, ls) for nm, ls in link_status.items() if ls[3]]
     if bad_links:
-        lines.append("**Red links (reasons)**")
+        lines.append("### Colliding links")
+        lines.append("```")
         for nm, (obj, cl, fl, _, reasons) in bad_links:
             short = nm.replace("leap_rh_", "")
-            lines.append(f"- {short}: {', '.join(reasons)}")
+            lines.append(f"{short:<10}  {', '.join(reasons)}")
+        lines.append("```")
         lines.append("")
 
-    # Stage comparison
+    # Stage trajectory
     stage_match = []
     for sn in stage_names:
         sd = data["stages"][sn]
@@ -451,14 +476,17 @@ def show(obj_name=None, stage=None, grasp_idx=None):
             s = match.get("sigma_min", 0)
             l = match.get("l_star", -1)
             se = match.get("surf_err", 0)
-            stage_match.append(f"- {sn}: sigma={s:.4f}, lstar={l:+.4f}, surf={se*1000:.1f}mm")
+            stage_match.append(f"{sn:<14}  sigma={s:.4f}  l_star={l:+.4f}  surf={se*1000:.1f}mm")
     if stage_match:
-        lines.append("**Stage trajectory**")
+        lines.append("### Stage trajectory")
+        lines.append("```")
         for s in stage_match:
             lines.append(s)
+        lines.append("```")
 
     content = "\n".join(lines)
     info_md.content = content
+    open("/tmp/viser_current.md","w").write(content)
     print(f"[VISER] info_md updated, len={len(content)}")
 
 
