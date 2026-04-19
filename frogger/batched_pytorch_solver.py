@@ -2123,14 +2123,11 @@ class BatchedGraspOptimizer:
                         wT = bT_ai @ fk_ai[nm].get_matrix()
                         off_h = torch.cat([self.tip_offsets[b_fi], torch.ones(1, device=dev)])
                         tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                        # Linear pos (was (tp-act)².sum — quadratic stagnates far)
-                        loss_ai += mask_fi.float() * 1000 * torch.norm(tp - act_pos, dim=-1)
+                        loss_ai += mask_fi.float() * 1000 * ((tp - act_pos) ** 2).sum(-1)
                         if act_dir is not None:
                             pad = -wT[:, :3, 0]
-                            cos_align = (pad * act_dir).sum(-1)
-                            bad_face = F.softplus((0.5 - cos_align) * 10) / 10
-                            loss_ai += mask_fi.float() * 100 * bad_face ** 2
-                        # Collision: mean (was sum — sum-over-~400-pts amplifies)
+                            loss_ai += mask_fi.float() * 100 * (1.0 - (pad * act_dir).sum(-1)) ** 2
+                        # Collision: penalize body links inside object (ignore clearance zone)
                         for suf in sfx_act[b_fi]:
                             lnm = f"leap_{self.hand}_{prefixes_act[b_fi]}_{suf}"
                             for cnm, lp in self._col_data:
@@ -2138,7 +2135,7 @@ class BatchedGraspOptimizer:
                                     lwT = bT_ai @ fk_ai[lnm].get_matrix()
                                     lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                     lsdf = self.sdf.query(lwp, include_clearance=False)
-                                    loss_ai += mask_fi.float() * 500 * F.relu(-lsdf).mean(-1)
+                                    loss_ai += mask_fi.float() * 500 * F.relu(-lsdf).sum(-1)
                     loss_ai.mean().backward()
                     with torch.no_grad():
                         u_act_ik.grad[~act_joint_mask] = 0.0
@@ -2510,12 +2507,8 @@ class BatchedGraspOptimizer:
                         tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                         tp_sdf = self.sdf.query(tp.unsqueeze(1)).squeeze(1)
 
-                        # Surface seeking: ALWAYS active (never replaced by repulsion).
-                        # Linear in |sdf| — quadratic form had vanishing gradient
-                        # far from surface (500×0.02²=0.2 at 20mm); pad/col losses
-                        # dominated and pos stagnated. Linear keeps gradient
-                        # magnitude constant with distance so it can compete.
-                        sdf_loss = tp_sdf.abs()  # was: tp_sdf ** 2
+                        # Surface seeking: ALWAYS active (never replaced by repulsion)
+                        sdf_loss = tp_sdf ** 2
                         below_obj = F.relu(self._obj_z_min - tp[:, 2]) ** 2
                         loss_sup += sup_finger_mask[:, fi].float() * (500 * sdf_loss + 2000 * below_obj)
 
@@ -2528,11 +2521,7 @@ class BatchedGraspOptimizer:
                         _, inward_n = self.sdf.query_with_normals(tp.unsqueeze(1))
                         inward_n = inward_n[:, 0]  # [B, 3]
                         align = (pad_dir * inward_n).sum(-1)
-                        # Smooth softplus form (vs relu's kink at align=0):
-                        # ≈0 for align>0.3 (faced correctly), smooth through 0,
-                        # grows quadratically for align<0 (facing away).
-                        bad_face = F.softplus(-align * 10) / 10
-                        loss_sup += sup_finger_mask[:, fi].float() * 500 * bad_face ** 2
+                        loss_sup += sup_finger_mask[:, fi].float() * 500 * F.relu(0.95 - align) ** 2
 
                         # Actuation repulsion: ADDED on top of surface loss (not replacing)
                         dist_to_act_tip = torch.norm(tp - act_tip_pos, dim=-1)
@@ -2541,14 +2530,13 @@ class BatchedGraspOptimizer:
                         too_close = (dist_to_act < 0.040) & sup_finger_mask[:, fi]
                         loss_sup += too_close.float() * 500 * F.relu(0.040 - dist_to_act) ** 2
 
-                        # Guide support fingers toward spread target positions.
-                        # Linear distance (was squared) so gradient stays meaningful
-                        # when tip is 30-50mm from target.
+                        # Guide support fingers toward spread target positions
+                        # Strong for first half of IK (guidance), fade for second half (surface takes over)
                         if fi in finger_targets:
                             target = finger_targets[fi]
                             target_w = 100 * max(0, 1 - ik_step / 200)  # 100 → 0 over 200 steps
                             if target_w > 1:
-                                loss_sup += sup_finger_mask[:, fi].float() * target_w * torch.norm(tp - target, dim=-1)
+                                loss_sup += sup_finger_mask[:, fi].float() * target_w * ((tp - target) ** 2).sum(-1)
 
                     # Support finger link collision + below-object penalty
                     prefixes = ['if', 'mf', 'rf', 'th']
@@ -2563,17 +2551,13 @@ class BatchedGraspOptimizer:
                                 below = F.relu(self._obj_z_min - lp[:, 2]) ** 2
                                 loss_sup += sup_finger_mask[:, fi].float() * 1000 * below
                             # Link collision: non-ds links penalize any penetration.
-                            # Use MEAN over points instead of sum — sum over ~400
-                            # points/link amplified penetration penalty 400× vs
-                            # pad alignment, crowding out surface gradient. Mean
-                            # normalizes the scale so all losses are same order.
                             if suf in ('bs', 'px', 'md', 'mp'):
                                 for cnm, clp in self._col_data:
                                     if cnm == ln and ln in fk_ik:
                                         lwT = bT_ik @ fk_ik[ln].get_matrix()
                                         lwp = (lwT @ clp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
-                                        col_pen = F.relu(-lsdf).mean(-1)  # was .sum(-1)
+                                        col_pen = F.relu(-lsdf).sum(-1)
                                         loss_sup += sup_finger_mask[:, fi].float() * 500 * col_pen
                             elif suf == 'ds':
                                 # Fingertip ds: back-side only (pad wrapping is expected).
@@ -2959,11 +2943,7 @@ class BatchedGraspOptimizer:
 
                         # ── Section B: Collision loss ──
                         if opt_variant in ("A", "P"):
-                            # B1: mean(relu(-SDF)) for non-ds links.
-                            # Sum-over-points (original) amplified col loss 200-600×
-                            # depending on link point-count, crowding out surface
-                            # gradient. Mean normalizes across links so each link
-                            # contributes comparably.
+                            # B1: relu(-SDF) for non-ds links
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 for ci, cnm in sup_col_idx[fi]:
@@ -2972,7 +2952,7 @@ class BatchedGraspOptimizer:
                                         lwT = bT_o @ fk_o[cnm].get_matrix()
                                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).mean(-1)
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
 
                             # B2: Fingertip ds collision — back-side strict, pad-side tolerant.
                             # Back: 1mm contact allowed, heavy penalty beyond.
@@ -3186,32 +3166,6 @@ class BatchedGraspOptimizer:
                                 tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                                 dist_to_act = torch.norm(tip - act_tip_actual, dim=-1)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(0.035 - dist_to_act) ** 2
-
-                        # ── Section F: Support-in-clearance penalty ──
-                        # Feasibility rejects any grasp where a support-finger
-                        # point enters the actuation clearance cylinder. Main
-                        # opt had no loss enforcing this; envs could silently
-                        # drift into clearance and then fail feasibility.
-                        if hasattr(self.sdf, '_clearance_center'):
-                            for fi in range(4):
-                                if not sup_finger_mask_opt[:, fi].any(): continue
-                                for ci, cnm in sup_col_idx[fi]:
-                                    lp = self._col_data[ci][1]
-                                    if cnm not in fk_o: continue
-                                    lwT = bT_o @ fk_o[cnm].get_matrix()
-                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                    cl_sdf = self.sdf._clearance_sdf(lwp)  # [B, N]
-                                    # Penalize any point with cl_sdf<0 (inside clearance).
-                                    # Mean for consistency with B1 rebalance.
-                                    total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-cl_sdf).mean(-1)
-                                # Also check support ds links (fingertip)
-                                for ci, cnm in sup_col_idx_ds[fi]:
-                                    lp = self._col_data[ci][1]
-                                    if cnm not in fk_o: continue
-                                    lwT = bT_o @ fk_o[cnm].get_matrix()
-                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                    cl_sdf = self.sdf._clearance_sdf(lwp)
-                                    total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-cl_sdf).mean(-1)
 
                         # Freeze non-support joints (regularize back to initial values)
                         total_loss += 100 * ((q_opt - q_init) ** 2 * (~opt_joint_mask).float()).sum(-1)
