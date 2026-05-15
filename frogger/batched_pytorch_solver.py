@@ -2434,7 +2434,10 @@ class BatchedGraspOptimizer:
                         search_3d = torch.cat([search_pt, target_z], -1)
                         tgt_sdf = self.sdf.query(search_3d.unsqueeze(1)).squeeze(1)
                         _, tgt_normals = self.sdf.query_with_normals(search_3d.unsqueeze(1))
-                        tgt_pts = search_3d - tgt_sdf.unsqueeze(-1) * tgt_normals[:, 0]
+                        # query_with_normals returns INWARD normals (-∇SDF).
+                        # Projection: search_3d + sdf * inward_normal moves toward
+                        # surface for both exterior (sdf>0) and interior (sdf<0).
+                        tgt_pts = search_3d + tgt_sdf.unsqueeze(-1) * tgt_normals[:, 0]
                         finger_targets_all[fi] = tgt_pts
 
                     # Build per-env finger targets: skip the actuation finger
@@ -2971,26 +2974,20 @@ class BatchedGraspOptimizer:
                                         lsdf_b = self.sdf.query(lwp_b)
                                         pen_back = F.relu(-lsdf_b - 0.001).max(-1).values
                                         total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * pen_back ** 2
-                                    # Pad-side: tolerant (3mm wrap allowance)
+                                    # Pad-side: tolerant (3mm wrap allowance),
+                                    # LINEAR penalty past the margin for strong
+                                    # gradient at borderline cases. Previous
+                                    # quadratic form was 500×0.002²=0.002 at
+                                    # 2mm excess — too weak to push many
+                                    # borderline grasps below the feasibility
+                                    # threshold (-5mm). Linear keeps gradient
+                                    # magnitude constant so 0-10mm excess all
+                                    # get pushed out equally hard.
                                     if (~back_m).any():
                                         lwp_p = (lwT @ lp[~back_m].T)[:, :3, :].transpose(1, 2)
                                         lsdf_p = self.sdf.query(lwp_p)
                                         pen_pad = F.relu(-lsdf_p - 0.003).max(-1).values
-                                        # Mixed quadratic-then-linear penalty:
-                                        # quadratic near threshold for smooth
-                                        # gradient, linear when deep (>5mm over
-                                        # threshold) so optimizer has a real
-                                        # force to pull pad out of object.
-                                        # Observed on flashlight: ds_pad_worst
-                                        # = -11.7mm failed feasibility, but the
-                                        # pure-quadratic loss was 0.038 — too
-                                        # weak to create any recovery gradient.
-                                        pad_loss = torch.where(
-                                            pen_pad < 0.005,
-                                            500 * pen_pad ** 2,
-                                            500 * 0.005 * (2 * pen_pad - 0.005),
-                                        )
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * pad_loss
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * pen_pad
 
                         elif opt_variant in ("B", "C"):
                             # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
@@ -3055,6 +3052,16 @@ class BatchedGraspOptimizer:
                                 gz = (self.sdf.query(tp_fc+fd_ofst[2])-self.sdf.query(tp_fc-fd_ofst[2]))/(2*eps_fd)
                                 tn = -torch.stack([gx,gy,gz],dim=-1)
                                 tn = tn / tn.norm(dim=-1,keepdim=True).clamp(min=1e-8)
+
+                                # FC proxy: penalise parallel contact normals
+                                # (`l* ≤ 0` when normals point same way even if
+                                # σ_min > 0). This is the differentiable FC
+                                # surrogate `compute_fc_proxy_loss` — was dead
+                                # code in the file, now wired in to target the
+                                # σ>0/l*≤0 failure pattern on air_blower/flash.
+                                fc_proxy = compute_fc_proxy_loss(tp_fc, tn, obj_c)
+                                total_loss += group_mask.float() * fc_weight * 2.0 * fc_proxy
+
                                 g_OCs = compute_contact_frames(tp_fc, tn)
                                 G = compute_grasp_matrix_torch(g_OCs)
                                 W = compute_wrench_matrix(G, F_prim, nc_fc, ns)
@@ -3166,6 +3173,31 @@ class BatchedGraspOptimizer:
                                 tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
                                 dist_to_act = torch.norm(tip - act_tip_actual, dim=-1)
                                 total_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(0.035 - dist_to_act) ** 2
+
+                        # Section F: Support-in-clearance penalty. Uses MAX
+                        # over points (matches feasibility's worst-point check).
+                        # Mean was too weak: only a few points out of ~400/link
+                        # penetrate the clearance, mean(-1) dilutes signal to
+                        # negligible. Max gives the gradient a clear target.
+                        if hasattr(self.sdf, '_clearance_center'):
+                            for fi in range(4):
+                                if not sup_finger_mask_opt[:, fi].any(): continue
+                                for ci, cnm in sup_col_idx[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm not in fk_o: continue
+                                    lwT = bT_o @ fk_o[cnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    cl_sdf = self.sdf._clearance_sdf(lwp)
+                                    worst_pen = F.relu(-cl_sdf).max(-1).values
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 2000 * worst_pen
+                                for ci, cnm in sup_col_idx_ds[fi]:
+                                    lp = self._col_data[ci][1]
+                                    if cnm not in fk_o: continue
+                                    lwT = bT_o @ fk_o[cnm].get_matrix()
+                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
+                                    cl_sdf = self.sdf._clearance_sdf(lwp)
+                                    worst_pen = F.relu(-cl_sdf).max(-1).values
+                                    total_loss += sup_finger_mask_opt[:, fi].float() * 2000 * worst_pen
 
                         # Freeze non-support joints (regularize back to initial values)
                         total_loss += 100 * ((q_opt - q_init) ** 2 * (~opt_joint_mask).float()).sum(-1)
