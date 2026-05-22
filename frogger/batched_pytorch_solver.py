@@ -36,6 +36,74 @@ _IK_TWO_PHASE = bool(int(os.environ.get("FROGGER_IK_TWO_PHASE", "0")))
 _IK_PHASE1_STEPS = int(os.environ.get("FROGGER_IK_PH1", "100"))
 _IK_PHASE2_STEPS = int(os.environ.get("FROGGER_IK_PH2", "50"))
 
+# Multi-assign selector. "argmin" picks the lowest-score trial per env
+# (current default; biases toward thumb because thumb has longest reach,
+# which then forces palm-wrap support topology). "uniform_viable" samples
+# uniformly among trials with score <= max(1.5*min_score, viable_floor),
+# preserving topology diversity for objects (e.g. air_blower) where the
+# closest-reach finger is not the FC-feasible one.
+_ACT_SELECT = os.environ.get("FROGGER_ACT_SELECT", "argmin").lower()
+_ACT_VIABLE_FLOOR = float(os.environ.get("FROGGER_ACT_VIABLE_FLOOR", "0.005"))
+_ACT_VIABLE_RATIO = float(os.environ.get("FROGGER_ACT_VIABLE_RATIO", "1.5"))
+assert _ACT_SELECT in ("argmin", "uniform_viable"), _ACT_SELECT
+
+# SC projection in P-variant. Default OFF: a 5-object 1-batch test
+# (output/sc_proj_v1 vs ablation_uniform_v1) showed projection didn't
+# improve SC pass rate within l*>0 candidates for air_blower (1/7 vs 2/6).
+# Surface projection (which runs first and minimizes tip_sdf^2) keeps tips on
+# the surface; SC projection wants to rotate joints to separate links, but
+# any joint rotation that separates links also moves tips off surface, where
+# surface projection immediately pulls them back. For narrow geometry no
+# single config satisfies both — the bottleneck is init sampling rate of
+# non-self-colliding configs, not optimization.
+_SC_PROJ_ITERS = int(os.environ.get("FROGGER_SC_PROJ_ITERS", "0"))
+_SC_PROJ_LR = float(os.environ.get("FROGGER_SC_PROJ_LR", "0.03"))
+_SC_PROJ_MARGIN = float(os.environ.get("FROGGER_SC_PROJ_MARGIN", "0.001"))  # 1mm
+
+# Self-collision loss tuning. Default mirrors original (quadratic, weight 5000,
+# every 5 steps). Per per-stage SC-trajectory measurements on air_blower, the
+# default SC loss is functionally inert: SC pass rate changes <1% across 300
+# main-opt steps for all objects, and FC-pursuing envs actively degrade SC.
+# Enable with FROGGER_SC_STRONG=1 to fire every step with a linear term added.
+_SC_STRONG = bool(int(os.environ.get("FROGGER_SC_STRONG", "0")))
+_SC_QUAD_W = float(os.environ.get("FROGGER_SC_QUAD_W", "5000"))   # quadratic coeff
+_SC_LIN_W  = float(os.environ.get("FROGGER_SC_LIN_W",  "50"))     # linear coeff (active when STRONG)
+_SC_FREQ   = int(os.environ.get("FROGGER_SC_FREQ", "5"))           # opt-step modulus
+
+# Support IK currently has support↔actuation SC point repulsion but NO
+# support↔support repulsion. Hot_glue env 831 went SC=+0.15→-8.21mm in S3 alone.
+# Enable with FROGGER_IK_SUP_SC=1 to add support↔support SC point repulsion in
+# support IK (mirroring the support↔actuation block).
+_IK_SUP_SC = bool(int(os.environ.get("FROGGER_IK_SUP_SC", "0")))
+_IK_SUP_SC_W = float(os.environ.get("FROGGER_IK_SUP_SC_W", "50"))   # match support↔act coeff
+_IK_SUP_SC_MARGIN = float(os.environ.get("FROGGER_IK_SUP_SC_MARGIN", "0.020"))  # 20mm
+# Use box-box SDF for support↔support repulsion in IK (vs cdist on grid samples).
+# Grid-sample cdist has sample-density gap: 5mm grid points stay >5mm apart even
+# when boxes overlap, so cdist can't detect actual link overlap. Box-box SDF is
+# exact (same metric the gate uses). FROGGER_IK_SUP_SC_BBOX=1 enables it.
+_IK_SUP_SC_BBOX = bool(int(os.environ.get("FROGGER_IK_SUP_SC_BBOX", "0")))
+_IK_SUP_SC_BBOX_FREQ = int(os.environ.get("FROGGER_IK_SUP_SC_BBOX_FREQ", "1"))  # IK steps modulus
+_IK_SUP_SC_BBOX_MARGIN = float(os.environ.get("FROGGER_IK_SUP_SC_BBOX_MARGIN", "0.002"))  # 2mm
+
+# Pre-opt SC filter on opt_mask. After support IK, if an env's sc_worst_sdf
+# (box-box SDF, exact) is below threshold, exclude from main opt. This avoids
+# wasting compute on envs whose supports already overlap deeply — they cannot
+# close FC without violating the SC gate. Default -10mm (lenient: only filter
+# extreme collisions). Set FROGGER_OPT_MASK_SC=-0.003 for 3mm gate-match.
+_OPT_MASK_SC_THRESH = float(os.environ.get("FROGGER_OPT_MASK_SC", "-0.010"))   # -10mm default (off-ish)
+
+# Non-ds object-collision deep-pen hinge. Per project_sigma_to_feas_gap.md,
+# `col` (max_col_viol > 3mm) is the dominant killer for air_blower's l*>0
+# grasps (5/11 fails). The existing B1 loss at line 3149 is `500 * sum(pen)` —
+# a flat-gradient sum penalty that loses the equilibrium to FC pursuit at
+# 4-15mm violation. This hinge adds `_NONDS_HINGE_W * relu(max_pen -
+# _NONDS_HINGE_MARGIN)^2` on top, fires only when an env's worst non-ds
+# point crosses the threshold. Mirrors v12's mean→max shape change for
+# clearance in Section F. Default OFF to preserve baseline reproducibility.
+_NONDS_HINGE = bool(int(os.environ.get("FROGGER_NONDS_HINGE", "0")))
+_NONDS_HINGE_W = float(os.environ.get("FROGGER_NONDS_HINGE_W", "20000"))
+_NONDS_HINGE_MARGIN = float(os.environ.get("FROGGER_NONDS_HINGE_MARGIN", "0.003"))  # 3mm = feasibility threshold
+
 
 # ---------------------------------------------------------------------------
 # SDF grid
@@ -1864,6 +1932,14 @@ class BatchedGraspOptimizer:
             best_score = torch.full((B,), float('inf'), device=dev)
             best_fi = torch.zeros(B, device=dev, dtype=torch.long)
 
+            # When _ACT_SELECT == "uniform_viable", we need every trial's
+            # post-IK state to sample from. argmin mode never reads these.
+            _store_all_trials = (_ACT_SELECT == "uniform_viable" and not _DISABLE_MULTI_ASSIGN)
+            trial_u_list = []         # each: [B, 16]
+            trial_score_list = []     # each: [B]
+            trial_act_dist_list = []  # each: [B]
+            trial_fi_list = []        # each: [B] long
+
             prefixes_ik = ['if', 'mf', 'rf', 'th']
             sfx_ik = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
 
@@ -1985,6 +2061,45 @@ class BatchedGraspOptimizer:
                     best_u_full = torch.where(improved.unsqueeze(-1), u_act.detach(), best_u_full)
                     best_act_dist = torch.where(improved, trial_dist, best_act_dist)
                     best_fi = torch.where(improved, fi_tensor, best_fi)
+
+                    if _store_all_trials:
+                        trial_u_list.append(u_act.detach().clone())
+                        trial_score_list.append(trial_score.clone())
+                        trial_act_dist_list.append(trial_dist.clone())
+                        trial_fi_list.append(fi_tensor.clone())
+
+            # If running in uniform_viable mode, overwrite the argmin choice
+            # with a uniform sample over per-env viable trials. Viable =
+            # score <= max(_ACT_VIABLE_RATIO * min_score, _ACT_VIABLE_FLOOR).
+            # For envs where only one trial is viable (e.g. grinder, only TH
+            # can reach), this collapses back to argmin. For envs with
+            # multiple viable trials (e.g. air_blower), we get topology
+            # diversity at no compute cost — we already ran IK for each.
+            if _store_all_trials and len(trial_score_list) > 0:
+                with torch.no_grad():
+                    all_u = torch.stack(trial_u_list, dim=1)            # [B, T, 16]
+                    all_scores = torch.stack(trial_score_list, dim=1)   # [B, T]
+                    all_dists = torch.stack(trial_act_dist_list, dim=1) # [B, T]
+                    all_fis = torch.stack(trial_fi_list, dim=1)         # [B, T]
+                    min_scores = all_scores.min(dim=1).values           # [B]
+                    threshold = torch.clamp(_ACT_VIABLE_RATIO * min_scores,
+                                            min=_ACT_VIABLE_FLOOR)      # [B]
+                    viable = all_scores <= threshold.unsqueeze(1)       # [B, T]
+                    # Uniform sample by argmax of (rand * viable - inf where !viable).
+                    rand = torch.rand_like(all_scores)
+                    rand = torch.where(viable, rand, torch.full_like(rand, -1.0))
+                    chosen = rand.argmax(dim=1)                         # [B]
+                    bidx = torch.arange(B, device=dev)
+                    best_u_full = all_u[bidx, chosen]
+                    best_score = all_scores[bidx, chosen]
+                    best_act_dist = all_dists[bidx, chosen]
+                    best_fi = all_fis[bidx, chosen]
+                    n_viable_per_env = viable.float().sum(dim=1)
+                    print(f"  [act_select=uniform_viable] viable-trial counts: "
+                          f"min={int(n_viable_per_env.min())}, "
+                          f"mean={n_viable_per_env.mean():.2f}, "
+                          f"max={int(n_viable_per_env.max())} "
+                          f"(threshold med={threshold.median():.4f})")
 
             # Commit best assignment per env
             with torch.no_grad():
@@ -2618,6 +2733,80 @@ class BatchedGraspOptimizer:
                                 repulsion = pair_pen.sum(dim=(-2, -1))  # [B]
                                 loss_sup += (sup_finger_mask[:, fi] & mask_fi).float() * 50 * repulsion
 
+                        # Support↔Support box-box SDF repulsion (NEW: enables when
+                        # FROGGER_IK_SUP_SC_BBOX=1). Uses the EXACT box-box SDF metric
+                        # that the feasibility gate checks. Required because cdist on
+                        # grid-sampled SC points has a sample-density gap and can't
+                        # detect actual link overlap (samples stay ≥5mm apart even
+                        # when boxes overlap deeply).
+                        if _IK_SUP_SC_BBOX and hasattr(self, '_box_primitives') and ik_step % _IK_SUP_SC_BBOX_FREQ == 0:
+                            _prefix_bb = f"leap_{self.hand}_"
+                            _adj_bb = {
+                                ('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
+                                ('if_bs','if_px'),('if_px','if_md'),('if_md','if_ds'),
+                                ('mf_bs','mf_px'),('mf_px','mf_md'),('mf_md','mf_ds'),
+                                ('rf_bs','rf_px'),('rf_px','rf_md'),('rf_md','rf_ds'),
+                                ('th_mp','th_bs'),('th_bs','th_px'),('th_px','th_ds')}
+                            _link_wT_bb = {}
+                            for nm_bb in self._box_primitives:
+                                if nm_bb in fk_ik:
+                                    _link_wT_bb[nm_bb] = bT_ik @ fk_ik[nm_bb].get_matrix()
+                            _fi_per_link = {}
+                            for nm_bb in self._box_primitives:
+                                short = nm_bb.replace(_prefix_bb, '')
+                                fkey = short.split('_')[0]
+                                _fi_per_link[nm_bb] = {'if':0,'mf':1,'rf':2,'th':3,'palm':-1}.get(fkey, -2)
+                            sc_loss_bb = torch.zeros(B, device=dev)
+                            for nm_i in self._box_primitives:
+                                if nm_i not in _link_wT_bb: continue
+                                fi_idx = _fi_per_link[nm_i]
+                                if fi_idx < 0: continue   # skip palm
+                                for nm_j in self._box_primitives:
+                                    if nm_j not in _link_wT_bb or nm_i >= nm_j: continue
+                                    fj_idx = _fi_per_link[nm_j]
+                                    if fj_idx < 0: continue
+                                    if fi_idx == fj_idx: continue   # same finger handled elsewhere
+                                    si_bb = nm_i.replace(_prefix_bb, '')
+                                    sj_bb = nm_j.replace(_prefix_bb, '')
+                                    if (si_bb, sj_bb) in _adj_bb or (sj_bb, si_bb) in _adj_bb: continue
+                                    both = sup_finger_mask[:, fi_idx] & sup_finger_mask[:, fj_idx]
+                                    if not both.any(): continue
+                                    for bi_c, bi_r, bi_h in self._box_primitives[nm_i]:
+                                        for bj_c, bj_r, bj_h in self._box_primitives[nm_j]:
+                                            ci_w = (_link_wT_bb[nm_i] @ bi_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                            ri_w = _link_wT_bb[nm_i][:, :3, :3] @ bi_r.unsqueeze(0)
+                                            cj_w = (_link_wT_bb[nm_j] @ bj_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                            rj_w = _link_wT_bb[nm_j][:, :3, :3] @ bj_r.unsqueeze(0)
+                                            cdist_bb = (ci_w - cj_w).norm(dim=-1)
+                                            if not (cdist_bb < 0.040).any(): continue
+                                            sd_bb = box_box_sdf_batch(
+                                                ci_w, ri_w, bi_h.unsqueeze(0).expand(B, -1),
+                                                cj_w, rj_w, bj_h.unsqueeze(0).expand(B, -1))
+                                            overlap_bb = F.relu(-sd_bb - _IK_SUP_SC_BBOX_MARGIN)
+                                            sc_loss_bb = sc_loss_bb + both.float() * (5000.0 * overlap_bb ** 2 + 50.0 * overlap_bb)
+                            loss_sup = loss_sup + sc_loss_bb
+
+                        # Support↔Support SC-point repulsion (legacy cdist version,
+                        # enables when FROGGER_IK_SUP_SC=1). Kept for ablation.
+                        if _IK_SUP_SC:
+                            for fi in range(4):
+                                if not sup_finger_mask[:, fi].any(): continue
+                                sup_i_ranges = finger_sc_ranges.get(fi, [])
+                                if not sup_i_ranges: continue
+                                sup_i_idx = [idx for s, e in sup_i_ranges for idx in range(s, e)]
+                                pts_i = sc_pts_world[:, sup_i_idx]  # [B, n_i, 3]
+                                for fj in range(fi + 1, 4):
+                                    if not sup_finger_mask[:, fj].any(): continue
+                                    sup_j_ranges = finger_sc_ranges.get(fj, [])
+                                    if not sup_j_ranges: continue
+                                    sup_j_idx = [idx for s, e in sup_j_ranges for idx in range(s, e)]
+                                    pts_j = sc_pts_world[:, sup_j_idx]  # [B, n_j, 3]
+                                    dists = torch.cdist(pts_i, pts_j)
+                                    pair_pen = F.relu(_IK_SUP_SC_MARGIN - dists) ** 2
+                                    rep = pair_pen.sum(dim=(-2, -1))
+                                    both = sup_finger_mask[:, fi] & sup_finger_mask[:, fj]
+                                    loss_sup += both.float() * _IK_SUP_SC_W * rep
+
                     # Spread support fingertips apart + diverse normals
                     sup_tips = []
                     sup_normals = []
@@ -2756,7 +2945,21 @@ class BatchedGraspOptimizer:
                            & (worst_sup_link > -0.005) & (worst_act_link > -0.010))
                 n_opt = opt_mask.sum().item()
                 n_act_filtered = ((worst_act_link <= -0.010) & (act_d < 0.010)).sum().item()
-                print(f"  Optimization candidates: {n_opt}/{B} ({n_act_filtered} filtered by act collision)")
+                # Optional SC pre-filter: read the S3 sc_worst from snapshot and exclude
+                # envs with deep box-box self-collision (they can't pass the gate later).
+                n_sc_filtered = 0
+                if _OPT_MASK_SC_THRESH > -0.999 and hasattr(self, '_metrics_log'):
+                    s3 = self._metrics_log.get('S3_after_support_ik')
+                    if s3 is not None and 'sc_worst' in s3:
+                        _sc_arr = torch.as_tensor(s3['sc_worst'], device=dev)
+                        _sc_pass = _sc_arr > _OPT_MASK_SC_THRESH
+                        before = opt_mask.sum().item()
+                        opt_mask = opt_mask & _sc_pass
+                        n_sc_filtered = before - opt_mask.sum().item()
+                        n_opt = opt_mask.sum().item()
+                print(f"  Optimization candidates: {n_opt}/{B} ({n_act_filtered} filtered by act collision"
+                      + (f", {n_sc_filtered} filtered by SC<{_OPT_MASK_SC_THRESH*1000:.0f}mm" if n_sc_filtered else "")
+                      + ")")
 
             if n_opt > 0:
                 # Build support masks
@@ -2946,7 +3149,12 @@ class BatchedGraspOptimizer:
 
                         # ── Section B: Collision loss ──
                         if opt_variant in ("A", "P"):
-                            # B1: relu(-SDF) for non-ds links
+                            # B1: relu(-SDF) for non-ds links.
+                            # Base loss: sum(pen) — broad coverage, flat per-point gradient.
+                            # Optional deep-pen hinge (FROGGER_NONDS_HINGE=1): focused max-pen
+                            # penalty that fires only past the feasibility threshold; closes
+                            # the σ→feas gap for hard objects (air_blower col:5/11 fails per
+                            # project_sigma_to_feas_gap.md). Default OFF to preserve baseline.
                             for fi in range(4):
                                 if not sup_finger_mask_opt[:, fi].any(): continue
                                 for ci, cnm in sup_col_idx[fi]:
@@ -2955,7 +3163,13 @@ class BatchedGraspOptimizer:
                                         lwT = bT_o @ fk_o[cnm].get_matrix()
                                         lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
                                         lsdf = self.sdf.query(lwp)
-                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * F.relu(-lsdf).sum(-1)
+                                        pen = F.relu(-lsdf)
+                                        total_loss += sup_finger_mask_opt[:, fi].float() * 500 * pen.sum(-1)
+                                        if _NONDS_HINGE:
+                                            max_pen = pen.max(-1).values
+                                            total_loss += (sup_finger_mask_opt[:, fi].float()
+                                                           * _NONDS_HINGE_W
+                                                           * F.relu(max_pen - _NONDS_HINGE_MARGIN) ** 2)
 
                             # B2: Fingertip ds collision — back-side strict, pad-side tolerant.
                             # Back: 1mm contact allowed, heavy penalty beyond.
@@ -3099,7 +3313,8 @@ class BatchedGraspOptimizer:
                         # Use box-box SDF directly — matches the feasibility metric.
                         # Only process opt_mask envs and skip distant pairs for efficiency.
                         # Computed every 10 steps to amortize cost.
-                        if hasattr(self, '_box_primitives') and opt_step % 5 == 0:
+                        _sc_freq = 1 if _SC_STRONG else _SC_FREQ
+                        if hasattr(self, '_box_primitives') and opt_step % _sc_freq == 0:
                             _prefix_d = f"leap_{self.hand}_"
                             _adj_d = {
                                 ('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
@@ -3144,7 +3359,12 @@ class BatchedGraspOptimizer:
                                                     ci_w, ri_w, bi_h.unsqueeze(0).expand(B_d, -1),
                                                     cj_w, rj_w, bj_h.unsqueeze(0).expand(B_d, -1))
                                                 overlap = F.relu(-sd - 0.001)
-                                                sc_loss_d += 5000 * overlap ** 2
+                                                if _SC_STRONG:
+                                                    # Linear term keeps gradient finite as overlap → 0;
+                                                    # quadratic still dominates at large overlaps.
+                                                    sc_loss_d += _SC_QUAD_W * overlap ** 2 + _SC_LIN_W * overlap
+                                                else:
+                                                    sc_loss_d += _SC_QUAD_W * overlap ** 2
                                 # Scatter back to full batch
                                 sc_loss_full = torch.zeros(B, device=dev)
                                 sc_loss_full[opt_idx_d] = sc_loss_d
@@ -3296,6 +3516,67 @@ class BatchedGraspOptimizer:
                                     q_opt.data -= proj_lr * g
                                     q_opt.clamp_(self.q_lo, self.q_lo + self.q_range)
                             q_opt.grad = None
+
+                            # ── SC projection ──
+                            # Project onto SC-feasibility (box-box SDF >= -margin)
+                            # using the exact metric, opt_mask envs only.
+                            if _SC_PROJ_ITERS > 0 and hasattr(self, '_box_primitives'):
+                                _prefix_p = f"leap_{self.hand}_"
+                                _adj_p = {
+                                    ('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
+                                    ('if_bs','if_px'),('if_px','if_md'),('if_md','if_ds'),
+                                    ('mf_bs','mf_px'),('mf_px','mf_md'),('mf_md','mf_ds'),
+                                    ('rf_bs','rf_px'),('rf_px','rf_md'),('rf_md','rf_ds'),
+                                    ('th_mp','th_bs'),('th_bs','th_px'),('th_px','th_ds')}
+                                opt_idx_p = torch.where(opt_mask)[0]
+                                B_p = len(opt_idx_p)
+                                if B_p > 0:
+                                    for _scp_it in range(_SC_PROJ_ITERS):
+                                        q_opt.grad = None
+                                        if pos_opt is not None:
+                                            bT_p = self._base_T(pos_opt.detach(), rot6d_opt.detach())
+                                        else:
+                                            bT_p = self._base_T(self.pos.detach(), self.rot6d.detach())
+                                        fk_p = self.chain.forward_kinematics(q_opt)
+                                        bT_pm = bT_p[opt_idx_p]
+                                        link_wT_p = {}
+                                        for nm_p in self._box_primitives:
+                                            if nm_p in fk_p:
+                                                link_wT_p[nm_p] = bT_pm @ fk_p[nm_p].get_matrix()[opt_idx_p]
+                                        sc_proj_loss_m = torch.zeros(B_p, device=dev)
+                                        for nm_i in self._box_primitives:
+                                            if nm_i not in link_wT_p: continue
+                                            for nm_j in self._box_primitives:
+                                                if nm_j not in link_wT_p or nm_i >= nm_j: continue
+                                                si_p = nm_i.replace(_prefix_p, '')
+                                                sj_p = nm_j.replace(_prefix_p, '')
+                                                if (si_p, sj_p) in _adj_p or (sj_p, si_p) in _adj_p: continue
+                                                fi_p = si_p.split('_')[0]; fj_p = sj_p.split('_')[0]
+                                                if fi_p == fj_p and fi_p != 'palm': continue
+                                                for bi_c, bi_r, bi_h in self._box_primitives[nm_i]:
+                                                    for bj_c, bj_r, bj_h in self._box_primitives[nm_j]:
+                                                        ci_w = (link_wT_p[nm_i] @ bi_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                                        ri_w = link_wT_p[nm_i][:, :3, :3] @ bi_r.unsqueeze(0)
+                                                        cj_w = (link_wT_p[nm_j] @ bj_c.unsqueeze(-1)).squeeze(-1)[:, :3]
+                                                        rj_w = link_wT_p[nm_j][:, :3, :3] @ bj_r.unsqueeze(0)
+                                                        cdist = (ci_w - cj_w).norm(dim=-1)
+                                                        close = cdist < 0.060
+                                                        if not close.any(): continue
+                                                        sd_p = box_box_sdf_batch(
+                                                            ci_w, ri_w, bi_h.unsqueeze(0).expand(B_p, -1),
+                                                            cj_w, rj_w, bj_h.unsqueeze(0).expand(B_p, -1))
+                                                        overlap_p = F.relu(-sd_p - _SC_PROJ_MARGIN)
+                                                        sc_proj_loss_m = sc_proj_loss_m + overlap_p ** 2
+                                        if sc_proj_loss_m.sum() > 0:
+                                            sc_proj_loss_full = torch.zeros(B, device=dev)
+                                            sc_proj_loss_full[opt_idx_p] = sc_proj_loss_m
+                                            sc_proj_loss_full.sum().backward()
+                                            with torch.no_grad():
+                                                g_sc = q_opt.grad
+                                                g_sc[~opt_joint_mask] = 0.0
+                                                q_opt.data -= _SC_PROJ_LR * g_sc
+                                                q_opt.clamp_(self.q_lo, self.q_lo + self.q_range)
+                                        q_opt.grad = None
 
                         # Metrics snapshot at key checkpoints
                         if opt_step in (50, 150, 299):
