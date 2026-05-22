@@ -61,3 +61,30 @@ output/                       # gitignored: grasp .pt files + per-stage metrics
 
 - Grasp outputs → `output/<run_name>/<object>/batch_<N>/`
 - Do not commit output files. `output/` is gitignored.
+
+## Current ablation knobs (all env-var gated, defaults preserve baseline)
+
+The current head extends the v12 baseline with several env-var-controlled
+interventions. Read the comments at the top of `batched_pytorch_solver.py`
+for the rationale on each. Recommended config for hard-object investigation:
+
+```
+FROGGER_ACT_SELECT=uniform_viable    # multi-assign topology diversity (proven; v12 air_blower 0→? per batch)
+FROGGER_IK_SUP_SC=1                   # support↔support SC point-repulsion in support IK
+FROGGER_IK_SUP_SC_MARGIN=0.005        # 5mm margin (20mm default was too loose; cdist5mm proved 5mm doubles air_blower l*>0)
+FROGGER_NONDS_HINGE=1                 # deep-pen quadratic hinge on max non-ds penetration (hypothesis: closes σ→feas gap)
+```
+
+Falsified interventions (kept as env vars for reproducibility, default OFF):
+- `FROGGER_SC_PROJ_ITERS>0`: P-variant SC projection fights surf-projection
+- `FROGGER_IK_SUP_SC_MARGIN=0.020`: too loose; no help
+- `FROGGER_OPT_MASK_SC=-0.003`: pre-opt SC filter; no help
+
+Untested (default OFF):
+- `FROGGER_SC_STRONG=1`: linear+quadratic SC loss every step in main opt
+- `FROGGER_IK_SUP_SC_BBOX=1`: box-box SDF version of support↔support repulsion (crashed in initial test; needs investigation)
+
+See memory files `project_act_fi_selection_bias.md`, `project_cdist5mm_winner.md`,
+`project_sigma_to_feas_gap.md`, `project_sc_loss_inert.md`,
+`project_support_ik_no_sup_sc.md`, `project_sc_proj_falsified.md` for the
+evidence and reasoning behind each.
