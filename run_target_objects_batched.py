@@ -5,14 +5,18 @@ Instead of one 20k-env batch (memory heavy), run N batches of 4000 envs with
 independent random seeds and pool the feasible grasps. Each batch re-samples
 the base pose init distribution so we get better coverage.
 """
-import os, sys, json, numpy as np, trimesh, torch, time, argparse
+import os, sys, json, numpy as np, trimesh, torch, time, argparse, contextlib
 
-sys.path.insert(0, os.path.dirname(__file__))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 from frogger.batched_pytorch_solver import BatchedSDF, BatchedGraspOptimizer
 
-MESH_BASE = "/home/bowenj/Projects/DexFun/assets/mesh_obj"
-MESH_ALT = "/home/bowenj/Projects/DexFun/output/meshes/mesh_raw_ahg"
-ACT_BASE = "/home/bowenj/Projects/DexFun/assets/actuation_contacts"
+# Asset paths resolved relative to the repo location. The third_parties/frogger
+# folder lives at <DEXFUN>/third_parties/frogger, so assets/ is two levels up.
+_DEXFUN_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
+MESH_BASE = os.path.join(_DEXFUN_ROOT, "assets", "mesh_obj")
+MESH_ALT = os.path.join(_DEXFUN_ROOT, "output", "meshes", "mesh_raw_ahg")
+ACT_BASE = os.path.join(_DEXFUN_ROOT, "assets", "actuation_contacts")
 TARGET_OBJECTS = [
     "funky_clear_spray_bottle", "hot_glue_gun", "air_blower",
     "grinder", "flashlight",
@@ -83,11 +87,26 @@ def main():
         all_results = []
         n_feas_per_batch = []
         t0 = time.time()
+        # Capture per-object stdout (entry-filter breakdown etc.) alongside grasps.
+        obj_dir = os.path.join(args.out_dir, name)
+        os.makedirs(obj_dir, exist_ok=True)
+        log_path = os.path.join(obj_dir, "run.log")
+        log_f = open(log_path, "w", buffering=1)
+
+        class _Tee:
+            def __init__(self, *streams): self.streams = streams
+            def write(self, s):
+                for st in self.streams: st.write(s)
+            def flush(self):
+                for st in self.streams: st.flush()
+        tee = _Tee(sys.stdout, log_f)
+
         for bi in range(args.n_batches):
             print(f"\n{'='*60}\n  {name} — batch {bi+1}/{args.n_batches}\n{'='*60}")
             try:
-                r = run_batch(name, mesh_path, actuation_targets, X_WO, obj_center,
-                              offset, bi, args.num_envs, args.out_dir)
+                with contextlib.redirect_stdout(tee):
+                    r = run_batch(name, mesh_path, actuation_targets, X_WO, obj_center,
+                                  offset, bi, args.num_envs, args.out_dir)
                 for g in r:
                     g["batch_idx"] = bi
                     all_results.append(g)
@@ -98,6 +117,7 @@ def main():
                 print(f"  batch {bi} ERROR: {e}")
                 n_feas_per_batch.append(0)
                 continue
+        log_f.close()
 
         elapsed = time.time() - t0
         n_feas_total = sum(1 for g in all_results if g.get("feasible", False))
