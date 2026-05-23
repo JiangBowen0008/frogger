@@ -30,16 +30,19 @@ def find_mesh(name):
 
 
 def run_batch(name, mesh_path, actuation_targets, X_WO, obj_center, offset,
-              batch_i, num_envs, out_dir):
+              batch_i, num_envs, out_dir, seed_offset=0):
     mesh = trimesh.load(mesh_path, force="mesh")
     sdf = BatchedSDF(mesh, X_WO, bounds_padding=0.15, resolution=128, device="cuda")
     sdf.add_clearance_volume(actuation_targets[0][0], actuation_targets[0][1],
                              radius=0.020, height=0.03)
     sdf.add_floor(0.0)
 
-    # Reseed so each batch samples independently
-    torch.manual_seed(1000 * batch_i + 7)
-    np.random.seed(1000 * batch_i + 7)
+    # Reseed so each batch samples independently. seed_offset enables cross-seed
+    # ablation reruns ("Consistent" evidence per CLAUDE.md requires independent
+    # draws, not just deterministic reproduction).
+    seed = 1000 * batch_i + 7 + seed_offset
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     opt = BatchedGraspOptimizer(
         sdf, num_envs=num_envs, device="cuda",
@@ -64,6 +67,10 @@ def main():
     ap.add_argument("--n-batches", type=int, default=5)
     ap.add_argument("--out-dir", default="output/batched_sampling")
     ap.add_argument("--objects", nargs="*", default=TARGET_OBJECTS)
+    ap.add_argument("--seed-offset", type=int, default=0,
+                    help="Add this offset to the per-batch seed. Use a "
+                         "different value to get cross-seed independent runs "
+                         "for 'Consistent' evidence per CLAUDE.md.")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -106,7 +113,8 @@ def main():
             try:
                 with contextlib.redirect_stdout(tee):
                     r = run_batch(name, mesh_path, actuation_targets, X_WO, obj_center,
-                                  offset, bi, args.num_envs, args.out_dir)
+                                  offset, bi, args.num_envs, args.out_dir,
+                                  seed_offset=args.seed_offset)
                 for g in r:
                     g["batch_idx"] = bi
                     all_results.append(g)
