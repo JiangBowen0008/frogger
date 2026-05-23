@@ -28,25 +28,6 @@ import time
 _DISABLE_MULTI_ASSIGN = bool(int(os.environ.get("FROGGER_NO_MULTI", "0")))
 _DISABLE_BASE_UNFREEZE = bool(int(os.environ.get("FROGGER_NO_BASE", "0")))
 
-# Multi-assign selector. "argmin" picks the lowest-score trial per env (biases
-# toward thumb because thumb has longest reach, forcing palm-wrap support
-# topology). "uniform_viable" samples uniformly among trials within
-# max(1.5*min_score, viable_floor), preserving topology diversity for objects
-# (e.g. air_blower) where the closest-reach finger is not the FC-feasible one.
-_ACT_SELECT = os.environ.get("FROGGER_ACT_SELECT", "argmin").lower()
-_ACT_VIABLE_FLOOR = float(os.environ.get("FROGGER_ACT_VIABLE_FLOOR", "0.005"))
-_ACT_VIABLE_RATIO = float(os.environ.get("FROGGER_ACT_VIABLE_RATIO", "1.5"))
-assert _ACT_SELECT in ("argmin", "uniform_viable"), _ACT_SELECT
-
-# Support↔support self-collision point repulsion in support IK. Without it,
-# active envs degrade from 47-77% SC-clean (S1) to 11-26% (S3) on hard objects
-# because support IK pulls fingers toward the surface with no signal to push
-# their links apart. 5mm margin is the proven setting; a 20mm margin (the
-# initial experiment) was too loose to help on any object.
-_IK_SUP_SC = bool(int(os.environ.get("FROGGER_IK_SUP_SC", "0")))
-_IK_SUP_SC_W = float(os.environ.get("FROGGER_IK_SUP_SC_W", "50"))
-_IK_SUP_SC_MARGIN = float(os.environ.get("FROGGER_IK_SUP_SC_MARGIN", "0.005"))
-
 
 # ---------------------------------------------------------------------------
 # SDF grid
@@ -1875,14 +1856,6 @@ class BatchedGraspOptimizer:
             best_score = torch.full((B,), float('inf'), device=dev)
             best_fi = torch.zeros(B, device=dev, dtype=torch.long)
 
-            # When _ACT_SELECT == "uniform_viable", we need every trial's
-            # post-IK state to sample from. argmin mode never reads these.
-            _store_all_trials = (_ACT_SELECT == "uniform_viable" and not _DISABLE_MULTI_ASSIGN)
-            trial_u_list = []         # each: [B, 16]
-            trial_score_list = []     # each: [B]
-            trial_act_dist_list = []  # each: [B]
-            trial_fi_list = []        # each: [B] long
-
             prefixes_ik = ['if', 'mf', 'rf', 'th']
             sfx_ik = [['bs', 'px', 'md']] * 3 + [['mp', 'bs', 'px']]
 
@@ -2004,45 +1977,6 @@ class BatchedGraspOptimizer:
                     best_u_full = torch.where(improved.unsqueeze(-1), u_act.detach(), best_u_full)
                     best_act_dist = torch.where(improved, trial_dist, best_act_dist)
                     best_fi = torch.where(improved, fi_tensor, best_fi)
-
-                    if _store_all_trials:
-                        trial_u_list.append(u_act.detach().clone())
-                        trial_score_list.append(trial_score.clone())
-                        trial_act_dist_list.append(trial_dist.clone())
-                        trial_fi_list.append(fi_tensor.clone())
-
-            # If running in uniform_viable mode, overwrite the argmin choice
-            # with a uniform sample over per-env viable trials. Viable =
-            # score <= max(_ACT_VIABLE_RATIO * min_score, _ACT_VIABLE_FLOOR).
-            # For envs where only one trial is viable (e.g. grinder, only TH
-            # can reach), this collapses back to argmin. For envs with
-            # multiple viable trials (e.g. air_blower), we get topology
-            # diversity at no compute cost — we already ran IK for each.
-            if _store_all_trials and len(trial_score_list) > 0:
-                with torch.no_grad():
-                    all_u = torch.stack(trial_u_list, dim=1)            # [B, T, 16]
-                    all_scores = torch.stack(trial_score_list, dim=1)   # [B, T]
-                    all_dists = torch.stack(trial_act_dist_list, dim=1) # [B, T]
-                    all_fis = torch.stack(trial_fi_list, dim=1)         # [B, T]
-                    min_scores = all_scores.min(dim=1).values           # [B]
-                    threshold = torch.clamp(_ACT_VIABLE_RATIO * min_scores,
-                                            min=_ACT_VIABLE_FLOOR)      # [B]
-                    viable = all_scores <= threshold.unsqueeze(1)       # [B, T]
-                    # Uniform sample by argmax of (rand * viable - inf where !viable).
-                    rand = torch.rand_like(all_scores)
-                    rand = torch.where(viable, rand, torch.full_like(rand, -1.0))
-                    chosen = rand.argmax(dim=1)                         # [B]
-                    bidx = torch.arange(B, device=dev)
-                    best_u_full = all_u[bidx, chosen]
-                    best_score = all_scores[bidx, chosen]
-                    best_act_dist = all_dists[bidx, chosen]
-                    best_fi = all_fis[bidx, chosen]
-                    n_viable_per_env = viable.float().sum(dim=1)
-                    print(f"  [act_select=uniform_viable] viable-trial counts: "
-                          f"min={int(n_viable_per_env.min())}, "
-                          f"mean={n_viable_per_env.mean():.2f}, "
-                          f"max={int(n_viable_per_env.max())} "
-                          f"(threshold med={threshold.median():.4f})")
 
             # Commit best assignment per env
             with torch.no_grad():
@@ -2675,27 +2609,6 @@ class BatchedGraspOptimizer:
                                 pair_pen = F.relu(0.020 - dists) ** 2  # [B, n_sup, n_act]
                                 repulsion = pair_pen.sum(dim=(-2, -1))  # [B]
                                 loss_sup += (sup_finger_mask[:, fi] & mask_fi).float() * 50 * repulsion
-
-                        # Support↔Support SC-point repulsion (cdist on grid samples).
-                        # Enables when FROGGER_IK_SUP_SC=1.
-                        if _IK_SUP_SC:
-                            for fi in range(4):
-                                if not sup_finger_mask[:, fi].any(): continue
-                                sup_i_ranges = finger_sc_ranges.get(fi, [])
-                                if not sup_i_ranges: continue
-                                sup_i_idx = [idx for s, e in sup_i_ranges for idx in range(s, e)]
-                                pts_i = sc_pts_world[:, sup_i_idx]  # [B, n_i, 3]
-                                for fj in range(fi + 1, 4):
-                                    if not sup_finger_mask[:, fj].any(): continue
-                                    sup_j_ranges = finger_sc_ranges.get(fj, [])
-                                    if not sup_j_ranges: continue
-                                    sup_j_idx = [idx for s, e in sup_j_ranges for idx in range(s, e)]
-                                    pts_j = sc_pts_world[:, sup_j_idx]  # [B, n_j, 3]
-                                    dists = torch.cdist(pts_i, pts_j)
-                                    pair_pen = F.relu(_IK_SUP_SC_MARGIN - dists) ** 2
-                                    rep = pair_pen.sum(dim=(-2, -1))
-                                    both = sup_finger_mask[:, fi] & sup_finger_mask[:, fj]
-                                    loss_sup += both.float() * _IK_SUP_SC_W * rep
 
                     # Spread support fingertips apart + diverse normals
                     sup_tips = []
