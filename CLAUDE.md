@@ -50,16 +50,15 @@ Two ablation toggles for offline debugging:
 - `FROGGER_NO_MULTI=1` — force single-assignment IK (skip multi-assign trials)
 - `FROGGER_NO_BASE=1` — freeze base pose during main opt
 
-Two interventions with single-batch evidence, awaiting multi-batch confirmation
-before becoming default behavior:
-- `FROGGER_ACT_SELECT=uniform_viable` — multi-assign topology diversity (vs `argmin` default)
-- `FROGGER_IK_SUP_SC=1` — support↔support SC point-repulsion in support IK
-  (margin defaults to 5 mm, the proven setting; the original 20 mm was falsified)
-
-Falsified, untested-with-no-evidence, and orphaned-debug knobs have been
-deleted from the solver. See git history at commits prior to this point
-(`e61c281` was the last commit with the full set) and memory files
-`project_sc_proj_falsified.md`, `project_sc_loss_inert.md`,
-`project_support_ik_no_sup_sc.md`, `project_cdist5mm_winner.md`,
-`project_sigma_to_feas_gap.md`, `project_full_bottleneck_picture.md`
-for the evidence behind each decision.
+Default behavior is the multi-assign + base-unfreeze pipeline (the v12
+baseline). No other env-var-gated interventions ship with this code —
+attempted interventions (`SC_PROJ`, `OPT_MASK_SC`, `IK_SUP_SC` variants,
+`SC_STRONG`, `NONDS_HINGE`, `ACT_SELECT=uniform_viable`) were either
+falsified, never produced data, or empirically regressed on the 5-object
+benchmark at 3-batch. The pipeline's current open problem is the
+sub-3-feasibles-per-3-batch rate on the hard objects (air_blower,
+hot_glue), driven by a high SC kill rate among l*>0 candidates that the
+main-opt SC loss does not recover. See memory files
+`project_sc_loss_inert.md`, `project_support_ik_no_sup_sc.md`,
+`project_sc_proj_falsified.md`, `project_cdist5mm_winner.md`,
+`project_full_bottleneck_picture.md` for the history.
