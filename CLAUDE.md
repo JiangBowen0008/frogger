@@ -12,79 +12,54 @@ diagnose_lstar_fails.py       # Contact spread analysis for l*-fail grasps
 output/                       # gitignored: grasp .pt files + per-stage metrics
 ```
 
-## Core principles
+<!-- principles:start -->
+## Goal
 
-- Write clean, concise, principled research code.
-- Prefer explicit, fail-fast behavior.
-- No backward-compatibility layers, no per-object tuning knobs.
+A grasp synthesis pipeline that produces physically valid, high-quality grasps on arbitrary objects. Real force closure, no penetration, fingertips on the surface, sensible palm wrapping, actuation finger pointing the right way. The five test objects (grinder, spray, flashlight, air_blower, hot_glue_gun) are a benchmark, not the target.
+
+## Principles
+
+- **Generalization is the point.** No per-object tuning. No hacks specific to one shape. A fix that only helps because we knew the object beforehand does not count.
+
+- **Simplicity over patches.** The pipeline should get shorter when we improve it, not longer. Remove rather than gate behind default-off env vars. Each loss term, each stage, each flag has to earn its place. Audit holistically; don't keep patching.
+
+- **Measure, don't guess.** "X is the bottleneck" needs a measurement of X — an isolated experiment varying only X, or a direct read. Inferences from indirect evidence are speculation; label them so and don't act on them as facts.
+
+- **Fix the hard cases, not the easy ones.** Per-object balance matters more than total count. Grinder going from 10 to 12 is wasted effort while air_blower is at 1.
+
+- **Small experiments before big ones.** If a 20-minute targeted test on broken objects can falsify an idea, run that first. Abort early when there's no signal.
+
+- **Evidence has strength levels.** *Observed* = one run, one seed. *Consistent* = 3+ runs the same direction. *Verified* = multiple independent setups. Do not silently promote.
+
+- **No shortcuts.** Don't loosen feasibility criteria to make more grasps pass. Don't add fallbacks that mask invalid state. Don't add backward-compat shims. The pipeline has to actually be correct.
+
+- **Confirm before tuning.** Before changing a loss weight, verify the loss is actually firing on the cases we care about.
+
+- **Look at the grasps.** Visual plausibility matters. Numbers alone aren't enough — render, look at the geometry, confirm it makes physical sense.
+<!-- principles:end -->
+
+## Repo conventions
+
 - Do not create, edit, move, or delete files under `/tmp` or `/var/tmp`.
+- Entry-point scripts: verb-noun (e.g., `run_batched.py`, `diagnose_lstar.py`). No permanent `*_v2.py`, `*_new.py`, `*_tmp.py` filenames.
+- Grasp outputs → `output/<run_name>/<object>/batch_<N>/`. `output/` is gitignored — don't commit output files.
 
-## Error-handling standard
+## Env vars
 
-- Surface bugs instead of hiding them.
-- Do not use broad or silent error handling.
-- Do not use fallback patterns that quietly mask invalid state.
+Two ablation toggles for offline debugging:
+- `FROGGER_NO_MULTI=1` — force single-assignment IK (skip multi-assign trials)
+- `FROGGER_NO_BASE=1` — freeze base pose during main opt
 
-## Debugging methodology
+Two interventions with single-batch evidence, awaiting multi-batch confirmation
+before becoming default behavior:
+- `FROGGER_ACT_SELECT=uniform_viable` — multi-assign topology diversity (vs `argmin` default)
+- `FROGGER_IK_SUP_SC=1` — support↔support SC point-repulsion in support IK
+  (margin defaults to 5 mm, the proven setting; the original 20 mm was falsified)
 
-- Prioritize root-cause analysis over quick fixes.
-- Do not speculate about causes and then treat the speculation as fact. State uncertainty explicitly ("I suspect X because Y, but we should verify by Z").
-- "X is the bottleneck" requires either an isolated experiment varying only X, or a direct measurement of X. Inferences from indirect evidence do not count.
-- When multiple anomalies coexist, treat them as DISTINCT until you can prove a shared mechanism.
-- Label each result: **verified** (multi-run, controlled), **observed** (single run, uncontrolled), **inferred** (not directly measured). Never promote inferences to verified facts.
-
-## Working style
-
-- Before editing, identify the minimal file set that must change.
-- Before asserting "fixed" or "ruled out", run the command that would falsify the claim and quote its output.
-- Before tuning a loss weight, verify the loss is actually firing (not zero or negligible) for the targeted envs.
-- Test fixes on the targeted/broken objects first. Abort early if no signal rather than waiting for the full 5-object × 3-batch run.
-- Per-object balance over total count. 4 objects × 5 grasps > 1 × 20 + 3 × 0.
-
-## Experiment workflow
-
-- Before launching a run: state the hypothesis and define the expected direction of change per object.
-- After completing: check per-object counts, not just total. Grinder is capped at 10 — don't overweight it.
-- Run single-object 1-batch sanity checks before full 3-batch runs.
-- Do not present results without verifying there were no silent failures (check log for errors, NaN, zero-grad).
-- Intermediate result labels:
-  - **Observed** = single batch, one seed
-  - **Consistent** = 3+ batches same direction
-  - **Verified** = multiple independent runs, consistent direction
-
-## Naming
-
-- Entry-point scripts: verb-noun (e.g., `run_batched.py`, `diagnose_lstar.py`)
-- No permanent `*_v2.py`, `*_new.py`, `*_tmp.py` filenames.
-
-## Output / data paths
-
-- Grasp outputs → `output/<run_name>/<object>/batch_<N>/`
-- Do not commit output files. `output/` is gitignored.
-
-## Current ablation knobs (all env-var gated, defaults preserve baseline)
-
-The current head extends the v12 baseline with several env-var-controlled
-interventions. Read the comments at the top of `batched_pytorch_solver.py`
-for the rationale on each. Recommended config for hard-object investigation:
-
-```
-FROGGER_ACT_SELECT=uniform_viable    # multi-assign topology diversity (proven; v12 air_blower 0→? per batch)
-FROGGER_IK_SUP_SC=1                   # support↔support SC point-repulsion in support IK
-FROGGER_IK_SUP_SC_MARGIN=0.005        # 5mm margin (20mm default was too loose; cdist5mm proved 5mm doubles air_blower l*>0)
-FROGGER_NONDS_HINGE=1                 # deep-pen quadratic hinge on max non-ds penetration (hypothesis: closes σ→feas gap)
-```
-
-Falsified interventions (kept as env vars for reproducibility, default OFF):
-- `FROGGER_SC_PROJ_ITERS>0`: P-variant SC projection fights surf-projection
-- `FROGGER_IK_SUP_SC_MARGIN=0.020`: too loose; no help
-- `FROGGER_OPT_MASK_SC=-0.003`: pre-opt SC filter; no help
-
-Untested (default OFF):
-- `FROGGER_SC_STRONG=1`: linear+quadratic SC loss every step in main opt
-- `FROGGER_IK_SUP_SC_BBOX=1`: box-box SDF version of support↔support repulsion (crashed in initial test; needs investigation)
-
-See memory files `project_act_fi_selection_bias.md`, `project_cdist5mm_winner.md`,
-`project_sigma_to_feas_gap.md`, `project_sc_loss_inert.md`,
-`project_support_ik_no_sup_sc.md`, `project_sc_proj_falsified.md` for the
-evidence and reasoning behind each.
+Falsified, untested-with-no-evidence, and orphaned-debug knobs have been
+deleted from the solver. See git history at commits prior to this point
+(`e61c281` was the last commit with the full set) and memory files
+`project_sc_proj_falsified.md`, `project_sc_loss_inert.md`,
+`project_support_ik_no_sup_sc.md`, `project_cdist5mm_winner.md`,
+`project_sigma_to_feas_gap.md`, `project_full_bottleneck_picture.md`
+for the evidence behind each decision.
