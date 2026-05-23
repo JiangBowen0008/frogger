@@ -950,7 +950,6 @@ class BatchedGraspOptimizer:
         For Allegro: falls back to mesh vertex sampling (original approach).
         """
         from scipy.spatial.transform import Rotation as ScipyR
-        import xml.etree.ElementTree as ET
 
         tip_set = set(self.tip_link_names)
 
@@ -1458,7 +1457,6 @@ class BatchedGraspOptimizer:
             # sc box-box SDF (only if box primitives exist)
             sc_worst = torch.full((B,), 1.0, device=dev)
             if hasattr(self, '_box_primitives'):
-                from collections import defaultdict
                 _prefix = f"leap_{self.hand}_"
                 _adj = {('palm','if_bs'),('palm','mf_bs'),('palm','rf_bs'),('palm','th_mp'),
                         ('if_bs','if_px'),('if_px','if_md'),('if_md','if_ds'),
