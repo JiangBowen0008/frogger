@@ -2746,7 +2746,23 @@ class BatchedGraspOptimizer:
                            & (worst_sup_link > -0.005) & (worst_act_link > -0.010))
                 n_opt = opt_mask.sum().item()
                 n_act_filtered = ((worst_act_link <= -0.010) & (act_d < 0.010)).sum().item()
-                print(f"  Optimization candidates: {n_opt}/{B} ({n_act_filtered} filtered by act collision)")
+                # SC pre-filter: envs whose support fingers already self-collide
+                # by more than 10 mm at the end of support IK cannot recover
+                # SC > -1 mm in main opt (the SC loss is structurally weak; see
+                # project_sc_loss_inert.md). Filter them out before optimization
+                # to avoid spending compute on lost causes and to keep the
+                # ranking pool clean.
+                n_sc_filtered = 0
+                if hasattr(self, '_metrics_log'):
+                    s3 = self._metrics_log.get('S3_after_support_ik')
+                    if s3 is not None and 'sc_worst' in s3:
+                        sc_pass = torch.as_tensor(s3['sc_worst'], device=dev) > -0.010
+                        before = opt_mask.sum().item()
+                        opt_mask = opt_mask & sc_pass
+                        n_sc_filtered = before - opt_mask.sum().item()
+                        n_opt = opt_mask.sum().item()
+                print(f"  Optimization candidates: {n_opt}/{B} ({n_act_filtered} filtered by act collision"
+                      + (f", {n_sc_filtered} filtered by sc<-10mm" if n_sc_filtered else "") + ")")
 
             if n_opt > 0:
                 # Build support masks
