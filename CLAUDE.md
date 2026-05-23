@@ -50,15 +50,35 @@ Two ablation toggles for offline debugging:
 - `FROGGER_NO_MULTI=1` — force single-assignment IK (skip multi-assign trials)
 - `FROGGER_NO_BASE=1` — freeze base pose during main opt
 
-Default behavior is the multi-assign + base-unfreeze pipeline (the v12
-baseline). No other env-var-gated interventions ship with this code —
-attempted interventions (`SC_PROJ`, `OPT_MASK_SC`, `IK_SUP_SC` variants,
-`SC_STRONG`, `NONDS_HINGE`, `ACT_SELECT=uniform_viable`) were either
-falsified, never produced data, or empirically regressed on the 5-object
-benchmark at 3-batch. The pipeline's current open problem is the
-sub-3-feasibles-per-3-batch rate on the hard objects (air_blower,
-hot_glue), driven by a high SC kill rate among l*>0 candidates that the
-main-opt SC loss does not recover. See memory files
+Default behavior is the multi-assign + base-unfreeze pipeline. No other
+env-var-gated interventions ship with this code — attempted interventions
+(`SC_PROJ`, `IK_SUP_SC`, `SC_STRONG`, `NONDS_HINGE`,
+`ACT_SELECT=uniform_viable`) were either falsified or empirically
+neutral/regressing once measured against the FC-corrected baseline.
+
+## Honest baseline (3-batch × 4000 envs, with FC gate)
+
+```
+grinder      30  [10, 10, 10]   (caps at 10/batch)
+spray         3  [2, 1, 0]
+flashlight    5  [0, 4, 1]
+air_blower    1  [1, 0, 0]
+hot_glue      0  [0, 0, 0]
+TOTAL        39
+```
+
+Before commit `4ba5749`, the feasibility check used only `sigma_min > 0.01`
+as the FC gate — full-rank G is necessary but not sufficient. 44% of v12
+"feasibles" had `l_star = -1` (LP infeasible — no actual force closure):
+spray 84% phantom, flashlight 74%, hot_glue 100%. The fix adds
+`l_star > 0` to the feasibility expression. See
+`project_fc_gate_bug_2026-05-23.md`.
+
+## Open problem
+
+Hard objects (air_blower, hot_glue) produce <2 real feasibles per
+3-batch. The main bottleneck is high SC kill among l\*>0 candidates;
+main-opt SC loss is empirically inert. See memory files
 `project_sc_loss_inert.md`, `project_support_ik_no_sup_sc.md`,
-`project_sc_proj_falsified.md`, `project_cdist5mm_winner.md`,
-`project_full_bottleneck_picture.md` for the history.
+`project_sc_proj_falsified.md`, `project_full_bottleneck_picture.md`,
+`project_hot_glue_distinct_from_air_blower.md`.
