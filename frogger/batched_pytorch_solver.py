@@ -3730,7 +3730,8 @@ class BatchedGraspOptimizer:
                             & (ds_pad_worst > -0.005)  # 5mm pad-side ds pen
                             & (sup_clearance_worst >= 0.0)  # support MUST NOT enter clearance
                             & (sc_worst_sdf > -0.001)  # box-box SDF > -1mm
-                            & (sigma_all > 0.01))  # force closure
+                            & (sigma_all > 0.01)  # grasp matrix full rank (necessary for FC)
+                            & (final_lstars_t > 0))  # FC LP feasible (sufficient for FC)
                 if n_act:
                     feasible = feasible & (act_dist < 0.010)  # 10mm actuation
 
