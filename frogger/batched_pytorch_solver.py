@@ -1794,7 +1794,14 @@ class BatchedGraspOptimizer:
             z_hat = F.normalize(z_hat, dim=-1)
             R_base = torch.stack([x_hat, y_hat, z_hat], dim=-1)  # [B, 3, 3]
 
-            d = 0.02 * torch.rand(B, device=dev)  # [0, 2cm]
+            # Palm-to-surface distance: was [0, 2cm], now [0, 5cm]. Tight palm
+            # (close to surface) forces fingers to wrap tight and proximal links
+            # to dig into the object for thick bodies (air_blower body 65mm).
+            # Wider range gives some envs the "loose wrap" geometry where the
+            # palm sits farther out and fingers stretch over the body without
+            # link penetration. Hard objects need this; easy small objects
+            # (grinder) still work at small d.
+            d = 0.05 * torch.rand(B, device=dev)
             target = surf_pts + d.unsqueeze(-1) * outward_normals
 
         # 5) Store rotation (no noise — canonical poses are exact)
