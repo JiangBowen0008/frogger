@@ -1889,7 +1889,7 @@ class BatchedGraspOptimizer:
                 # mean-over-points collision. Two-phase was a workaround for
                 # the loss-balance bug; now that the balance is correct we
                 # don't need the phase split.
-                total_ik_steps = 150
+                total_ik_steps = 250
 
                 for ik_step in range(total_ik_steps):
                     opt_act.zero_grad()
