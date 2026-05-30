@@ -30,7 +30,7 @@ def find_mesh(name):
 
 
 def run_batch(name, mesh_path, actuation_targets, X_WO, obj_center, offset,
-              batch_i, num_envs, out_dir, seed_offset=0):
+              batch_i, num_envs, out_dir, seed_offset=0, variant="P"):
     mesh = trimesh.load(mesh_path, force="mesh")
     sdf = BatchedSDF(mesh, X_WO, bounds_padding=0.15, resolution=128, device="cuda")
     sdf.add_clearance_volume(actuation_targets[0][0], actuation_targets[0][1],
@@ -56,7 +56,7 @@ def run_batch(name, mesh_path, actuation_targets, X_WO, obj_center, offset,
         steps=300, lr=0.005,
         save_path=os.path.join(batch_out, "grasps.pt"),
         opt_sections="ABCD",
-        opt_variant="P",
+        opt_variant=variant,
     )
     return results
 
@@ -71,6 +71,9 @@ def main():
                     help="Add this offset to the per-batch seed. Use a "
                          "different value to get cross-seed independent runs "
                          "for 'Consistent' evidence per CLAUDE.md.")
+    ap.add_argument("--variant", default="P", choices=["A", "P"],
+                    help="Opt variant: P = with projected gradient descent on "
+                         "tip-surface (default); A = no projection.")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -114,7 +117,7 @@ def main():
                 with contextlib.redirect_stdout(tee):
                     r = run_batch(name, mesh_path, actuation_targets, X_WO, obj_center,
                                   offset, bi, args.num_envs, args.out_dir,
-                                  seed_offset=args.seed_offset)
+                                  seed_offset=args.seed_offset, variant=args.variant)
                 for g in r:
                     g["batch_idx"] = bi
                     all_results.append(g)
