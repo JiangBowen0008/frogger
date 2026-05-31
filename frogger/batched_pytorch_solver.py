@@ -2804,7 +2804,7 @@ class BatchedGraspOptimizer:
                             sup_col_idx_ds[fi].append((ci, cnm))
 
                 if opt_variant in ("A", "P"):
-                    # ── Simple Adam loop (all variants A/B/C/P) ──
+                    # ── Adam loop (variants A and P) ──
                     # Variant P additionally projects onto the surface constraint
                     # after each Adam step (hard constraint on fingertip contact)
                     # AND unfreezes base pose (translation+rotation) so the whole
