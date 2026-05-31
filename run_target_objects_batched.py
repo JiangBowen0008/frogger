@@ -55,7 +55,6 @@ def run_batch(name, mesh_path, actuation_targets, X_WO, obj_center, offset,
         object_center=obj_center,
         steps=300, lr=0.005,
         save_path=os.path.join(batch_out, "grasps.pt"),
-        opt_sections="ABCD",
         opt_variant=variant,
     )
     return results

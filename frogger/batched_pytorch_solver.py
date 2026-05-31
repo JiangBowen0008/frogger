@@ -308,48 +308,6 @@ def box_box_sdf_batch(centers_A, rots_A, half_A, centers_B, rots_B, half_B):
     return sdf
 
 
-# Legacy sampling-based version kept for reference / ablation.
-def box_box_sdf_sampled(centers_A, rots_A, half_A, centers_B, rots_B, half_B):
-    """Old sampling-based box-box SDF (27 pts per box queried against other)."""
-    B = centers_A.shape[0]
-    dev = centers_A.device
-
-    def _make_sample_offsets():
-        """Center + 8 corners + 6 face centers + 12 edge midpoints = 27 points."""
-        pts = [[0, 0, 0]]  # center
-        # 8 corners
-        for sx in [-1, 1]:
-            for sy in [-1, 1]:
-                for sz in [-1, 1]:
-                    pts.append([sx, sy, sz])
-        # 6 face centers
-        for dim in range(3):
-            for s in [-1, 1]:
-                p = [0, 0, 0]; p[dim] = s; pts.append(p)
-        # 12 edge midpoints
-        for d1 in range(3):
-            for d2 in range(d1+1, 3):
-                for s1 in [-1, 1]:
-                    for s2 in [-1, 1]:
-                        p = [0, 0, 0]; p[d1] = s1; p[d2] = s2; pts.append(p)
-        return torch.tensor(pts, dtype=torch.float32, device=dev)  # [27, 3]
-
-    offsets = _make_sample_offsets()  # [27, 3]
-
-    def _query_pts_in_box(pts_offsets, pts_center, pts_rot, pts_half, tgt_center, tgt_rot, tgt_half):
-        """Generate sample points from source box, query against target box SDF."""
-        # World points: center + rot @ (offsets * half)
-        local = pts_offsets.unsqueeze(0) * pts_half.unsqueeze(1)  # [B, 27, 3]
-        world = pts_center.unsqueeze(1) + torch.bmm(pts_rot, local.transpose(1, 2)).transpose(1, 2)
-        return box_sdf_batch(world, tgt_center, tgt_rot, tgt_half)  # [B, 27]
-
-    sdf_B_in_A = _query_pts_in_box(offsets, centers_B, rots_B, half_B, centers_A, rots_A, half_A)
-    sdf_A_in_B = _query_pts_in_box(offsets, centers_A, rots_A, half_A, centers_B, rots_B, half_B)
-
-    all_sdf = torch.cat([sdf_B_in_A, sdf_A_in_B], dim=1)  # [B, 54]
-    return all_sdf.min(dim=1).values  # [B]
-
-
 def compute_primitive_forces_torch(ns: int, mu: float, device="cuda"):
     """Pyramidal friction cone approximation.  Returns F [3, ns]."""
     nums = torch.arange(ns, dtype=torch.float32, device=device)
@@ -2182,11 +2140,13 @@ class BatchedGraspOptimizer:
         mu: float = 0.5,
         ns: int = 4,
         save_path: Optional[str] = None,
-        opt_sections: str = "ABCD",
-        opt_variant: str = "PGD",
+        opt_variant: str = "P",
         trajectory_log: Optional[list] = None,
     ):
         """Optimise grasps using the FRoGGeR formulation.
+
+        opt_variant: "P" (projected gradient descent on tip-surface, default)
+                     or "A" (no projection). Other variants have been removed.
 
         Phase 1: Get fingertips onto the object surface (SDF-based).
         Phase 2: Maximise the min-weight metric l* for force closure while
@@ -2201,6 +2161,7 @@ class BatchedGraspOptimizer:
             ns: number of friction cone pyramid sides
             save_path: if given, save results to this .pt file
         """
+        assert opt_variant in ("A", "P"), opt_variant
         n_act = len(actuation_targets)
         B, dev = self.num_envs, self.device
         # Stage timing: torch.cuda.synchronize before each time.time() so we
@@ -2842,7 +2803,7 @@ class BatchedGraspOptimizer:
                         if cnm == cnm_ds:
                             sup_col_idx_ds[fi].append((ci, cnm))
 
-                if opt_variant in ("A", "B", "C", "P"):
+                if opt_variant in ("A", "P"):
                     # ── Simple Adam loop (all variants A/B/C/P) ──
                     # Variant P additionally projects onto the surface constraint
                     # after each Adam step (hard constraint on fingertip contact)
@@ -2943,24 +2904,6 @@ class BatchedGraspOptimizer:
                                     deep_pen = F.relu(-p_sdf - 0.003)
                                     total_loss += sup_finger_mask_opt[:, fi].float() * 2000 * deep_pen ** 2
 
-                        elif opt_variant in ("B", "C"):
-                            # Min-k unified: for ds links, query ALL collision points,
-                            # take k lowest |SDF|, loss = sum(SDF^2) — pulls tips to surface
-                            for fi in range(4):
-                                if not sup_finger_mask_opt[:, fi].any(): continue
-                                # ds (fingertip) link: min-k SDF^2 (both push out AND pull in)
-                                for ci, cnm in sup_col_idx_ds[fi]:
-                                    lp = self._col_data[ci][1]
-                                    if cnm not in fk_o: continue
-                                    lwT = bT_o @ fk_o[cnm].get_matrix()
-                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)  # [B, N, 3]
-                                    lsdf = self.sdf.query(lwp)  # [B, N]
-                                    # Take k points with lowest |SDF| (closest to surface)
-                                    k = min(mink_k, lsdf.shape[1])
-                                    _, topk_idx = lsdf.abs().topk(k, dim=1, largest=False)
-                                    topk_sdf = lsdf.gather(1, topk_idx)  # [B, k]
-                                    total_loss += sup_finger_mask_opt[:, fi].float() * 200 * (topk_sdf ** 2).sum(dim=1)
-
                         # ── Section B: Collision loss ──
                         if opt_variant in ("A", "P"):
                             # B1: relu(-SDF) for non-ds links
@@ -3006,22 +2949,6 @@ class BatchedGraspOptimizer:
                                         pen_pad = F.relu(-lsdf_p - 0.003).max(-1).values
                                         total_loss += sup_finger_mask_opt[:, fi].float() * 1000 * pen_pad
 
-                        elif opt_variant in ("B", "C"):
-                            # Min-k for non-ds links: take k lowest SDF, loss = relu(-SDF)^2
-                            # Only push OUT, don't pull in (these links shouldn't touch)
-                            for fi in range(4):
-                                if not sup_finger_mask_opt[:, fi].any(): continue
-                                for ci, cnm in sup_col_idx[fi]:
-                                    lp = self._col_data[ci][1]
-                                    if cnm not in fk_o: continue
-                                    lwT = bT_o @ fk_o[cnm].get_matrix()
-                                    lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                    lsdf = self.sdf.query(lwp)  # [B, N]
-                                    k = min(mink_k, lsdf.shape[1])
-                                    _, topk_idx = lsdf.topk(k, dim=1, largest=False)  # lowest SDF
-                                    topk_sdf = lsdf.gather(1, topk_idx)
-                                    total_loss += sup_finger_mask_opt[:, fi].float() * 500 * (F.relu(-topk_sdf) ** 2).sum(dim=1)
-
                         # ── Section C: Force closure (σ_min) ──
                         if opt_step >= fc_start_step:
                             all_tips = torch.stack([
@@ -3040,25 +2967,7 @@ class BatchedGraspOptimizer:
                                 if not group_mask.any(): continue
                                 sup_fi = [fi for fi in range(4) if fi != act_fi]
 
-                                if opt_variant == "C":
-                                    # Variant C: use min-k contact point as FC location
-                                    fc_pts = []
-                                    for fi in sup_fi:
-                                        # Find collision point with lowest |SDF| on ds link
-                                        best_pt = all_tips[:, fi]  # fallback to tip offset
-                                        for ci, cnm in sup_col_idx_ds[fi]:
-                                            lp = self._col_data[ci][1]
-                                            if cnm not in fk_o: continue
-                                            lwT = bT_o @ fk_o[cnm].get_matrix()
-                                            lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                            lsdf = self.sdf.query(lwp)  # [B, N]
-                                            # Index of point with lowest |SDF| per env
-                                            min_idx = lsdf.abs().argmin(dim=1)  # [B]
-                                            best_pt = lwp[torch.arange(B, device=dev), min_idx]  # [B, 3]
-                                        fc_pts.append(best_pt)
-                                else:
-                                    # Variants A, B: use fixed tip offset
-                                    fc_pts = [all_tips[:, fi] for fi in sup_fi]
+                                fc_pts = [all_tips[:, fi] for fi in sup_fi]
 
                                 if palm_pt is not None:
                                     fc_pts.append(palm_pt)
@@ -3350,207 +3259,6 @@ class BatchedGraspOptimizer:
                                         "sigma": sig_val,
                                     })
 
-                else:
-                    # ── Original PGD optimization (uses sigmoid u-space) ──
-                    u_opt = self.u.detach().clone().requires_grad_(True)
-                    lr_fc = 0.01
-                    lr_proj = 0.02
-                    proj_iters = 2
-                    print(f"  PGD optimization ({opt_steps} steps, lr_fc={lr_fc}, proj={proj_iters}x{lr_proj})")
-
-                    for opt_step in range(opt_steps):
-                        bT_o = self._base_T(self.pos.detach(), self.rot6d.detach())
-
-                        # Phase A: FC gradient step
-                        u_opt.requires_grad_(True)
-                        q_o = self._u2q(u_opt)
-                        fk_o = self.chain.forward_kinematics(q_o)
-
-                        fc_loss = torch.zeros(B, device=dev)
-                        all_tips = torch.stack([
-                            (bT_o @ fk_o[self.tip_link_names[fi]].get_matrix()
-                             @ torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)]).unsqueeze(-1)
-                            ).squeeze(-1)[:, :3]
-                            for fi in range(4)], dim=1)
-                        palm_pt = None
-                        if self.palm_contact and self.palm_link in fk_o:
-                            wT_palm = bT_o @ fk_o[self.palm_link].get_matrix()
-                            palm_oh = torch.cat([self.palm_offset, torch.ones(1, device=dev)])
-                            palm_pt = (wT_palm @ palm_oh.unsqueeze(-1)).squeeze(-1)[:, :3]
-
-                        for act_fi in range(4):
-                            group_mask = opt_mask & (self.amap_t[:, 0] == act_fi)
-                            if not group_mask.any(): continue
-                            sup_fi = [fi for fi in range(4) if fi != act_fi]
-                            fc_pts = [all_tips[:, fi] for fi in sup_fi]
-                            if palm_pt is not None:
-                                fc_pts.append(palm_pt)
-                            nc_fc = len(fc_pts)
-                            tp_fc = torch.stack(fc_pts, dim=1)
-                            gx = (self.sdf.query(tp_fc+fd_ofst[0])-self.sdf.query(tp_fc-fd_ofst[0]))/(2*eps_fd)
-                            gy = (self.sdf.query(tp_fc+fd_ofst[1])-self.sdf.query(tp_fc-fd_ofst[1]))/(2*eps_fd)
-                            gz = (self.sdf.query(tp_fc+fd_ofst[2])-self.sdf.query(tp_fc-fd_ofst[2]))/(2*eps_fd)
-                            tn = -torch.stack([gx,gy,gz],dim=-1)
-                            tn = tn / tn.norm(dim=-1,keepdim=True).clamp(min=1e-8)
-                            g_OCs = compute_contact_frames(tp_fc, tn)
-                            G = compute_grasp_matrix_torch(g_OCs)
-                            W = compute_wrench_matrix(G, F_prim, nc_fc, ns)
-                            s = torch.linalg.svdvals(W)[:, -1]
-                            sigma[group_mask] = s[group_mask].detach()
-                            fc_loss += group_mask.float() * (-s)
-
-                        fc_loss += 100 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
-
-                        fc_loss.mean().backward()
-                        with torch.no_grad():
-                            grad_fc = u_opt.grad.clone()
-                            grad_fc[~opt_joint_mask] = 0.0
-
-                        # Tangent projection
-                        u_tang = u_opt.detach().requires_grad_(True)
-                        q_tang = self._u2q(u_tang)
-                        fk_tang = self.chain.forward_kinematics(q_tang)
-                        surf_sq = torch.zeros(B, device=dev)
-                        for fi in range(4):
-                            if not sup_finger_mask_opt[:, fi].any(): continue
-                            nm = self.tip_link_names[fi]
-                            wT = bT_o @ fk_tang[nm].get_matrix()
-                            off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
-                            tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                            tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
-                            surf_sq += sup_finger_mask_opt[:, fi].float() * tip_sdf ** 2
-                        surf_sq.mean().backward()
-                        with torch.no_grad():
-                            grad_surf = u_tang.grad.clone()
-                            grad_surf[~opt_joint_mask] = 0.0
-                            dot = (grad_fc * grad_surf).sum(-1, keepdim=True)
-                            surf_sq_norm = (grad_surf * grad_surf).sum(-1, keepdim=True).clamp(min=1e-12)
-                            grad_tangent = grad_fc - (dot / surf_sq_norm) * grad_surf
-                            u_opt = (u_opt.detach() - lr_fc * grad_tangent).detach()
-
-                        # Phase B: Project onto constraints
-                        for pi in range(proj_iters):
-                            u_opt.requires_grad_(True)
-                            q_p = self._u2q(u_opt)
-                            fk_p = self.chain.forward_kinematics(q_p)
-                            bT_p = bT_o
-
-                            proj_loss = torch.zeros(B, device=dev)
-                            for fi in range(4):
-                                if not sup_finger_mask_opt[:, fi].any(): continue
-                                nm = self.tip_link_names[fi]
-                                wT = bT_p @ fk_p[nm].get_matrix()
-                                off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
-                                tip = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                                tip_sdf = self.sdf.query(tip.unsqueeze(1)).squeeze(1)
-                                proj_loss += sup_finger_mask_opt[:, fi].float() * 500 * tip_sdf ** 2
-
-                            for fi in range(4):
-                                if not sup_finger_mask_opt[:, fi].any(): continue
-                                for ci, cnm in sup_col_idx[fi]:
-                                    lp = self._col_data[ci][1]
-                                    if cnm in fk_p:
-                                        lwT = bT_p @ fk_p[cnm].get_matrix()
-                                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                        lsdf = self.sdf.query(lwp)
-                                        proj_loss += sup_finger_mask_opt[:, fi].float() * 200 * F.relu(-lsdf).max(-1).values ** 2
-
-                            # PGD Phase B: Fingertip ds collision (push out, allow 1mm)
-                            for fi in range(4):
-                                if not sup_finger_mask_opt[:, fi].any(): continue
-                                for ci, cnm in sup_col_idx_ds[fi]:
-                                    lp = self._col_data[ci][1]
-                                    if cnm in fk_p:
-                                        lwT = bT_p @ fk_p[cnm].get_matrix()
-                                        lwp = (lwT @ lp.T)[:, :3, :].transpose(1, 2)
-                                        lsdf = self.sdf.query(lwp)
-                                        deep_pen = F.relu(-lsdf - 0.001)
-                                        proj_loss += sup_finger_mask_opt[:, fi].float() * 500 * deep_pen.sum(-1)
-
-                            sc_pts = self._get_sc_points(fk_p, bT_p)
-                            if sc_pts is not None:
-                                for sc_i1, sc_i2 in self._self_col_pairs:
-                                    d = torch.cdist(sc_pts[:, sc_i1], sc_pts[:, sc_i2])
-                                    min_d = d.min(-1).values.min(-1).values
-                                    proj_loss += opt_mask.float() * 100 * F.relu(0.005 - min_d) ** 2
-
-                            proj_loss += 500 * ((u_opt - self.u.detach()) ** 2 * (~opt_joint_mask).float()).sum(-1)
-
-                            proj_loss.mean().backward()
-                            with torch.no_grad():
-                                u_opt.grad[~opt_joint_mask] = 0.0
-                                u_opt = (u_opt - lr_proj * u_opt.grad).detach()
-
-                        # Logging
-                        if opt_step % 50 == 0:
-                            with torch.no_grad():
-                                q_e = self._u2q(u_opt)
-                                bT_e = self._base_T(self.pos, self.rot6d)
-                                fk_e = self.chain.forward_kinematics(q_e)
-                                sup_sdf = []
-                                for fi in range(4):
-                                    nm = self.tip_link_names[fi]
-                                    wT = bT_e @ fk_e[nm].get_matrix()
-                                    off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
-                                    tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[:, :3]
-                                    sup_sdf.append(self.sdf.query(tp.unsqueeze(1)).squeeze(1).abs())
-                                sup_sdf = torch.stack(sup_sdf, dim=1)
-                                se = sup_sdf[opt_mask].mean().item() if opt_mask.any() else 0
-                                sig_val = sigma[opt_mask].mean().item() if opt_mask.any() else 0
-                                print(f"    pgd {opt_step}: surf={se*1000:.1f}mm sigma={sig_val:.4f}")
-                                if trajectory_log is not None:
-                                    trajectory_log.append({
-                                        "step": opt_step,
-                                        "surface_mm": se * 1000,
-                                        "sigma": sig_val,
-                                    })
-
-                with torch.no_grad():
-                    # Convert direct-q back to u-space for consistency
-                    self.u = self._q2u(q_opt.detach()).requires_grad_(True)
-                    # Write back optimised base pose so downstream FK sees it.
-                    if pos_opt is not None and rot6d_opt is not None:
-                        self.pos = pos_opt.detach().clone().requires_grad_(True)
-                        self.rot6d = rot6d_opt.detach().clone().requires_grad_(False)
-
-                # Rank by combined quality: low surface SDF + low collision + high σ_min
-                with torch.no_grad():
-                    q_rank = self._u2q(self.u)
-                    bT_rank = self._base_T(self.pos, self.rot6d)
-                    fk_rank = self.chain.forward_kinematics(q_rank)
-                    rank_score = torch.full((B,), -1e9, device=dev)
-                    for b in range(B):
-                        if not opt_mask[b]: continue
-                        act_fi = self.amap[b, 0]
-                        # Support tip surface quality (lower = better)
-                        tip_err = 0
-                        for fi in range(4):
-                            if fi == act_fi: continue
-                            nm = self.tip_link_names[fi]
-                            wT = bT_rank @ fk_rank[nm].get_matrix()
-                            off_h = torch.cat([self.tip_offsets[fi], torch.ones(1, device=dev)])
-                            tp = (wT @ off_h.unsqueeze(-1)).squeeze(-1)[b, :3]
-                            tip_err += self.sdf.query(tp.reshape(1,1,3)).abs().item()
-                        # Support link collision (lower = better)
-                        col_count = 0
-                        for fi in range(4):
-                            if fi == act_fi: continue
-                            for ci, cnm in sup_col_idx[fi]:
-                                lp = self._col_data[ci][1]
-                                if cnm in fk_rank:
-                                    lwT = bT_rank @ fk_rank[cnm].get_matrix()
-                                    lwp = (lwT @ lp.T)[b:b+1, :3, :].transpose(1, 2)
-                                    lsv = self.sdf.query(lwp)
-                                    col_count += (lsv < 0).sum().item()
-                        # Score: higher = better
-                        rank_score[b] = -tip_err * 100 - col_count * 0.01
-                        if sigma is not None:
-                            rank_score[b] += sigma[b].item() * 10
-
-                    self._opt_quality_order = rank_score.argsort(descending=True)
-                    self._final_order = self._opt_quality_order.clone()
-                    top5 = self._opt_quality_order[:5]
-                    print(f"  Top 5 quality scores: {[f'{rank_score[i].item():.2f}' for i in top5]}")
                 _tock("stage_main_opt", "_t_mainopt")
                 _tick("_t_feas")
 
