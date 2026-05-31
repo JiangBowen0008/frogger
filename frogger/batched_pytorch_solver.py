@@ -1728,7 +1728,11 @@ class BatchedGraspOptimizer:
             valid_mask = pool_pts[:, 2] > z_cutoff
             valid_pts = pool_pts[valid_mask] if valid_mask.sum() >= B else pool_pts
 
-            n_uniform = B // 2
+            # 70/30 split (was 50/50): more uniform palm placements help
+            # multi-region objects (air_blower) where palm-near-trigger leaves
+            # supports unable to reach the body. Keep some biased samples for
+            # small objects whose trigger requires palm proximity.
+            n_uniform = int(B * 0.7)
             n_biased = B - n_uniform
             # Uniform half
             idx_uniform = torch.randint(0, valid_pts.shape[0], (n_uniform,), device=dev)
