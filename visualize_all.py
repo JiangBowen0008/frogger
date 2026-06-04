@@ -11,35 +11,37 @@ from scipy.spatial.transform import Rotation
 
 from frogger.batched_pytorch_solver import _visual_meshes, _link_names
 
-ASSETS = "/home/bowenj/Projects/DexFun/assets"
-GRASP_DIR = "output/grasps"
+ASSETS = "/media/bowenj/DATA/projects/DexFun/assets"
+# Default: latest 3-batch run with all wins (palm-d 0-5cm, IK 250, surf_pt 70/30)
+GRASP_DIR = "output/v34_split_70_30_3batch"
 
 OBJECTS = {
-    "spray_bottle": {
-        "mesh": f"{ASSETS}/mesh_obj/black_spray_bottle_single/object.obj",
-        "grasp": f"{GRASP_DIR}/black_spray_bottle_single_leap_rh.pt",
+    "grinder": {
+        "mesh": f"{ASSETS}/mesh_obj/grinder/object.obj",
+        "grasp": f"{GRASP_DIR}/grinder/grasps_pooled.pt",
     },
-    "hot_glue_gun": {
-        "mesh": f"{ASSETS}/mesh_obj/hot_glue_gun/object.obj",
-        "grasp": f"{GRASP_DIR}/hot_glue_gun_leap_rh.pt",
+    "spray_bottle": {
+        "mesh": f"{ASSETS}/mesh_obj/funky_clear_spray_bottle/object.obj",
+        "grasp": f"{GRASP_DIR}/funky_clear_spray_bottle/grasps_pooled.pt",
+    },
+    "flashlight": {
+        "mesh": f"{ASSETS}/mesh_obj/flashlight/object.obj",
+        "grasp": f"{GRASP_DIR}/flashlight/grasps_pooled.pt",
     },
     "air_blower": {
         "mesh": f"{ASSETS}/mesh_obj/air_blower/object.obj",
-        "grasp": f"{GRASP_DIR}/air_blower_leap_rh.pt",
+        "grasp": f"{GRASP_DIR}/air_blower/grasps_pooled.pt",
     },
-    "syrup_pourer": {
-        "mesh": f"{ASSETS}/mesh_obj/syrup_pourer_single/object.obj",
-        "grasp": f"{GRASP_DIR}/syrup_pourer_single_leap_rh.pt",
-    },
-    "clamp": {
-        "mesh": f"{ASSETS}/mesh_obj/clamp_single/object.obj",
-        "grasp": f"{GRASP_DIR}/clamp_single_leap_rh.pt",
-    },
-    "grinder": {
-        "mesh": f"{ASSETS}/mesh_obj/grinder/object.obj",
-        "grasp": f"{GRASP_DIR}/grinder_leap_rh.pt",
+    "hot_glue_gun": {
+        "mesh": f"{ASSETS}/mesh_obj/hot_glue_gun/object.obj",
+        "grasp": f"{GRASP_DIR}/hot_glue_gun/grasps_pooled.pt",
     },
 }
+
+
+def is_real_feasible(g):
+    """REAL feasibility: passes all gates including FC LP (l_star > 0)."""
+    return g.get("feasible", False) and g.get("l_star", -1) > 0
 
 
 def load_object(mesh_path):
@@ -98,11 +100,16 @@ def main():
             print(f"  Skipping {name}: missing files")
             continue
         verts_W, faces, X_WO = load_object(info["mesh"])
-        results = torch.load(info["grasp"], weights_only=False)
+        all_results = torch.load(info["grasp"], weights_only=False)
+        # Filter to REAL feasibles only — passes all gates including FC LP
+        results = [g for g in all_results if is_real_feasible(g)]
+        if not results:
+            print(f"  Skipping {name}: 0 REAL feasibles (of {len(all_results)} total)")
+            continue
         obj_data[name] = {
             "verts": verts_W, "faces": faces, "results": results,
         }
-        print(f"  Loaded {name}: {len(results)} grasps")
+        print(f"  Loaded {name}: {len(results)} REAL feasible grasps (of {len(all_results)} total)")
 
     obj_names = list(obj_data.keys())
     if not obj_names:
