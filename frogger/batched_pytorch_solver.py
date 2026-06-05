@@ -2137,7 +2137,7 @@ class BatchedGraspOptimizer:
         object_center: np.ndarray,
         steps: int = 800,
         lr: float = 0.005,
-        mu: float = 0.5,
+        mu: float = 0.7,
         ns: int = 4,
         save_path: Optional[str] = None,
         opt_variant: str = "P",
