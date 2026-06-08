@@ -2305,9 +2305,14 @@ class BatchedGraspOptimizer:
                       f"-{n_palm_fail} palm)")
 
             if n_good > 0:
-                # Diversify support finger CMC to avoid the actuation finger.
-                # Adjacent fingers at same CMC overlap (45mm fixed distance).
-                # Need at least ~1 radian CMC difference for separation.
+                # Randomize support finger joint init across the FULL valid
+                # range. Each env independently samples a starting topology,
+                # which lets surface-seek + tip-tip distance + normal diversity
+                # explore different basins (some envs end as body wraps, some
+                # as semi-wraps, some as side grips). The previous deterministic
+                # CMC pattern (act_cmc + 1.0 + si*0.7) collapsed every env to
+                # the same "fingers fan out from act" topology, which on flat-
+                # faced objects guaranteed all supports landing on one face.
                 jl = torch.tensor(_LEAP_JOINT_LOWER, device=dev)
                 jh = torch.tensor(_LEAP_JOINT_UPPER, device=dev)
                 cmc_min, cmc_max = -0.3, 2.2  # full usable CMC range
@@ -2315,36 +2320,19 @@ class BatchedGraspOptimizer:
                     for b in range(B):
                         if not good[b]: continue
                         act_fi = self.amap[b, 0]
-                        # Read actuation finger's actual CMC after IK
-                        act_cmc = self._u2q(self.u[b:b+1])[0, act_fi * 4].item()
                         sup_fingers = [fi for fi in range(4) if fi != act_fi]
-                        # Place support fingers far from actuation CMC.
-                        # Use 3 evenly-spaced CMC values that avoid act_cmc.
-                        # Offset by ~0.8 rad from actuation, then space 0.8 apart.
-                        base_offset = 1.0  # minimum 1 radian from actuation
-                        sup_cmcs = []
-                        for si in range(3):
-                            target_cmc = act_cmc + base_offset + si * 0.7
-                            # Wrap to valid range
-                            if target_cmc > cmc_max:
-                                target_cmc = cmc_min + (target_cmc - cmc_max)
-                            target_cmc = max(cmc_min, min(cmc_max, target_cmc))
-                            sup_cmcs.append(target_cmc)
-                        for si, fi in enumerate(sup_fingers):
+                        for fi in sup_fingers:
                             j0 = fi * 4
-                            cmc_val = sup_cmcs[si] + 0.1 * (torch.rand(1, device=dev).item() - 0.5)
-                            cmc_val = max(cmc_min, min(cmc_max, cmc_val))
+                            # Each joint sampled uniformly over its full
+                            # valid range — no hand-tuned per-joint subranges.
                             ranges = [
-                                (cmc_val, cmc_val),                # CMC: specific value
-                                (-0.3, 0.6),                       # MCP: slight flex
-                                (0.2, 1.3),                        # PIP: moderate curl
-                                (0.1, 1.0),                        # DIP: moderate curl
+                                (cmc_min, cmc_max),    # CMC: full lateral spread
+                                (-0.3, 0.6),           # MCP: slight flex
+                                (0.0, 1.5),            # PIP: any curl
+                                (0.0, 1.3),            # DIP: any curl
                             ]
                             for ji, (lo, hi) in enumerate(ranges):
-                                if lo == hi:
-                                    q_val = torch.tensor(lo, device=dev)
-                                else:
-                                    q_val = lo + (hi - lo) * torch.rand(1, device=dev)
+                                q_val = lo + (hi - lo) * torch.rand(1, device=dev)
                                 u_val = (q_val - jl[j0+ji]) / (jh[j0+ji] - jl[j0+ji])
                                 u_val = torch.log(u_val.clamp(1e-6, 1-1e-6) / (1 - u_val.clamp(1e-6, 1-1e-6)))
                                 self.u.data[b, j0+ji] = u_val.item()
@@ -2364,49 +2352,6 @@ class BatchedGraspOptimizer:
                             # CMC is frozen later during optimization.
                             sup_joint_mask[b, fi*4:fi*4+4] = True
                             sup_finger_mask[b, fi] = True
-
-                # Compute spread target positions for support fingers
-                # Each finger gets a target on the object surface at a specific
-                # angle from the palm approach direction (recycled from Phase 0)
-                with torch.no_grad():
-                    R_init = self._rot6d_to_matrix(self.rot6d)
-                    palm_inward = R_init[:, :, 0]  # base +X = toward object
-                    palm_inward_xy = F.normalize(palm_inward[:, :2], dim=-1)
-
-                    # 4 targets (one per finger slot), angles spread around object
-                    angles_tgt = [1.57, 2.62, 3.14, -1.57]  # 90, 150, 180, -90 deg
-                    # Compute object z-range for vertical spread
-                    verts_z = torch.tensor(self.sdf._verts_W[:, 2], dtype=torch.float32, device=dev)
-                    z_range_obj = verts_z.max() - verts_z.min()
-                    z_center = obj_c[2]
-                    # Vertical offsets: spread support targets across object height
-                    # Avoids all fingers competing for the same circumference band
-                    z_offsets = [-0.2 * z_range_obj, 0.0, 0.15 * z_range_obj, -0.1 * z_range_obj]
-
-                    finger_targets_all = {}  # fi -> [B, 3] target on surface
-                    for fi in range(4):
-                        angle = angles_tgt[fi]
-                        cos_a = torch.cos(torch.tensor(angle, device=dev))
-                        sin_a = torch.sin(torch.tensor(angle, device=dev))
-                        target_dir_x = palm_inward_xy[:, 0] * cos_a - palm_inward_xy[:, 1] * sin_a
-                        target_dir_y = palm_inward_xy[:, 0] * sin_a + palm_inward_xy[:, 1] * cos_a
-                        target_dir = torch.stack([target_dir_x, target_dir_y], dim=-1)
-                        search_pt = obj_c[:2].unsqueeze(0) + 0.05 * target_dir
-                        target_z = (z_center + z_offsets[fi]).unsqueeze(0).expand(B, -1)
-                        search_3d = torch.cat([search_pt, target_z], -1)
-                        tgt_sdf = self.sdf.query(search_3d.unsqueeze(1)).squeeze(1)
-                        _, tgt_normals = self.sdf.query_with_normals(search_3d.unsqueeze(1))
-                        # query_with_normals returns INWARD normals (-∇SDF).
-                        # Projection: search_3d + sdf * inward_normal moves toward
-                        # surface for both exterior (sdf>0) and interior (sdf<0).
-                        tgt_pts = search_3d + tgt_sdf.unsqueeze(-1) * tgt_normals[:, 0]
-                        finger_targets_all[fi] = tgt_pts
-
-                    # Build per-env finger targets: skip the actuation finger
-                    # and assign the other 3 targets to support fingers
-                    finger_targets = {}  # fi -> [B, 3]
-                    for fi in range(4):
-                        finger_targets[fi] = finger_targets_all[fi]
 
                 if hasattr(self, '_stage_times'):
                     import time as _t
@@ -2494,14 +2439,6 @@ class BatchedGraspOptimizer:
                         dist_to_act = torch.minimum(dist_to_act_tip, dist_to_act_target)
                         too_close = (dist_to_act < 0.040) & sup_finger_mask[:, fi]
                         loss_sup += too_close.float() * 500 * F.relu(0.040 - dist_to_act) ** 2
-
-                        # Guide support fingers toward spread target positions
-                        # Strong for first half of IK (guidance), fade for second half (surface takes over)
-                        if fi in finger_targets:
-                            target = finger_targets[fi]
-                            target_w = 100 * max(0, 1 - ik_step / 200)  # 100 → 0 over 200 steps
-                            if target_w > 1:
-                                loss_sup += sup_finger_mask[:, fi].float() * target_w * ((tp - target) ** 2).sum(-1)
 
                     # Support finger link collision + below-object penalty
                     prefixes = ['if', 'mf', 'rf', 'th']
