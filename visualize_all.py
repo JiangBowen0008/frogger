@@ -12,8 +12,9 @@ from scipy.spatial.transform import Rotation
 from frogger.batched_pytorch_solver import _visual_meshes, _link_names
 
 ASSETS = "/media/bowenj/DATA/projects/DexFun/assets"
-# Default: latest 3-batch run with all wins (palm-d 0-5cm, IK 250, surf_pt 70/30)
-GRASP_DIR = "output/v34_split_70_30_3batch"
+# Default: latest 3-batch run with all wins
+# (palm-d 0-5cm, IK 250, surf_pt 70/30, μ=0.7, simplified supIK)
+GRASP_DIR = "output/v46_random_init_5obj"
 
 OBJECTS = {
     "grinder": {
